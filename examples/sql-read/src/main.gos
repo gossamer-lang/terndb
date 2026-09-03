@@ -1,0 +1,169 @@
+use std::{env, fs, process}
+use terndb::{codec, engine}
+
+// Reading with SQL, four ways: a statement parsed each time, the same statement
+// with its values bound, a statement parsed and planned once, and a cache that
+// recognises a statement by its shape.
+//
+// The four answer the same rows off the same store. What separates them is
+// where the parse and the plan happen, which is the whole of what a read costs
+// once the reading itself is a single positional read.
+//
+//   gos run .            a fresh temporary directory, removed on the way out
+//   gos run . <dir>      a directory of your own, left behind
+
+fn main() {
+    let args = env::args()
+    let owned = args.len() == 0
+    let dir = if owned {
+        match fs::temp_dir("terndb-sql-read-") {
+            Ok(d) => d
+            Err(e) => fail("temp dir: " + e.to_string())
+        }
+    } else {
+        args[0]
+    }
+    if let Err(e) = run(dir) { let _ = fail(e) }
+    if owned {
+        let _ = fs::remove_dir_all(dir)
+    } else {
+        println("")
+        println("the store is in {}", dir)
+    }
+}
+
+fn run(dir: String) -> Result<(), String> {
+    seed(dir)?
+
+    // A read-only engine takes no lock and answers from the store as it stood
+    // when it was opened. Any number of workers may hold one over one store.
+    let mut db = engine::open(dir, true)?
+
+    parsed_each_time(&mut db)?
+    with_bound_values(&mut db)?
+    prepared_once(&mut db)?
+    cached_by_shape(&mut db)?
+    Ok(())
+}
+
+// The writer, run once and closed before the readers open: the rows every
+// section below reads.
+fn seed(dir: String) -> Result<(), String> {
+    let mut db = engine::open(dir, false)?
+    engine::exec(&mut db, "CREATE TABLE users (name TEXT, email TEXT, score FLOAT, active BOOL)")?
+    engine::exec(&mut db, "CREATE INDEX ON users (name)")?
+    engine::exec(&mut db, "INSERT INTO users VALUES ('ada', 'ada@example.com', 4.5, true), ('grace', 'grace@example.com', 2.5, true), ('alan', 'alan@example.com', 3.5, false), ('edsger', 'edsger@example.com', 1.5, true)")?
+    engine::sync(&mut db)
+}
+
+// A statement parsed, planned and run in one call. This is what the CLI does,
+// and what a program running a statement once should do.
+fn parsed_each_time(db: &mut engine::Engine) -> Result<(), String> {
+    heading("parsed each time: engine::query")
+
+    let mut all = engine::query(db, "SELECT name, score FROM users ORDER BY score DESC")?
+    show(&mut all)
+
+    // COUNT(*) answers one row, and the count is also the statement's count.
+    let n, _ = engine::exec(db, "SELECT COUNT(*) FROM users WHERE active = true")?
+    println("  active users: {}", n)
+
+    let mut top = engine::query(db, "SELECT name FROM users WHERE score > 2.0 ORDER BY name LIMIT 2")?
+    show(&mut top)
+    Ok(())
+}
+
+// The same statements, with the values a caller supplied rather than written
+// into the text. A `?` stands anywhere a value does, and it is filled from the
+// arguments in the order the placeholders were written.
+fn with_bound_values(db: &mut engine::Engine) -> Result<(), String> {
+    heading("values bound to placeholders: engine::query_args")
+
+    // The indexed column: with an index declared on `name` this is a lookup.
+    let mut one = engine::query_args(db, "SELECT name, email, score FROM users WHERE name = ?"
+        #[codec::v_text("grace")])?
+    show(&mut one)
+
+    // A value carrying SQL is a value. It is narrowed to its column's type and
+    // its text never reaches the parser, so there is nothing here to inject.
+    let mut none = engine::query_args(db, "SELECT name FROM users WHERE name = ?"
+        #[codec::v_text("ada' OR '1' = '1")])?
+    println("  rows for a name spelling an injection: {}", none.rows.len())
+
+    // Two placeholders, filled in the order they were written.
+    let mut band = engine::query_args(db
+        "SELECT name, score FROM users WHERE score > ? AND score < ? ORDER BY score"
+        #[codec::v_f64(1.0), codec::v_f64(4.0)])?
+    show(&mut band)
+    Ok(())
+}
+
+// A statement parsed and planned once and then run repeatedly. A SELECT settles
+// its whole plan in `prepare` - the table, the projection, the order, the limit
+// and every comparison resolved to a column index - so running it does the
+// reading and nothing else.
+fn prepared_once(db: &mut engine::Engine) -> Result<(), String> {
+    heading("prepared once: engine::plan::prepare and run")
+
+    let mut above = engine::plan::prepare(db, "SELECT name, score FROM users WHERE score > ? ORDER BY name")?
+    for floor in #[1.0, 3.0, 4.0] {
+        let _, mut res = engine::plan::run(db, &mut above, #[codec::v_f64(floor)])?
+        println("  score > {:.1}: {}", floor, engine::render(&mut res).join(", "))
+    }
+
+    // The plan knows its own arity, and a call that does not match it is
+    // refused before it reads anything.
+    println("  the plan takes {} argument(s)", above.arity)
+    match engine::plan::run(db, &mut above, #[]) {
+        Ok(_) => println("  a call with no arguments was accepted, which it should not be")
+        Err(e) => println("  no arguments: {}", e)
+    }
+
+    // Only a SELECT can be prepared: everything else is planned by the write
+    // itself, where the log append and the flush dwarf the parse.
+    match engine::plan::prepare(db, "DELETE FROM users WHERE score < 2.0") {
+        Ok(_) => println("  a DELETE was prepared, which it should not be")
+        Err(e) => println("  preparing a DELETE: {}", e)
+    }
+    Ok(())
+}
+
+// A cache belongs to whoever runs statements - one worker, one request handler.
+// A statement is normalised to its shape, planned once, and then run with the
+// literals it carried as arguments, so statements differing only in their
+// values share one plan.
+fn cached_by_shape(db: &mut engine::Engine) -> Result<(), String> {
+    heading("cached by shape: engine::cache::exec")
+
+    let mut cache = engine::cache::plans()
+    for src in #[
+        "SELECT name, score FROM users WHERE name = 'ada'"
+        "SELECT name, score FROM users WHERE name = 'grace'"
+        "SELECT name, score FROM users WHERE name = 'alan'"
+        "SELECT COUNT(*) FROM users"
+    ] {
+        let _, mut res = engine::cache::exec(db, &mut cache, src)?
+        println("  {} -> {}", src, engine::render(&mut res).join(", "))
+    }
+    // The three `WHERE name = ...` statements differ only in a literal, so one
+    // plan answered all three.
+    println("  plans held for four statements: {}", cache.plans.len())
+    Ok(())
+}
+
+fn heading(title: String) {
+    println("")
+    println("-- {} --", title)
+}
+
+fn show(res: &mut engine::QueryResult) {
+    println("  {}", res.cols.join("|"))
+    for line in engine::render(res) { println("  {}", line) }
+}
+
+// Reports a failure and leaves; the `String` it answers is the one the caller's
+// binding needs, and `process::exit` means it is never produced.
+fn fail(e: String) -> String {
+    eprintln("terndb sql-read example: {}", e)
+    process::exit(1)
+}

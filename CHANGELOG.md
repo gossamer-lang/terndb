@@ -20,4 +20,5 @@
 - Bound values: a `?` stands anywhere a value does, filled from the arguments given to `engine::exec_args` / `engine::query_args`, so a caller never builds a statement out of text it was handed.
 - Prepared statements, and a per-caller plan cache.
 - CLI over the same library: `exec`, `shell`, `bench`.
+- `examples/`: three runnable programs reaching the library as a path dependency - CRUD through the statement layer, reads parsed, bound, prepared and cached, and one row by its identity through the cache, a prepared statement and the store.
 - Runs identically on the bytecode VM, the Cranelift JIT and LLVM AOT.

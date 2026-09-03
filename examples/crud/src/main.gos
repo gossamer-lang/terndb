@@ -1,0 +1,110 @@
+use std::{env, fs, process}
+use terndb::{codec, engine}
+
+// Create, read, update and delete, through the statement layer.
+//
+// Every statement here is a transaction: it commits whole or leaves nothing,
+// and `engine::sync` returns before the example claims a write is durable. The
+// last step reopens the directory to show that what it claimed is there.
+//
+//   gos run .            a fresh temporary directory, removed on the way out
+//   gos run . <dir>      a directory of your own, left behind
+
+fn main() {
+    let args = env::args()
+    let owned = args.len() == 0
+    let dir = if owned {
+        match fs::temp_dir("terndb-crud-") {
+            Ok(d) => d
+            Err(e) => fail("temp dir: " + e.to_string())
+        }
+    } else {
+        args[0]
+    }
+    if let Err(e) = run(dir) { let _ = fail(e) }
+    if owned {
+        let _ = fs::remove_dir_all(dir)
+    } else {
+        println("")
+        println("the store is in {}", dir)
+    }
+}
+
+fn run(dir: String) -> Result<(), String> {
+    let mut db = engine::open(dir, false)?
+
+    // CREATE. An index is declared in the store and rebuilt from the rows at
+    // every open, so a WHERE on `name` is a lookup rather than a walk.
+    step(&mut db, "CREATE TABLE users (name TEXT, email TEXT, score FLOAT, active BOOL)")?
+    step(&mut db, "CREATE INDEX ON users (name)")?
+
+    // INSERT, written out. Rowids are assigned in insertion order.
+    step(&mut db, "INSERT INTO users VALUES ('ada', 'ada@example.com', 1.5, true)")?
+    step(&mut db, "INSERT INTO users VALUES ('grace', 'grace@example.com', 2.5, true), ('alan', 'alan@example.com', 3.5, false)")?
+
+    // INSERT, with the values supplied rather than written. A `?` stands where
+    // a value does, and what fills it never reaches the parser, so a name
+    // carrying SQL is a name.
+    let name = "bobby'); DROP TABLE users; --"
+    let written, _ = engine::exec_args(&mut db, "INSERT INTO users VALUES (?, ?, ?, ?)", #[
+        codec::v_text(name)
+        codec::v_text("bobby@example.com")
+        codec::v_f64(0.5)
+        codec::v_bool(false)
+    ])?
+    println("INSERT INTO users VALUES (?, ?, ?, ?)")
+    println("  OK {}", written)
+
+    // READ.
+    step(&mut db, "SELECT * FROM users")?
+    step(&mut db, "SELECT name, score FROM users WHERE active = true ORDER BY score DESC")?
+    step(&mut db, "SELECT COUNT(*) FROM users")?
+
+    // UPDATE, both spellings. The count is the rows the statement touched.
+    step(&mut db, "UPDATE users SET score = 9.5 WHERE name = 'ada'")?
+    let updated, _ = engine::exec_args(&mut db, "UPDATE users SET active = ? WHERE name = ?"
+        #[codec::v_bool(true), codec::v_text(name)])?
+    println("UPDATE users SET active = ? WHERE name = ?")
+    println("  OK {}", updated)
+
+    // DELETE.
+    step(&mut db, "DELETE FROM users WHERE score < 1.0")?
+    step(&mut db, "SELECT name, score, active FROM users ORDER BY name")?
+
+    // COMPACT drops what the rewrites superseded. A commit whose log is half
+    // dead already merges the generations that are mostly dead, so this is for
+    // reclaiming space on demand rather than for keeping the store healthy.
+    step(&mut db, "COMPACT")?
+
+    engine::sync(&mut db)?
+
+    // A second engine over the same directory, as a restart would open it.
+    println("")
+    println("-- reopened --")
+    let mut again = engine::open(dir, false)?
+    println("tables: {}", engine::table_names(&mut again).join(", "))
+    step(&mut again, "SELECT name, score FROM users ORDER BY name")?
+    Ok(())
+}
+
+// Runs one statement and prints it the way the CLI does: `OK <n>` for a
+// statement that answers no rows, the column names and a line per row for one
+// that does.
+fn step(db: &mut engine::Engine, src: String) -> Result<(), String> {
+    println("{}", src)
+    let n, mut res = engine::exec(db, src)?
+    if res.cols.len() == 0 {
+        println("  OK {}", n)
+        return Ok(())
+    }
+    println("  {}", res.cols.join("|"))
+    for line in engine::render(&mut res) { println("  {}", line) }
+    Ok(())
+}
+
+// Reports a failure and leaves; the `String` it answers is the one the caller's
+// binding needs, and `process::exit` means it is never produced.
+fn fail(e: String) -> String {
+    eprintln("terndb crud example: {}", e)
+    process::exit(1)
+}

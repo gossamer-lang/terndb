@@ -1,0 +1,7 @@
+[project]
+id = "terndb.db/example-crud"
+version = "0.1.0"
+gossamer-version = "^v0.58.9"
+
+[dependencies]
+"terndb.db/terndb" = { path = "../.." }

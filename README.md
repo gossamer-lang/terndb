@@ -44,6 +44,8 @@ terndb bench <dir> [keys] [size]            # reads against fs::read of the same
   embedded and from the command line.
 - **[docs/kv.md](docs/kv.md)** - fetching a row by its id with no statement
   layer above it: `cache::row_json` and `rows::read`.
+- **[examples/](examples)** - three programs that run: CRUD through the
+  statement layer, reads four ways, and one row by its identity.
 
 The two read what each other writes. SQL is how data changes; the key-value path
 is how a row already identified is fetched.

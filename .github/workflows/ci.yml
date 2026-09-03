@@ -35,6 +35,8 @@ jobs:
 
       - run: ./scripts/check-benchmarks.sh
 
+      - run: ./scripts/check-examples.sh
+
   tier-parity:
     name: Tier parity and server soak
     runs-on: ubuntu-latest
