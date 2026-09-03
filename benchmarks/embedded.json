@@ -1,0 +1,12 @@
+{
+  "config": {"rows": 50000, "seconds": 5, "threads": 1},
+  "host": {"cores": 24, "kernel": "Linux 7.0.0-28-generic"},
+  "runs": [
+{"target":"gos-terndb-embedded-sql","queries":17370112,"seconds":5.000,"qps":3474022.4,"ns_per_query":287.9,"bytes":1569105415,"rss_peak_mb":12.8},
+{"target":"gos-terndb-embedded-kv","queries":17933312,"seconds":5.000,"qps":3586662.4,"ns_per_query":278.8,"bytes":1619981312,"rss_peak_mb":11.8},
+{"target":"rust-sqlite-embedded-sql","queries":3282944,"seconds":5.000,"qps":656555.1,"ns_per_query":1523.1,"bytes":296560229,"rss_peak_mb":5.8},
+{"target":"rust-redb-embedded-kv","queries":12309504,"seconds":5.000,"qps":2461742.9,"ns_per_query":406.2,"bytes":1111962252,"rss_peak_mb":15.6},
+{"target":"rust-redb-embedded-kv-typed","queries":9022464,"seconds":5.000,"qps":1804313.7,"ns_per_query":554.2,"bytes":815032002,"rss_peak_mb":11.6},
+{"target":"go-sqlite-embedded-sql","queries":476160,"seconds":5.007,"qps":95103.5,"ns_per_query":10514.9,"bytes":43013250,"rss_peak_mb":18.1}
+  ]
+}

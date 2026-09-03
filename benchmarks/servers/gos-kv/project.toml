@@ -1,0 +1,3 @@
+[project]
+id = "terndb.db/bench-kv"
+version = "0.1.0"

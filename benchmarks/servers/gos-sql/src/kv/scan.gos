@@ -1,0 +1,149 @@
+use crate::kv
+
+// Answering a key prefix: the keys under it, their values, and how many there
+// are. The dense index keeps rowids rather than keys, so a prefix walk spells
+// its keys back out of the table it holds them for.
+
+/// Every live key carrying `prefix`, in key order, with its value.
+///
+/// A key the walk names is one the index holds, so a value it cannot produce is
+/// reported rather than left out of the answer.
+pub fn pairs(st: &mut kv::Store, prefix: String) -> Result<Vec<kv::KvPair>, String> {
+    let mut keys = keys_unordered(st, prefix)
+    keys.sort()
+    let mut out: Vec<kv::KvPair> = #[]
+    for k in keys {
+        match kv::get(st, k) {
+            kv::Read::Value(v) => out.push(kv::KvPair { key: k, val: v })
+            kv::Read::Absent => ()
+            kv::Read::Fault(e) => return Err(e)
+        }
+    }
+    Ok(out)
+}
+
+/// Live keys carrying `prefix`, in no particular order.
+pub fn keys_unordered(st: &mut kv::Store, prefix: String) -> Vec<String> {
+    let mut keys: Vec<String> = #[]
+    for k in st.index.keys() {
+        if k.starts_with(prefix) { keys.push(k) }
+    }
+    dense_keys_into(st, prefix, &mut keys)
+    keys
+}
+
+// Writes out the row keys a dense table holds, which the index keeps as rowids
+// rather than as the strings a caller asking for keys wants back.
+fn dense_keys_into(st: &mut kv::Store, prefix: String, out: &mut Vec<String>) {
+    let mut t: i64 = 0
+    while t < st.tables.len() {
+        let whole = st.tables[t].prefix.starts_with(prefix)
+        if whole || prefix.starts_with(st.tables[t].prefix) {
+            let top = st.tables[t].top
+            let mut rid: i64 = 1
+            while rid <= top {
+                if st.tables[t].slots[3 * rid + 1] != 0 {
+                    let key = st.tables[t].prefix + rid.to_string()
+                    if whole || key.starts_with(prefix) { out.push(key) }
+                }
+                rid += 1
+            }
+        }
+        t += 1
+    }
+}
+
+/// How many live keys carry `prefix`, without listing or reading any of them.
+pub fn count_prefix(st: &mut kv::Store, prefix: String) -> i64 {
+    let mut n: i64 = 0
+    for k in st.index.keys() {
+        if k.starts_with(prefix) { n += 1 }
+    }
+    let mut t: i64 = 0
+    while t < st.tables.len() {
+        if st.tables[t].prefix.starts_with(prefix) {
+            // The prefix names the whole table, whose count the index carries.
+            n += st.tables[t].live
+        } else if prefix.starts_with(st.tables[t].prefix) {
+            let top = st.tables[t].top
+            let mut rid: i64 = 1
+            while rid <= top {
+                if st.tables[t].slots[3 * rid + 1] != 0 {
+                    let key = st.tables[t].prefix + rid.to_string()
+                    if key.starts_with(prefix) { n += 1 }
+                }
+                rid += 1
+            }
+        }
+        t += 1
+    }
+    n
+}
+
+/// Live keys carrying `prefix`, in key order, without reading any values.
+pub fn keys(st: &mut kv::Store, prefix: String) -> Vec<String> {
+    let mut keys = keys_unordered(st, prefix)
+    keys.sort()
+    keys
+}
+
+#[cfg(test)]
+mod tests {
+    use std::fs
+    use crate::kv
+
+    fn fresh(name: String) -> String {
+        let dir = "/tmp/terndb_kv_test/" + name
+        let _ = fs::remove_dir_all(dir)
+        let _ = fs::create_dir_all(dir)
+        dir
+    }
+
+    fn opened(dir: String) -> kv::Store {
+        kv::open(dir, false).unwrap_or_else(|e| panic("open " + dir + ": " + e))
+    }
+
+    #[test]
+    fn scan_returns_matching_keys_in_order() {
+        let mut st = opened(fresh("scan"))
+        assert(kv::put(&mut st, "t/r/3", #[3u8]).is_ok())
+        assert(kv::put(&mut st, "t/r/1", #[1u8]).is_ok())
+        assert(kv::put(&mut st, "t/r/2", #[2u8]).is_ok())
+        assert(kv::put(&mut st, "other/r/1", #[9u8]).is_ok())
+        let hits = kv::scan::pairs(&mut st, "t/r/").unwrap_or_else(|e| panic(e))
+        assert_eq(hits.len(), 3)
+        assert_eq(hits[0].key, "t/r/1")
+        assert_eq(hits[1].key, "t/r/2")
+        assert_eq(hits[2].key, "t/r/3")
+        assert_eq(hits[0].val, #[1u8])
+        assert_eq(kv::scan::pairs(&mut st, "").unwrap_or_else(|e| panic(e)).len(), 4, "an empty prefix matches everything")
+        assert_eq(kv::scan::pairs(&mut st, "nothing/").unwrap_or_else(|e| panic(e)).len(), 0)
+    }
+
+    #[test]
+    fn presence_and_counts_are_answered_from_the_index() {
+        let mut st = opened(fresh("index_only"))
+        assert_eq(kv::scan::count_prefix(&mut st, "t/r/"), 0)
+        assert(kv::put(&mut st, "t/r/1", #[1u8]).is_ok())
+        assert(kv::put(&mut st, "t/r/2", #[2u8]).is_ok())
+        assert(kv::put(&mut st, "other", #[3u8]).is_ok())
+        assert(kv::contains(&mut st, "t/r/1"))
+        assert(!kv::contains(&mut st, "t/r/9"))
+        assert_eq(kv::scan::count_prefix(&mut st, "t/r/"), 2)
+        assert_eq(kv::scan::count_prefix(&mut st, ""), 3, "an empty prefix counts everything")
+        assert_eq(kv::delete(&mut st, "t/r/1").unwrap_or(false), true)
+        assert(!kv::contains(&mut st, "t/r/1"))
+        assert_eq(kv::scan::count_prefix(&mut st, "t/r/"), 1)
+    }
+
+    #[test]
+    fn scan_skips_deleted_keys() {
+        let mut st = opened(fresh("scan_deleted"))
+        assert(kv::put(&mut st, "p/a", #[1u8]).is_ok())
+        assert(kv::put(&mut st, "p/b", #[2u8]).is_ok())
+        assert_eq(kv::delete(&mut st, "p/a").unwrap_or(false), true)
+        let hits = kv::scan::pairs(&mut st, "p/").unwrap_or_else(|e| panic(e))
+        assert_eq(hits.len(), 1)
+        assert_eq(hits[0].key, "p/b")
+    }
+}

@@ -1,0 +1,213 @@
+use crate::sql
+
+// The lexer: a statement's characters cut into the tokens the parser reads.
+
+/// Splits a statement into tokens.
+pub fn lex(src: String) -> Result<Vec<sql::Tok>, String> {
+    let mut toks: Vec<sql::Tok> = #[]
+    let mut i: i64 = 0
+    let n = src.len()
+    while i < n {
+        let c = src[i]
+        if is_space(c) {
+            i += 1
+            continue
+        }
+        if c == ';' {
+            // A trailing semicolon ends the statement; anything after it would
+            // be a second statement, which exec takes one at a time.
+            i += 1
+            while i < n && is_space(src[i]) { i += 1 }
+            if i < n { return Err("lex: only one statement per call") }
+            break
+        }
+        if c == '-' && i + 1 < n && src[i + 1] == '-' {
+            while i < n && src[i] != '\n' { i += 1 }
+            continue
+        }
+        if c == '\'' {
+            i = take_string(src, i, &mut toks)
+            if i < 0 { return Err("lex: unterminated string literal") }
+            continue
+        }
+        if is_ident_start(c) {
+            i = take_word(src, i, &mut toks)
+            continue
+        }
+        // A '-' is a sign when a value is what may come next, and an operator
+        // never precedes one in this grammar, so the previous token decides.
+        let negative = c == '-' && i + 1 < n && is_digit(src[i + 1]) && value_may_follow(toks)
+        if is_digit(c) || negative || (c == '.' && i + 1 < n && is_digit(src[i + 1])) {
+            i = take_number(src, i, negative, &mut toks)
+            continue
+        }
+        if (c == '<' || c == '>' || c == '!') && i + 1 < n && src[i + 1] == '=' {
+            toks.push(sql::Tok { kind: sql::T_PUNCT, text: c.to_string() + "=" })
+            i += 2
+            continue
+        }
+        if c == '?' {
+            toks.push(sql::Tok { kind: sql::T_PARAM, text: "?" })
+            i += 1
+            continue
+        }
+        if c == '(' || c == ')' || c == ',' || c == '*' || c == '=' || c == '<' || c == '>' {
+            toks.push(sql::Tok { kind: sql::T_PUNCT, text: c.to_string() })
+            i += 1
+            continue
+        }
+        return Err("lex: unexpected character '" + c.to_string() + "'")
+    }
+    toks.push(sql::Tok { kind: sql::T_EOF, text: "" })
+    Ok(toks)
+}
+
+// The string literal opening at `i`, with its escapes resolved; answers where
+// the token after it starts, or -1 when the literal never closes.
+fn take_string(src: String, i: i64, toks: &mut Vec<sql::Tok>) -> i64 {
+    let n = src.len()
+    let mut text = String::new()
+    let mut p = i + 1
+    while p < n {
+        let ch = src[p]
+        if ch == '\'' {
+            // A doubled quote is the SQL spelling of a literal quote.
+            if p + 1 < n && src[p + 1] == '\'' {
+                text.push('\'')
+                p += 2
+                continue
+            }
+            toks.push(sql::Tok { kind: sql::T_STR, text: text })
+            return p + 1
+        }
+        if ch == '\\' && p + 1 < n {
+            text.push(unescape(src[p + 1]))
+            p += 2
+            continue
+        }
+        text.push(ch)
+        p += 1
+    }
+    -1
+}
+
+// The identifier at `i`; answers where it ends.
+fn take_word(src: String, i: i64, toks: &mut Vec<sql::Tok>) -> i64 {
+    let n = src.len()
+    let mut word = String::new()
+    let mut p = i
+    while p < n && is_ident_part(src[p]) {
+        word.push(src[p])
+        p += 1
+    }
+    toks.push(sql::Tok { kind: sql::T_WORD, text: word })
+    p
+}
+
+// The number at `i`; answers where it ends. A number carrying a decimal point
+// is a float token, and the sign the caller recognised is part of the text.
+fn take_number(src: String, i: i64, negative: bool, toks: &mut Vec<sql::Tok>) -> i64 {
+    let n = src.len()
+    let mut text = String::new()
+    let mut p = i
+    if negative {
+        text.push('-')
+        p += 1
+    }
+    let mut isfloat = false
+    while p < n {
+        let ch = src[p]
+        if is_digit(ch) {
+            text.push(ch)
+            p += 1
+        } else if ch == '.' && !isfloat {
+            isfloat = true
+            text.push(ch)
+            p += 1
+        } else {
+            break
+        }
+    }
+    toks.push(sql::Tok { kind: if isfloat { sql::T_FLOAT } else { sql::T_INT }, text: text })
+    p
+}
+
+fn is_space(c: char) -> bool { c == ' ' || c == '\t' || c == '\n' || c == '\r' }
+
+// The character a backslash escape stands for; an unknown escape is the
+// character itself, which is what a quoted literal's scan also reads it as.
+pub (package) fn unescape(c: char) -> char {
+    if c == 'n' { return '\n' }
+    if c == 't' { return '\t' }
+    if c == 'r' { return '\r' }
+    c
+}
+
+fn is_digit(c: char) -> bool { c >= '0' && c <= '9' }
+
+fn is_ident_start(c: char) -> bool { (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || c == '_' }
+
+fn is_ident_part(c: char) -> bool { is_ident_start(c) || is_digit(c) }
+
+// A value can open the input, or follow a comparison operator, an opening
+// paren, or a comma. After a word or a literal, a '-' is not a sign.
+fn value_may_follow(toks: Vec<sql::Tok>) -> bool {
+    if toks.len() == 0 { return true }
+    let last = toks[toks.len() - 1]
+    if last.kind != sql::T_PUNCT { return last.kind == sql::T_WORD && last.text.to_uppercase() == "BY" }
+    last.text != ")" && last.text != "*"
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::sql
+
+    fn kinds(src: String) -> Vec<u8> {
+        let mut out: Vec<u8> = #[]
+        for t in super::lex(src).unwrap_or(#[]) { out.push(t.kind) }
+        out
+    }
+
+    fn texts(src: String) -> Vec<String> {
+        let mut out: Vec<String> = #[]
+        for t in super::lex(src).unwrap_or(#[]) {
+            if t.kind != sql::T_EOF { out.push(t.text) }
+        }
+        out
+    }
+
+    #[test]
+    fn the_lexer_classifies_each_token() {
+        assert_eq(kinds("SELECT * FROM t"), #[sql::T_WORD, sql::T_PUNCT, sql::T_WORD, sql::T_WORD, sql::T_EOF])
+        assert_eq(texts("a >= 1.5"), #["a", ">=", "1.5"])
+        assert_eq(texts("x != 'hi'"), #["x", "!=", "hi"])
+        assert_eq(texts("f(  )"), #["f", "(", ")"])
+    }
+
+    #[test]
+    fn the_lexer_reads_string_literals() {
+        assert_eq(texts("'plain'"), #["plain"])
+        assert_eq(texts("''"), #[""], "an empty literal is a value")
+        assert_eq(texts("'it''s'"), #["it's"], "a doubled quote is one quote")
+        assert_eq(texts("'a\\nb'"), #["a\nb"], "a backslash escape is honoured")
+        assert_eq(texts("'héllo 🌍'"), #["héllo 🌍"])
+        assert(super::lex("'unterminated").is_err())
+    }
+
+    #[test]
+    fn the_lexer_reads_negative_numbers_only_where_a_value_belongs() {
+        assert_eq(texts("WHERE a = -5"), #["WHERE", "a", "=", "-5"])
+        assert_eq(texts("VALUES (-1, -2.5)"), #["VALUES", "(", "-1", ",", "-2.5", ")"])
+        assert_eq(texts("SET x = -7"), #["SET", "x", "=", "-7"])
+        assert_eq(texts("a > -1"), #["a", ">", "-1"])
+    }
+
+    #[test]
+    fn the_lexer_skips_comments_and_a_trailing_semicolon() {
+        assert_eq(texts("SELECT -- everything\n * FROM t"), #["SELECT", "*", "FROM", "t"])
+        assert_eq(texts("SELECT * FROM t;"), #["SELECT", "*", "FROM", "t"])
+        assert_eq(texts("SELECT * FROM t ;  \n"), #["SELECT", "*", "FROM", "t"])
+        assert(super::lex("SELECT * FROM t; SELECT * FROM u").is_err(), "two statements are rejected")
+        assert(super::lex("SELECT @ FROM t").is_err())
+    }
+}

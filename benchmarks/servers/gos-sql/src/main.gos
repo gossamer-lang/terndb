@@ -1,0 +1,55 @@
+use std::{env, http, process}
+use std::http::router
+
+// terndb embedded behind a GET endpoint: the engine runs in this process and
+// the handler calls it directly, which is the deployment PLAN.md calls
+// "embedded".
+//
+// The store is opened read-only, which is the configuration a read replica
+// runs in: no active file, no writer lock, nothing mutable shared with a
+// writer.
+
+fn main() {
+    let args = env::args()
+    if args.len() < 2 {
+        eprintln("usage: bench-embedded <addr> <dir>")
+        process::exit(2)
+    }
+    match serve_forever(args[0], args[1]) {
+        Ok(()) => ()
+        Err(e) => {
+            eprintln("{}", e)
+            process::exit(1)
+        }
+    }
+}
+
+fn serve_forever(addr: String, dir: String) -> Result<(), String> {
+    let mut eng = engine::open(dir, true)?
+    // The statement is parsed and planned once. Parsing it per request is the
+    // larger part of what a keyed read costs.
+    let mut by_id = engine::plan::prepare(&mut eng, "SELECT name, email, score, active FROM users WHERE rowid = ?")?
+    println("bench-embedded on {}, serving {}", addr, dir)
+    let routes = router::Router::new()
+        .get("/health", |_req, _p| http::Response::text(200, "ok"))
+        .get("/user/{id}", |req, _p| answer(&mut eng, &mut by_id, req.path_int("id").unwrap_or(-1)))
+    match http::serve(addr, routes) {
+        Ok(()) => Ok(())
+        Err(e) => Err("serve: " + e.message())
+    }
+}
+
+fn answer(eng: &mut engine::Engine, by_id: &mut engine::plan::Prepared, id: i64) -> http::Response {
+    // The row is rendered straight out of the bytes the read produced: a
+    // request answering one row as JSON has no use for the decoded values, let
+    // alone a result set built around them.
+    match engine::plan::read_json(eng, by_id, id) {
+        Ok(body) => {
+            if body.len() == 0 { return not_found() }
+            http::Response::json(200, body)
+        }
+        Err(e) => http::Response::json(500, "{\"error\":\"" + e + "\"}")
+    }
+}
+
+fn not_found() -> http::Response { http::Response::json(404, "{\"error\":\"not found\"}") }

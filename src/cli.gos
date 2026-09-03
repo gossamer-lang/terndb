@@ -1,0 +1,289 @@
+use std::io
+use crate::engine
+use crate::bench
+
+// The command line: what each command takes, what it prints, and what it
+// leaves with.
+//
+// Everything a command decides happens here rather than in `main`, which does
+// nothing but leave: a command's argument handling, its exit code and the text
+// it produces are then all answerable in a test, where a process that writes to
+// a terminal and exits is not.
+
+/// Exit code for a command whose arguments the CLI does not accept.
+pub const EXIT_USAGE: i64 = 2
+
+/// Exit code for a command that ran and reported a failure.
+pub const EXIT_FAILED: i64 = 1
+
+/// Runs one command line against the process's own streams.
+pub fn dispatch(args: Vec<String>) -> i64 {
+    dispatch_to(args, |line| println("{}", line), |line| eprintln("{}", line))
+}
+
+/// Runs one command line, writing results through `out` and diagnostics through
+/// `err`, and answers the process's exit code.
+pub fn dispatch_to(args: Vec<String>, out: Fn(String), err: Fn(String)) -> i64 {
+    if args.len() < 1 { return usage(out) }
+    match args[0] {
+        "exec" => exec(args, out, err)
+        "shell" => shell(args, out, err)
+        "bench" => bench_report(args, out, err)
+        _ => usage(out)
+    }
+}
+
+// terndb exec <dir> <sql>...
+fn exec(args: Vec<String>, out: Fn(String), err: Fn(String)) -> i64 {
+    if args.len() < 3 { return usage(out) }
+    let mut eng = match engine::open(args[1], false) {
+        Ok(e) => e
+        Err(e) => return fail(err, e)
+    }
+    report_faults(&mut eng, err)
+    let mut failed = false
+    let mut i: i64 = 2
+    while i < args.len() {
+        if !run(&mut eng, args[i], out, err) { failed = true }
+        i += 1
+    }
+    if let Err(e) = engine::sync(&mut eng) { return fail(err, e) }
+    if failed { EXIT_FAILED } else { 0 }
+}
+
+// terndb shell <dir>
+fn shell(args: Vec<String>, out: Fn(String), err: Fn(String)) -> i64 {
+    if args.len() != 2 { return usage(out) }
+    let mut eng = match engine::open(args[1], false) {
+        Ok(e) => e
+        Err(e) => return fail(err, e)
+    }
+    report_faults(&mut eng, err)
+    out("terndb shell - one statement per line, CTRL-D to exit")
+    loop {
+        let line = match io::stdin().read_line() {
+            Some(l) => l
+            None => break
+        }
+        let src = line.trim()
+        if src == "" { continue }
+        if is_quit(src) { break }
+        let _ = run(&mut eng, src, out, err)
+    }
+    if let Err(e) = engine::sync(&mut eng) { return fail(err, e) }
+    0
+}
+
+// terndb bench <dir> [n] [size]
+fn bench_report(args: Vec<String>, out: Fn(String), err: Fn(String)) -> i64 {
+    if args.len() < 2 || args.len() > 4 { return usage(out) }
+    let n = if args.len() > 2 { args[2].to_i64().unwrap_or(-1) } else { 10_000 }
+    let size = if args.len() > 3 { args[3].to_i64().unwrap_or(-1) } else { 256 }
+    if n <= 0 || size <= 0 {
+        err("terndb: bench needs a positive key count and payload size")
+        return EXIT_USAGE
+    }
+    if let Err(e) = bench::claim(args[1]) { return fail(err, e) }
+    if !report(bench::report(args[1], n, size), out, err) { return EXIT_FAILED }
+    out("")
+    let rows = if n > 20_000 { 20_000 } else { n }
+    if !report(bench::sql_report(args[1] + "/sql", rows), out, err) { return EXIT_FAILED }
+    // One process ran both benchmarks, so the high-water mark is one number
+    // and it closes the run rather than repeating inside each section.
+    out("")
+    out(bench::memory_line())
+    0
+}
+
+// Writes one benchmark section, answering whether it ran.
+fn report(lines: Result<Vec<String>, String>, out: Fn(String), err: Fn(String)) -> bool {
+    match lines {
+        Ok(rendered) => {
+            for line in rendered { out(line) }
+            true
+        }
+        Err(e) => {
+            let _ = fail(err, e)
+            false
+        }
+    }
+}
+
+// The words that end a shell session, in either case.
+fn is_quit(src: String) -> bool {
+    let word = src.to_uppercase()
+    word == "QUIT" || word == "EXIT"
+}
+
+// What the open read past in the log. A store that recovered to its last good
+// commit still answers, and this is what says so before it does.
+fn report_faults(eng: &mut engine::Engine, err: Fn(String)) {
+    for fault in engine::faults(eng) { err("terndb: " + fault) }
+}
+
+// A statement prints its rows, or its count when it returns none; a rejected
+// one goes to stderr so a pipeline reading stdout sees only results.
+fn run(eng: &mut engine::Engine, src: String, out: Fn(String), err: Fn(String)) -> bool {
+    match engine::exec(eng, src) {
+        Ok((n, mut res)) => {
+            if res.cols.len() == 0 {
+                out("OK " + n.to_string())
+            } else {
+                out(res.cols.join("|"))
+                for line in engine::render(&mut res) { out(line) }
+            }
+            true
+        }
+        Err(e) => {
+            err("ERR " + e)
+            false
+        }
+    }
+}
+
+// A command that ran and could not finish says why, and answers the code the
+// process leaves with.
+fn fail(err: Fn(String), msg: String) -> i64 {
+    err("terndb: " + msg)
+    EXIT_FAILED
+}
+
+fn usage(out: Fn(String)) -> i64 {
+    out("terndb 0.1.0 - a small structured key-value store with a light SQL front")
+    out("")
+    out("  terndb exec <dir> <sql>...   run statements and print the rows")
+    out("                               CREATE TABLE / CREATE INDEX / INSERT /")
+    out("                               SELECT / UPDATE / DELETE / COMPACT")
+    out("  terndb shell <dir>           read statements from stdin")
+    out("  terndb bench <dir> [n] [sz]  queries a second and peak memory, against")
+    out("                               fs::read of the same bytes as a baseline")
+    out("                               <dir> must be empty or a previous bench directory")
+    EXIT_USAGE
+}
+
+#[cfg(test)]
+mod tests {
+    use std::fs
+    use crate::cli
+
+    fn fresh(name: String) -> String {
+        let dir = "/tmp/terndb_cli_test/" + name
+        let _ = fs::remove_dir_all(dir)
+        let _ = fs::create_dir_all(dir)
+        dir
+    }
+
+    /// One command line run with its two streams captured, as
+    /// `(exit code, result lines, diagnostic lines)`.
+    ///
+    /// The text a command produces is part of what it does, so a test that only
+    /// checked the exit code would leave the CLI's whole output unasserted - and
+    /// would print it to the terminal on the way past.
+    fn capture(args: Vec<String>) -> (i64, Vec<String>, Vec<String>) {
+        let mut out: Vec<String> = #[]
+        let mut err: Vec<String> = #[]
+        let code = cli::dispatch_to(args, |line| out.push(line), |line| err.push(line))
+        (code, out, err)
+    }
+
+    /// The exit code alone, for a line whose output another assertion covers.
+    fn code_of(args: Vec<String>) -> i64 {
+        let code, _, _ = capture(args)
+        code
+    }
+
+    #[test]
+    fn a_command_line_the_cli_does_not_take_answers_usage() {
+        let lines = #[
+            #[]
+            #["nonsense"]
+            #["exec"]
+            #["exec", "/tmp"]
+            #["shell"]
+            #["shell", "a", "b"]
+            #["bench"]
+            #["bench", "a", "b", "c", "d"]
+        ]
+        for args in lines {
+            let code, out, err = capture(args)
+            let what = "terndb " + args.join(" ")
+            assert_eq(code, cli::EXIT_USAGE, what)
+            assert_eq(err.len(), 0, what)
+            assert(out.len() > 0 && out[0].starts_with("terndb 0.1.0"), what)
+            for cmd in #["exec", "shell", "bench"] {
+                assert(out.join("\n").contains("terndb " + cmd), what + ": names " + cmd)
+            }
+        }
+    }
+
+    #[test]
+    fn bench_wants_a_positive_key_count_and_size() {
+        let dir = fresh("bench_args")
+        let bench_args = #[
+            #["bench", dir, "0"]
+            #["bench", dir, "-1"]
+            #["bench", dir, "10", "0"]
+            #["bench", dir, "10", "words"]
+        ]
+        for args in bench_args {
+            let code, out, err = capture(args)
+            assert_eq(code, cli::EXIT_USAGE, args.join(" "))
+            assert_eq(out.len(), 0, args.join(" "))
+            assert_eq(err, #["terndb: bench needs a positive key count and payload size"], args.join(" "))
+        }
+    }
+
+    #[test]
+    fn exec_runs_its_statements_and_reports_whether_they_all_ran() {
+        let dir = fresh("exec_ok")
+        let code, out, err = capture(#["exec", dir, "CREATE TABLE t (v TEXT)"])
+        assert_eq(code, 0)
+        assert_eq(out, #["OK 0"], "a statement answering no rows reports its count")
+        assert_eq(err.len(), 0)
+
+        let code2, out2, err2 = capture(#["exec", dir, "INSERT INTO t VALUES ('a')", "SELECT v FROM t"])
+        assert_eq(code2, 0, "several statements run in order")
+        assert_eq(out2, #["OK 1", "v", "a"], "the insert's count, then the header and the row")
+        assert_eq(err2.len(), 0)
+
+        let code3, out3, err3 = capture(#["exec", dir, "SELECT * FROM missing"])
+        assert_eq(code3, cli::EXIT_FAILED)
+        assert_eq(out3.len(), 0, "nothing reaches stdout, so a pipeline sees only results")
+        assert_eq(err3, #["ERR no such table: missing"])
+
+        let code4, out4, err4 = capture(
+            #["exec", dir, "INSERT INTO t VALUES ('b')", "NOT SQL", "INSERT INTO t VALUES ('c')"])
+        assert_eq(code4, cli::EXIT_FAILED, "one rejected statement fails the run")
+        assert_eq(out4, #["OK 1", "OK 1"], "the inserts either side of it ran")
+        assert_eq(err4.len(), 1)
+        assert(err4[0].starts_with("ERR parse:") && err4[0].contains("NOT"), "got: " + err4[0])
+
+        let code5, out5, _ = capture(#["exec", dir, "SELECT COUNT(*) FROM t"])
+        assert_eq(code5, 0)
+        assert_eq(out5, #["count", "3"], "a, b and c are all there")
+
+        let mut check = engine::open(dir, false).unwrap_or_else(|e| panic("open " + dir + ": " + e))
+        match engine::exec(&mut check, "SELECT COUNT(*) FROM t") {
+            Ok((_, mut res)) => assert_eq(engine::render(&mut res), #["3"], "and they survived the close")
+            Err(e) => assert(false, e)
+        }
+    }
+
+    #[test]
+    fn a_directory_that_cannot_be_opened_is_reported_not_ignored() {
+        let dir = fresh("not_a_dir")
+        let path = dir + "/plain"
+        assert(fs::write(path, "x".as_bytes()).is_ok())
+        let code, out, err = capture(#["exec", path, "SELECT 1"])
+        assert_eq(code, cli::EXIT_FAILED)
+        assert_eq(out.len(), 0)
+        assert_eq(err, #["terndb: open: not a directory: " + path])
+    }
+
+    #[test]
+    fn dispatch_writes_to_the_process_streams() {
+        let dir = fresh("streams")
+        assert_eq(cli::dispatch(#["exec", dir, "CREATE TABLE t (v TEXT)"]), 0)
+        assert_eq(code_of(#["exec", dir, "CREATE TABLE t2 (v TEXT)"]), 0)
+    }
+}

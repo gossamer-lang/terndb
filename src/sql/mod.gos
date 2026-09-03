@@ -1,0 +1,98 @@
+use crate::codec
+
+// terndb SQL: a hand-written lexer and recursive-descent parser for the subset
+//
+//   CREATE TABLE t (col TYPE, ...)
+//   CREATE INDEX ON t (col)
+//   INSERT INTO t VALUES (v, ...), (...)
+//   SELECT cols | * | COUNT(*) FROM t [WHERE c OP v AND ...] [ORDER BY col [ASC|DESC]] [LIMIT n]
+//   UPDATE t SET col = v, ... [WHERE ...]
+//   DELETE FROM t [WHERE ...]
+//   COMPACT
+//
+// OP is one of = != < > <= >=. There are no joins, no OR, and no subqueries:
+// the WHERE shape here is exactly the one a single-table indexed lookup can
+// answer, which is the contract PLAN.md sets out.
+//
+// This file is the vocabulary the three passes share: [`lexer`] cuts a
+// statement into `Tok`s, [`parser`] reads those into a `Stmt`, and [`shape`]
+// rewrites a statement into the shape a plan is cached under.
+
+pub const T_EOF: u8 = 0
+pub const T_WORD: u8 = 1
+pub const T_PUNCT: u8 = 2
+pub const T_INT: u8 = 3
+pub const T_FLOAT: u8 = 4
+pub const T_STR: u8 = 5
+
+/// A `?` placeholder, filled in when a prepared statement is bound.
+pub const T_PARAM: u8 = 6
+pub const OP_EQ: u8 = 0
+pub const OP_NE: u8 = 1
+pub const OP_LT: u8 = 2
+pub const OP_GT: u8 = 3
+pub const OP_LE: u8 = 4
+pub const OP_GE: u8 = 5
+
+/// One lexical token: `kind` selects how `text` is to be read.
+pub struct Tok {
+    pub kind: u8
+    pub text: String
+}
+
+/// A single WHERE comparison against one column.
+pub struct Cond {
+    pub col: String
+    pub op: u8
+    pub val: codec::Value
+}
+
+/// A parsed SELECT: what it reads, what it keeps, and in what order.
+pub struct Query {
+    pub table: String
+    /// The columns it projects, empty for `*`.
+    pub cols: Vec<String>
+    pub count_only: bool
+    pub conds: Vec<Cond>
+    pub order_col: String
+    pub order_asc: bool
+    pub has_order: bool
+    /// The row limit, or -1 for none.
+    pub limit: i64
+}
+
+/// A parsed statement.
+pub enum Stmt {
+    Create { name: String, cols: Vec<(String, u8)> }
+    CreateIndex { table: String, col: String }
+    Insert { table: String, rows: Vec<Vec<codec::Value>> }
+    Select(Query)
+    Update { table: String, sets: Vec<(String, codec::Value)>, conds: Vec<Cond> }
+    Delete { table: String, conds: Vec<Cond> }
+    Compact
+}
+
+/// The operator spelling a comparison code stands for.
+pub fn op_text(op: u8) -> String {
+    match op {
+        OP_EQ => "="
+        OP_NE => "!="
+        OP_LT => "<"
+        OP_GT => ">"
+        OP_LE => "<="
+        _ => ">="
+    }
+}
+
+/// The comparison code an operator spelling stands for.
+pub fn op_code(text: String) -> Option<u8> {
+    match text {
+        "=" => Some(OP_EQ)
+        "!=" => Some(OP_NE)
+        "<" => Some(OP_LT)
+        ">" => Some(OP_GT)
+        "<=" => Some(OP_LE)
+        ">=" => Some(OP_GE)
+        _ => None
+    }
+}

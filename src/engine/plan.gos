@@ -1,0 +1,498 @@
+use crate::engine
+use crate::codec
+use crate::kv
+use crate::sql
+use super::filter
+use super::scan
+
+// A statement parsed and planned once, so running it again costs neither.
+//
+// Reads are what this is for: a SELECT settles its whole plan here - the table,
+// the columns it projects, the order and limit, and every comparison resolved
+// to a column index - so running it does the reading and nothing else.
+
+/// A statement parsed and planned once, so running it again costs neither.
+///
+/// A `?` in the statement is a placeholder, filled from the arguments given to
+/// [`run`]. For a SELECT the whole plan is settled here - the table, the
+/// columns it projects, the order and limit, and every comparison resolved to a
+/// column index - so running it does the reading and nothing else.
+pub struct Prepared {
+    pub src: String
+    /// How many `?` placeholders the statement carries.
+    pub arity: i64
+    /// True when the statement names one row by its id and nothing else, so it
+    /// is answered by a single read rather than a walk.
+    point_read: bool
+    /// `<table>/r/`, built once.
+    prefix: String
+    /// The row index this statement reads, resolved once.
+    tid: i64
+    def: engine::TableDef
+    filter: filter::Filter
+    count_only: bool
+    picks: Vec<i64>
+    out_cols: Vec<String>
+    identity: bool
+    /// `,"<column>":` per projected column, built here so a render appends one
+    /// piece per column rather than three.
+    json_keys: Vec<String>
+    has_order: bool
+    order_idx: i64
+    order_asc: bool
+    limit: i64
+}
+
+/// Parses and plans `src` so it can be run repeatedly.
+///
+/// Reads are what this is for: a SELECT settles its whole plan here, and
+/// running it does the reading and nothing else. A statement that writes is
+/// planned by the write itself - the log append and the flush dwarf the parse -
+/// so `prepare` takes reads and `exec` takes everything.
+pub fn prepare(eng: &mut engine::Engine, src: String) -> Result<Prepared, String> {
+    match sql::parser::parse(src)? {
+        sql::Stmt::Select(q) => {
+            let mut def = engine::get_def(eng, q.table)?
+            let mut arity: i64 = 0
+            for c in q.conds {
+                if c.val.tag == codec::TAG_PARAM && c.val.i + 1 > arity { arity = c.val.i + 1 }
+            }
+            let filter = filter::compile(&mut def, q.conds)?
+            let mut out_cols: Vec<String> = #[]
+            let mut picks: Vec<i64> = #[]
+            if q.cols.len() == 0 {
+                for i in 0..def.cols.len() {
+                    out_cols.push(def.cols[i])
+                    picks.push(i)
+                }
+            } else {
+                for c in q.cols {
+                    picks.push(schema::col_index(&mut def, c)?)
+                    out_cols.push(c)
+                }
+            }
+            let mut identity = picks.len() == def.cols.len()
+            if identity {
+                for i in 0..picks.len() {
+                    if picks[i] != i {
+                        identity = false
+                        break
+                    }
+                }
+            }
+            let order_idx = if q.has_order { schema::col_index(&mut def, q.order_col)? } else { -1 }
+            // One row id and nothing else to test is a single read: no walk, no
+            // ordering to settle, and no limit that could cut it short.
+            let point_read = filter.id_ops.len() == 1 && filter.id_ops[0] == sql::OP_EQ
+            && filter.cols.len() == 0 && !q.has_order && q.limit != 0
+            let tid = kv::rows::table_id(&mut eng.store, q.table)
+            Ok(Prepared {
+                src: src, arity: arity, point_read: point_read, prefix: engine::row_prefix(q.table)
+                tid: tid, def: def, filter: filter
+                count_only: q.count_only, picks: picks, identity: identity
+                json_keys: codec::json::keys(out_cols), out_cols: out_cols
+                has_order: q.has_order, order_idx: order_idx, order_asc: q.order_asc, limit: q.limit
+            })
+        }
+        _ => Err("only a SELECT can be prepared; run the rest with exec")
+    }
+}
+
+/// Reads the row `id` names into `out`, in the prepared statement's projection
+/// order, and answers whether the row was there.
+///
+/// This is a keyed read with nothing built around it: no result set, no row
+/// wrapper, and no argument vector. A caller that answers one row per request
+/// has no use for those, and this is what the read costs without them. The
+/// statement must be one a single read can answer - `WHERE rowid = ?` and
+/// nothing else - which is what [`prepare`] already recognises.
+pub fn read_row(eng: &mut engine::Engine, plan: &mut Prepared, id: i64, out: &mut Vec<codec::Value>) -> Result<bool, String> {
+    if !plan.point_read {
+        return Err("read_row takes a statement that names one row by its id: " + plan.src)
+    }
+    out.clear()
+    if id < 1 { return Ok(false) }
+    match kv::rows::read(&mut eng.store, plan.tid, id) {
+        kv::Read::Value(bytes) => {
+            if plan.identity {
+                if !codec::decode_row_into(bytes, plan.def.cols.len(), out) {
+                    return Err("row " + id.to_string() + " of " + plan.def.name + " is malformed")
+                }
+                return Ok(true)
+            }
+            let vals = codec::decode_row(bytes, plan.def.cols.len())?
+            for i in plan.picks { out.push(vals[i]) }
+            Ok(true)
+        }
+        kv::Read::Absent => Ok(false)
+        kv::Read::Fault(e) => Err(e)
+    }
+}
+
+/// Renders row `id` as a JSON object in the statement's projection order, or
+/// the empty string when the row is not there.
+///
+/// A projection of the whole row in table order - which is what a keyed read
+/// usually is - is rendered straight from the bytes the read produced: no
+/// `Value` is built and no column is turned into a string of its own. A
+/// projection naming its columns in some other order reaches them through the
+/// decoded row, and renders each the same way. A rendered row always begins
+/// with `{`, so an empty answer names the absent row and nothing else.
+pub fn read_json(eng: &mut engine::Engine, plan: &mut Prepared, id: i64) -> Result<String, String> {
+    if !plan.point_read {
+        return Err("read_row_json takes a statement that names one row by its id: " + plan.src)
+    }
+    if id < 1 { return Ok("") }
+    // A row in a generation the store holds is rendered where it lies: no
+    // positional read, and no copy of the value out of the buffer first. The
+    // buffer is handed to the renderer straight off the store, because binding
+    // it to a local here would copy the whole file per request.
+    if plan.identity {
+        let start, end = kv::rows::span(&mut eng.store, plan.tid, id)
+        if end > start {
+            let body = codec::json::render_window(
+                eng.store.resident_bytes, start, end, plan.json_keys, id)
+            if body.len() == 0 {
+                return Err("row " + id.to_string() + " of " + plan.def.name + " is malformed")
+            }
+            return Ok(body)
+        }
+    }
+    let bytes = match kv::rows::read(&mut eng.store, plan.tid, id) {
+        kv::Read::Value(b) => b
+        kv::Read::Absent => return Ok("")
+        kv::Read::Fault(e) => return Err(e)
+    }
+    if plan.identity {
+        let body = codec::json::render_window(bytes, 0, bytes.len(), plan.json_keys, id)
+        if body.len() == 0 {
+            return Err("row " + id.to_string() + " of " + plan.def.name + " is malformed")
+        }
+        return Ok(body)
+    }
+    let vals = codec::decode_row(bytes, plan.def.cols.len())?
+    let mut out = String::with_capacity(16 + plan.picks.len() * 24)
+    out.push_str("{\"id\":")
+    out.push_str(id.to_string())
+    for k in 0..plan.picks.len() {
+        out.push_str(plan.json_keys[k])
+        out.push_str(codec::json::value(vals[plan.picks[k]]))
+    }
+    out.push_str("}")
+    Ok(out)
+}
+
+/// The encoded bytes of row `id`, for a caller that renders them itself.
+///
+/// A request answering one row as text has no use for the decoded values, let
+/// alone a result set built around them, so this hands back what the read
+/// produced and leaves the reading of it to the caller.
+pub fn read_bytes(eng: &mut engine::Engine, plan: &mut Prepared, id: i64) -> kv::Read {
+    if !plan.point_read {
+        return kv::Read::Fault("read_bytes takes a statement that names one row by its id: " + plan.src)
+    }
+    if id < 1 { return kv::Read::Absent }
+    kv::rows::read(&mut eng.store, plan.tid, id)
+}
+
+/// Runs a prepared statement with `args` filling its placeholders in order.
+///
+/// The plan is reached by reference: it is the one thing a hot read touches on
+/// every request, and a reference is the only way this language has to say
+/// "look at this, do not take a copy".
+pub fn run(eng: &mut engine::Engine, plan: &mut Prepared, args: Vec<codec::Value>) -> Result<(i64, engine::QueryResult), String> {
+    if args.len() != plan.arity {
+        return Err("statement takes " + plan.arity.to_string() + " argument(s), got " + args.len().to_string())
+    }
+    if !plan.point_read { return run_walk(eng, plan, args) }
+    // A read of one row by its id is a single read: name the row, read it,
+    // decode it. Written out here rather than behind a call so the plan is
+    // walked once on the path that runs most often.
+    let rid = if plan.filter.id_eq_arg >= 0 {
+        let a = args[plan.filter.id_eq_arg]
+        if a.tag != codec::TAG_I64 && a.tag != codec::TAG_I32 {
+            return Err("rowid compares against a whole number, not " + codec::type_name_for_tag(a.tag))
+        }
+        a.i
+    } else {
+        plan.filter.id_eq
+    }
+    if rid < 1 { return missing(plan) }
+    match kv::rows::read(&mut eng.store, plan.tid, rid) {
+        kv::Read::Value(bytes) => {
+            if plan.count_only { return engine::counted(1) }
+            let vals = codec::decode_row(bytes, plan.def.cols.len())?
+            if plan.identity {
+                return Ok((1, engine::QueryResult { cols: plan.out_cols, rows: #[engine::Row { rowid: rid, vals: vals }] }))
+            }
+            let mut picked: Vec<codec::Value> = #[]
+            for i in plan.picks { picked.push(vals[i]) }
+            Ok((1, engine::QueryResult { cols: plan.out_cols, rows: #[engine::Row { rowid: rid, vals: picked }] }))
+        }
+        kv::Read::Absent => missing(plan)
+        kv::Read::Fault(e) => Err(e)
+    }
+}
+
+// A statement the walk answers: the filter bound to this run's arguments, the
+// rows it matches, and the order and limit the plan settled.
+fn run_walk(eng: &mut engine::Engine, plan: &mut Prepared, args: Vec<codec::Value>) -> Result<(i64, engine::QueryResult), String> {
+    let filter = filter::bind(plan.filter, args)?
+    let want = if plan.count_only { scan::Want::Count } else { scan::Want::Values }
+    // An ORDER BY has to see every match before it can say which ones survive
+    // the limit; without one, the walk stops as soon as the limit is filled.
+    let cap = if plan.has_order { -1 } else { plan.limit }
+    let matched, mut kept = scan::table(eng, &mut plan.def, filter, want, cap)?
+    if plan.count_only {
+        return engine::counted(if plan.limit >= 0 && matched > plan.limit { plan.limit } else { matched })
+    }
+    if plan.has_order {
+        let oi = plan.order_idx
+        if plan.order_asc {
+            kept.sort_by(|a, b| schema::cmp_vals(a.vals[oi], b.vals[oi]))
+        } else {
+            kept.sort_by(|a, b| schema::cmp_vals(b.vals[oi], a.vals[oi]))
+        }
+        if plan.limit >= 0 && kept.len() > plan.limit { kept.truncate(plan.limit) }
+    }
+    if plan.identity { return Ok((kept.len(), engine::QueryResult { cols: plan.out_cols, rows: kept })) }
+    let mut projected: Vec<engine::Row> = #[]
+    for row in kept {
+        let mut vals: Vec<codec::Value> = #[]
+        for i in plan.picks { vals.push(row.vals[i]) }
+        projected.push(engine::Row { rowid: row.rowid, vals: vals })
+    }
+    Ok((projected.len(), engine::QueryResult { cols: plan.out_cols, rows: projected }))
+}
+
+// What a keyed read answers for a row the store does not hold: no rows, or a
+// count of none.
+fn missing(plan: &mut Prepared) -> Result<(i64, engine::QueryResult), String> {
+    if plan.count_only { return engine::counted(0) }
+    Ok((0, engine::QueryResult { cols: plan.out_cols, rows: #[] }))
+}
+
+
+#[cfg(test)]
+mod tests {
+    use std::fs
+    use crate::codec
+    use crate::engine
+
+    fn fresh(name: String) -> String {
+        let dir = "/tmp/terndb_engine_test/" + name
+        let _ = fs::remove_dir_all(dir)
+        let _ = fs::create_dir_all(dir)
+        dir
+    }
+
+    fn opened(dir: String) -> engine::Engine {
+        engine::open(dir, false).unwrap_or_else(|e| panic("open " + dir + ": " + e))
+    }
+
+    fn run(eng: &mut engine::Engine, src: String) -> i64 {
+        match engine::exec(eng, src) {
+            Ok((n, _)) => return n
+            Err(e) => {
+                assert(false, src + " -> " + e)
+                return -1
+            }
+        }
+    }
+
+    fn rows(eng: &mut engine::Engine, src: String) -> Vec<Vec<String>> {
+        match engine::exec(eng, src) {
+            Ok((_, res)) => {
+                let mut out: Vec<Vec<String>> = #[]
+                for row in res.rows {
+                    let mut cells: Vec<String> = #[]
+                    for v in row.vals { cells.push(codec::value_to_string(v)) }
+                    out.push(cells)
+                }
+                return out
+            }
+            Err(e) => {
+                assert(false, src + " -> " + e)
+                return #[]
+            }
+        }
+    }
+
+    fn users(eng: &mut engine::Engine) {
+        assert_eq(run(eng, "CREATE TABLE users (name TEXT, age INT32, active BOOL, at DATETIME, score FLOAT)"), 0)
+        assert_eq(run(eng, "INSERT INTO users VALUES ('alice', 30, true, '2023-11-14T22:13:20Z', 1.5)"), 1)
+        assert_eq(run(eng, "INSERT INTO users VALUES ('bob', 40, false, '2023-12-01T10:00:00Z', 2.5)"), 1)
+        assert_eq(run(eng, "INSERT INTO users VALUES ('carol', 25, true, '2024-01-01T00:00:00Z', 3.5)"), 1)
+    }
+
+    fn prepared(eng: &mut engine::Engine, src: String) -> super::Prepared {
+        super::prepare(eng, src).unwrap_or_else(|e| panic(src + ": " + e))
+    }
+
+    fn ran(eng: &mut engine::Engine, plan: &mut super::Prepared, args: Vec<codec::Value>) -> Vec<Vec<String>> {
+        match engine::plan::run(eng, plan, args) {
+            Ok((_, res)) => {
+                let mut out: Vec<Vec<String>> = #[]
+                for row in res.rows {
+                    let mut cells: Vec<String> = #[]
+                    for v in row.vals { cells.push(codec::value_to_string(v)) }
+                    out.push(cells)
+                }
+                out
+            }
+            Err(e) => {
+                assert(false, plan.src + ": " + e)
+                #[]
+            }
+        }
+    }
+
+    #[test]
+    fn a_prepared_read_answers_the_same_as_the_statement_it_came_from() {
+        let mut eng = opened(fresh("prepared"))
+        users(&mut eng)
+        let mut plan = prepared(&mut eng, "SELECT name, age FROM users WHERE rowid = ?")
+        assert_eq(plan.arity, 1)
+        assert_eq(ran(&mut eng, &mut plan, #[codec::v_i64(1)]), #[#["alice", "30"]])
+        assert_eq(ran(&mut eng, &mut plan, #[codec::v_i64(2)]), #[#["bob", "40"]])
+        assert_eq(ran(&mut eng, &mut plan, #[codec::v_i64(3)]), #[#["carol", "25"]])
+        assert_eq(ran(&mut eng, &mut plan, #[codec::v_i64(99)]), #[], "an absent id matches nothing")
+        // Running it again does not disturb the plan.
+        assert_eq(ran(&mut eng, &mut plan, #[codec::v_i64(1)]), #[#["alice", "30"]])
+        assert_eq(rows(&mut eng, "SELECT name, age FROM users WHERE rowid = 1"), #[#["alice", "30"]])
+    }
+
+    #[test]
+    fn read_row_answers_what_the_prepared_statement_would() {
+        let mut eng = opened(fresh("read_row"))
+        users(&mut eng)
+        let mut plan = prepared(&mut eng, "SELECT name, age FROM users WHERE rowid = ?")
+        let mut out: Vec<codec::Value> = #[]
+        assert_eq(super::read_row(&mut eng, &mut plan, 2, &mut out).unwrap_or(false), true)
+        assert_eq(codec::value_to_string(out[0]), "bob")
+        assert_eq(codec::value_to_string(out[1]), "40")
+        assert_eq(super::read_row(&mut eng, &mut plan, 99, &mut out).unwrap_or(true), false)
+        assert_eq(out.len(), 0, "a miss leaves nothing behind")
+        assert_eq(super::read_row(&mut eng, &mut plan, 0, &mut out).unwrap_or(true), false)
+        // The same answer the statement gives.
+        assert_eq(ran(&mut eng, &mut plan, #[codec::v_i64(2)]), #[#["bob", "40"]])
+
+        let mut whole = prepared(&mut eng, "SELECT * FROM users WHERE rowid = ?")
+        assert_eq(super::read_row(&mut eng, &mut whole, 1, &mut out).unwrap_or(false), true)
+        assert_eq(out.len(), 5, "every column, in schema order")
+        assert_eq(codec::value_to_string(out[0]), "alice")
+
+        let mut walk = prepared(&mut eng, "SELECT name FROM users WHERE age > ?")
+        assert(super::read_row(&mut eng, &mut walk, 1, &mut out).is_err(), "not a single-row read")
+    }
+
+    #[test]
+    fn a_prepared_read_binds_ordinary_columns_too() {
+        let mut eng = opened(fresh("prepared_cols"))
+        users(&mut eng)
+        let mut by_name = prepared(&mut eng, "SELECT age FROM users WHERE name = ?")
+        assert_eq(ran(&mut eng, &mut by_name, #[codec::v_text("bob")]), #[#["40"]])
+        assert_eq(ran(&mut eng, &mut by_name, #[codec::v_text("carol")]), #[#["25"]])
+
+        let mut older = prepared(&mut eng, "SELECT name FROM users WHERE age > ? ORDER BY age DESC")
+        assert_eq(ran(&mut eng, &mut older, #[codec::v_i64(26)]), #[#["bob"], #["alice"]])
+        assert_eq(ran(&mut eng, &mut older, #[codec::v_i64(100)]), #[])
+
+        let mut two = prepared(&mut eng, "SELECT name FROM users WHERE age > ? AND active = ?")
+        assert_eq(two.arity, 2)
+        assert_eq(ran(&mut eng, &mut two, #[codec::v_i64(20), codec::v_bool(true)]), #[#["alice"], #["carol"]])
+
+        let mut counted = prepared(&mut eng, "SELECT COUNT(*) FROM users WHERE age >= ?")
+        assert_eq(ran(&mut eng, &mut counted, #[codec::v_i64(30)]), #[#["2"]])
+    }
+
+    #[test]
+    fn a_prepared_read_narrows_its_arguments_like_a_literal() {
+        let mut eng = opened(fresh("prepared_narrow"))
+        users(&mut eng)
+        // A datetime column takes the text spelling, bound or written.
+        let mut at = prepared(&mut eng, "SELECT name FROM users WHERE at = ?")
+        assert_eq(ran(&mut eng, &mut at, #[codec::v_text("2023-11-14T22:13:20Z")]), #[#["alice"]])
+        // An INT32 column takes a whole number.
+        let mut age = prepared(&mut eng, "SELECT name FROM users WHERE age = ?")
+        assert_eq(ran(&mut eng, &mut age, #[codec::v_i64(40)]), #[#["bob"]])
+    }
+
+    #[test]
+    fn a_prepared_read_checks_its_arguments() {
+        let mut eng = opened(fresh("prepared_args"))
+        users(&mut eng)
+        let mut plan = prepared(&mut eng, "SELECT name FROM users WHERE rowid = ?")
+        assert(engine::plan::run(&mut eng, &mut plan, #[]).is_err(), "no argument for the placeholder")
+        assert(engine::plan::run(&mut eng, &mut plan, #[codec::v_i64(1), codec::v_i64(2)]).is_err(), "one too many")
+        assert(engine::plan::run(&mut eng, &mut plan, #[codec::v_text("x")]).is_err(), "a row id is a whole number")
+        assert(super::prepare(&mut eng, "DELETE FROM users WHERE rowid = ?").is_err(), "only a read is prepared")
+        assert(super::prepare(&mut eng, "SELECT * FROM nope WHERE rowid = ?").is_err())
+        assert(super::prepare(&mut eng, "SELECT nope FROM users").is_err())
+    }
+
+    #[test]
+    fn a_statement_with_no_placeholders_can_still_be_prepared() {
+        let mut eng = opened(fresh("prepared_const"))
+        users(&mut eng)
+        let mut plan = prepared(&mut eng, "SELECT COUNT(*) FROM users")
+        assert_eq(plan.arity, 0)
+        assert_eq(ran(&mut eng, &mut plan, #[]), #[#["3"]])
+        assert_eq(ran(&mut eng, &mut plan, #[]), #[#["3"]])
+    }
+
+    #[test]
+    fn a_statement_that_writes_cannot_be_planned_as_a_read() {
+        let mut eng = opened(fresh("prepare_misuse"))
+        assert_eq(run(&mut eng, "CREATE TABLE t (v TEXT)"), 0)
+        for src in #[
+            "INSERT INTO t VALUES ('a')"
+            "UPDATE t SET v = 'b'"
+            "DELETE FROM t"
+            "CREATE TABLE u (v TEXT)"
+            "CREATE INDEX ON t (v)"
+            "COMPACT"
+        ] {
+            match super::prepare(&mut eng, src) {
+                Ok(_) => assert(false, "prepared a statement that writes: " + src)
+                Err(e) => assert_eq(e, "only a SELECT can be prepared; run the rest with exec", src)
+            }
+        }
+        assert(super::prepare(&mut eng, "SELECT * FROM missing").is_err(), "the table must exist")
+        assert(super::prepare(&mut eng, "NOT SQL AT ALL").is_err(), "and it must parse")
+    }
+
+    #[test]
+    fn a_row_read_takes_a_statement_that_names_one_row() {
+        let mut eng = opened(fresh("read_row_misuse"))
+        assert_eq(run(&mut eng, "CREATE TABLE t (v TEXT)"), 0)
+        assert_eq(run(&mut eng, "INSERT INTO t VALUES ('a')"), 1)
+        // A statement that walks the table is not one a keyed read can answer.
+        let mut walk = super::prepare(&mut eng, "SELECT v FROM t").unwrap_or_else(|e| panic(e))
+        let mut out: Vec<codec::Value> = #[]
+        assert(super::read_row(&mut eng, &mut walk, 1, &mut out).is_err(), "read_row refuses a walk")
+        assert(engine::plan::read_json(&mut eng, &mut walk, 1).is_err(), "so does the JSON form")
+        assert(matches(engine::plan::read_bytes(&mut eng, &mut walk, 1), kv::Read::Fault(_)), "not a single-row read")
+        // A row id below the first is absent rather than an error.
+        let mut keyed = super::prepare(&mut eng, "SELECT v FROM t WHERE rowid = ?").unwrap_or_else(|e| panic(e))
+        assert(!super::read_row(&mut eng, &mut keyed, 0, &mut out).unwrap_or(true))
+        assert_eq(engine::plan::read_json(&mut eng, &mut keyed, -5).unwrap_or("x"), "")
+        assert(matches(engine::plan::read_bytes(&mut eng, &mut keyed, 0), kv::Read::Absent))
+        assert_eq(out.len(), 0, "a miss leaves nothing behind")
+    }
+
+    #[test]
+    fn a_keyed_read_renders_its_row_as_json() {
+        let mut eng = opened(fresh("row_json"))
+        assert_eq(run(&mut eng, "CREATE TABLE users (name TEXT, email TEXT, score FLOAT, active BOOL)"), 0)
+        assert_eq(run(&mut eng, "INSERT INTO users VALUES ('a\"b', 'a@b', 1.5, true), ('c', 'c@d', 2.5, false)"), 2)
+        let mut whole = super::prepare(&mut eng, "SELECT name, email, score, active FROM users WHERE rowid = ?").unwrap_or_else(|e| panic(e))
+        assert_eq(engine::plan::read_json(&mut eng, &mut whole, 1).unwrap_or("")
+            "{\"id\":1,\"name\":\"a\\\"b\",\"email\":\"a@b\",\"score\":1.5,\"active\":true}")
+        // A projection out of table order reaches its columns through the row.
+        let mut picked = super::prepare(&mut eng, "SELECT active, name FROM users WHERE rowid = ?").unwrap_or_else(|e| panic(e))
+        assert_eq(engine::plan::read_json(&mut eng, &mut picked, 2).unwrap_or("")
+            "{\"id\":2,\"active\":false,\"name\":\"c\"}")
+        assert_eq(engine::plan::read_json(&mut eng, &mut whole, 99).unwrap_or("x"), "", "a row that is not there answers nothing")
+    }
+}

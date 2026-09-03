@@ -1,0 +1,562 @@
+use std::fs
+use std::hash::crc32
+use crate::kv
+use super::log
+
+// What the store holds in memory: a dense slot per row for the tables whose
+// keys are `<table>/r/<rowid>`, and a hash entry for every other key.
+//
+// The two are one index. A key is offered to the dense side first, and the hash
+// side takes whatever it declines, so a caller never has to know which side
+// answered.
+
+// How far past a table's highest rowid a key may reach and still be held
+// densely. Rowids come from a counter, so a legitimate one is at most a step
+// past the top; a key far beyond that names a sparse space, which the hash
+// index holds at a cost proportional to the keys rather than to their range.
+const ROWID_SLACK: i64 = 1_048_576
+
+// Widest rowid the digit scan will read, so a long run of digits cannot
+// overflow the accumulator before the slack test rejects it.
+const MAX_ROWID: i64 = 1_000_000_000_000_000
+
+// How many bytes of sealed generations a store may hold in memory. A sealed
+// generation carries a hint file and is never appended to again, so its bytes
+// cannot change under a reader: holding them turns every read of that
+// generation into a look at a buffer rather than a positional read and a copy
+// of the value out of it. The budget is what keeps a large log from being held
+// whole; zero holds none.
+pub (package) const RESIDENT_BUDGET: i64 = 67_108_864
+
+/// One table's rows, addressed by rowid rather than by key.
+///
+/// Row keys are `<table>/r/<rowid>` and rowids come from a counter, so a
+/// table's live rows are a dense integer range. Two words of a `Vec` hold what
+/// a hash entry holds, at a tenth of the memory, and a keyed read builds no
+/// key and hashes nothing.
+pub struct RowIndex {
+    pub name: String
+    pub prefix: String
+    /// Three words per rowid: `3 * rid` places the record, `3 * rid + 1` carries
+    /// its generation and record checksum and is zero where no row is, and
+    /// `3 * rid + 2` carries the checksum of the record's key. A read continues
+    /// the third over the value it read and compares it against the second,
+    /// which checks the record without rebuilding the key it was written with.
+    pub slots: Vec<i64>
+    pub live: i64
+    /// Highest rowid this table has ever held, so a deleted one is not reissued.
+    pub top: i64
+}
+
+/// The table `name` addresses, or -1 when no row of it has been seen.
+pub fn table_id(st: &mut kv::Store, name: String) -> i64 {
+    let mut i: i64 = 0
+    while i < st.tables.len() {
+        if st.tables[i].name == name { return i }
+        i += 1
+    }
+    -1
+}
+
+/// The table `name` addresses, opening its row index on the first sight of it.
+pub fn open_table(st: &mut kv::Store, name: String) -> i64 {
+    let found = table_id(st, name)
+    if found >= 0 { return found }
+    let prefix = name + "/r/"
+    st.tables.push(RowIndex { name: name, prefix: prefix, slots: #[], live: 0, top: 0 })
+    st.tables.len() - 1
+}
+
+// The rowid a key names within `tid`, or -1 when it names none. A rowid is
+// written without a leading zero, so one row is never reachable under two
+// spellings of its key.
+fn rowid_after(st: &mut kv::Store, tid: i64, key: String) -> i64 {
+    let start = st.tables[tid].prefix.byte_len()
+    let n = key.byte_len()
+    if n <= start { return -1 }
+    if key.byte_at(start) == 48 && n > start + 1 { return -1 }
+    let mut v: i64 = 0
+    let mut i = start
+    while i < n {
+        let c = key.byte_at(i)
+        if c < 48 || c > 57 { return -1 }
+        v = v * 10 + (c - 48)
+        if v > MAX_ROWID { return -1 }
+        i += 1
+    }
+    if v < 1 { return -1 }
+    v
+}
+
+// Byte index just past the `/r/` of a `<table>/r/<digits>` key, or -1 when the
+// key is not that shape.
+fn row_prefix_end(key: String) -> i64 {
+    let n = key.byte_len()
+    let mut i = n
+    while i > 0 {
+        let c = key.byte_at(i - 1)
+        if c < 48 || c > 57 { break }
+        i -= 1
+    }
+    if i == n || i < 4 { return -1 }
+    if key.byte_at(i - 1) != 47 { return -1 }
+    if key.byte_at(i - 2) != 114 { return -1 }
+    if key.byte_at(i - 3) != 47 { return -1 }
+    i
+}
+
+// The table and rowid a key names among the tables already opened. A row the
+// dense index declined still answers here, because the caller falls through to
+// the hash index when the slot turns out to be empty.
+pub (package) fn locate_row(st: &mut kv::Store, key: String) -> (i64, i64) {
+    let mut t: i64 = 0
+    while t < st.tables.len() {
+        if key.starts_with(st.tables[t].prefix) {
+            let rid = rowid_after(st, t, key)
+            if rid > 0 { return (t, rid) }
+            return (-1, -1)
+        }
+        t += 1
+    }
+    (-1, -1)
+}
+
+// The table and rowid a key should be stored under, opening the table on the
+// first row of it. `(-1, -1)` sends the key to the hash index: it is not a
+// canonical row key, or its rowid reaches so far past the table's top that a
+// dense slot for it would cost more than the entry it replaces.
+fn locate_or_open_row(st: &mut kv::Store, key: String) -> (i64, i64) {
+    let mut t: i64 = 0
+    while t < st.tables.len() {
+        if key.starts_with(st.tables[t].prefix) {
+            let rid = rowid_after(st, t, key)
+            if rid > 0 && rid <= st.tables[t].top + ROWID_SLACK { return (t, rid) }
+            return (-1, -1)
+        }
+        t += 1
+    }
+    let cut = row_prefix_end(key)
+    if cut < 0 { return (-1, -1) }
+    let name = key.substring(0, cut - 3)
+    let tid = open_table(st, name)
+    let rid = rowid_after(st, tid, key)
+    if rid > 0 && rid <= ROWID_SLACK { return (tid, rid) }
+    (-1, -1)
+}
+
+// Grows `tid`'s slots to hold `rid` and answers the index of its first word.
+fn slot_for(st: &mut kv::Store, tid: i64, rid: i64) -> i64 {
+    let want = 3 * rid + 3
+    if st.tables[tid].slots.len() < want { st.tables[tid].slots.resize(want, 0) }
+    3 * rid
+}
+
+// What a row's record occupies, key included, from the parts the dense index
+// keeps instead of the key.
+pub (package) fn row_record_len(st: &mut kv::Store, tid: i64, rid: i64, vlen: i64) -> i64 {
+    log::HEADER_LEN + st.tables[tid].prefix.byte_len() + log::digits_len(rid) + vlen
+}
+
+// Replacing a key retires whatever the index held for it; the retired bytes
+// are what compaction reclaims.
+pub (package) fn remember(st: &mut kv::Store, key: String, e: kv::Entry) {
+    let tid, rid = locate_or_open_row(st, key)
+    if tid >= 0 {
+        // A key the hash index answered before a dense slot could hold it
+        // moves rather than being held in both.
+        if let Some(old) = st.index.get(key) {
+            st.live_bytes -= old.vlen
+            st.dead_bytes += log::record_len(key, old.vlen)
+            let _ = st.index.remove(key)
+        }
+        // The key's own checksum is taken once, here, so a read never rebuilds
+        // the key to check the record it found.
+        let kcrc = crc32::checksum(key.as_bytes())
+        let s = slot_for(st, tid, rid)
+        if st.tables[tid].slots[s + 1] == 0 {
+            st.tables[tid].live += 1
+        } else {
+            let plen = log::loc_vlen(st.tables[tid].slots[s])
+            st.live_bytes -= plen
+            st.dead_bytes += row_record_len(st, tid, rid, plen)
+        }
+        st.tables[tid].slots[s] = log::pack_loc(e.offset, e.vlen)
+        st.tables[tid].slots[s + 1] = log::pack_gc(e.file, e.crc)
+        st.tables[tid].slots[s + 2] = kcrc
+        if rid > st.tables[tid].top { st.tables[tid].top = rid }
+        st.live_bytes += e.vlen
+        return
+    }
+    if let Some(old) = st.index.get(key) {
+        st.live_bytes -= old.vlen
+        st.dead_bytes += log::record_len(key, old.vlen)
+    }
+    st.index.insert(key, e)
+    st.live_bytes += e.vlen
+}
+
+pub (package) fn forget(st: &mut kv::Store, key: String) {
+    let tid, rid = locate_row(st, key)
+    if tid >= 0 {
+        let s = 3 * rid
+        if s + 2 < st.tables[tid].slots.len() && st.tables[tid].slots[s + 1] != 0 {
+            let plen = log::loc_vlen(st.tables[tid].slots[s])
+            st.live_bytes -= plen
+            st.dead_bytes += row_record_len(st, tid, rid, plen)
+            st.tables[tid].slots[s] = 0
+            st.tables[tid].slots[s + 1] = 0
+            st.tables[tid].slots[s + 2] = 0
+            st.tables[tid].live -= 1
+            return
+        }
+    }
+    if let Some(old) = st.index.get(key) {
+        st.live_bytes -= old.vlen
+        st.dead_bytes += log::record_len(key, old.vlen)
+        let _ = st.index.remove(key)
+    }
+}
+
+/// The row `rid` of table `tid`, or None when no row is there.
+///
+/// This is what a keyed read costs: three words out of a `Vec`, one positional
+/// read, and the record's checksum continued from the key's over the value.
+/// Nothing is hashed and no key is built.
+///
+/// A slot the index holds names a record the store must be able to produce, so
+/// a read that cannot is a [`kv::Read::Fault`] and not an absence: only a row
+/// never written or since deleted is [`kv::Read::Absent`].
+pub fn read(st: &mut kv::Store, tid: i64, rid: i64) -> kv::Read {
+    if tid < 0 || rid < 1 { return kv::Read::Absent }
+    let s = 3 * rid
+    if s + 2 >= st.tables[tid].slots.len() { return kv::Read::Absent }
+    let gc = st.tables[tid].slots[s + 1]
+    if gc == 0 { return kv::Read::Absent }
+    let loc = st.tables[tid].slots[s]
+    let vlen = log::loc_vlen(loc)
+    let prefix = st.tables[tid].prefix
+    let at = log::loc_offset(loc) + log::HEADER_LEN + prefix.byte_len() + log::digits_len(rid)
+    let kcrc = st.tables[tid].slots[s + 2]
+    let gen = log::gc_gen(gc)
+    if gen == st.gen {
+        if let Some(f) = st.data { return read_row_value(f, at, vlen, kcrc, log::gc_crc(gc), prefix, rid) }
+    }
+    match kv::reader_for(st, gen) {
+        Some(f) => read_row_value(f, at, vlen, kcrc, log::gc_crc(gc), prefix, rid)
+        None => kv::Read::Fault(row_name(prefix, rid) + ": generation " + gen.to_string() +
+            " cannot be opened")
+    }
+}
+
+// One positional read of a row's value, checked against the checksum its slot
+// carries. The answer is built here and handed straight back, so the value a
+// caller receives is the one the read produced.
+//
+// The row's name is carried in rather than built, so it costs a message only
+// where there is a fault to report.
+fn read_row_value(f: fs::File, at: i64, vlen: i64, kcrc: i64, crc: i64, prefix: String, rid: i64) -> kv::Read {
+    let value = match f.read_at(vlen, at) {
+        Ok(v) => v
+        Err(e) => return kv::Read::Fault(row_name(prefix, rid) + ": " + e.message())
+    }
+    if value.len() != vlen {
+        return kv::Read::Fault(row_name(prefix, rid) + ": " + value.len().to_string() + " of " +
+            vlen.to_string() + " bytes readable")
+    }
+    if crc32::update(kcrc, value) != crc {
+        return kv::Read::Fault(row_name(prefix, rid) + ": checksum mismatch")
+    }
+    kv::Read::Value(value)
+}
+
+// How a row is named in a fault: the key it is stored under.
+fn row_name(prefix: String, rid: i64) -> String { "row " + prefix + rid.to_string() }
+
+/// Where row `rid` sits inside the buffer the store holds, as `(start, end)`,
+/// or `(0, 0)` when this cannot place it there.
+///
+/// This is the fast path and not the answer: `(0, 0)` says only that the row is
+/// not to be read out of the held buffer, which a caller answers with [`read`] -
+/// the positional read that tells a row that is not there from one the store
+/// cannot produce. A row whose checksum does not hold over the buffer is
+/// therefore reported by that read rather than swallowed here.
+///
+/// The span names the row; the buffer stays [`kv::Store::resident_bytes`], which
+/// the caller hands straight to whatever reads it. Answering the buffer here
+/// instead would bind it to a local, and a bound container is a value of its
+/// own - a copy of the whole file per row read.
+pub fn span(st: &mut kv::Store, tid: i64, rid: i64) -> (i64, i64) {
+    if tid < 0 || rid < 1 { return (0, 0) }
+    let s = 3 * rid
+    if s + 2 >= st.tables[tid].slots.len() { return (0, 0) }
+    let gc = st.tables[tid].slots[s + 1]
+    if gc == 0 { return (0, 0) }
+    let gen = log::gc_gen(gc)
+    if gen == st.gen { return (0, 0) }
+    if st.resident_gen != gen { return (0, 0) }
+    let loc = st.tables[tid].slots[s]
+    let vlen = log::loc_vlen(loc)
+    let at = log::loc_offset(loc) + log::HEADER_LEN + st.tables[tid].prefix.byte_len() + log::digits_len(rid)
+    if at < 0 || vlen <= 0 || at + vlen > st.resident_bytes.len() { return (0, 0) }
+    if crc32::update_window(st.tables[tid].slots[s + 2], st.resident_bytes, at, at + vlen)
+    != log::gc_crc(gc)
+    {
+        return (0, 0)
+    }
+    (at, at + vlen)
+}
+
+// Holds one sealed generation's bytes, chosen once while the store is being
+// opened. Residency is settled here rather than on the read path for two
+// reasons: a store that decides it per read would swap buffers whenever
+// consecutive rows fall in different generations, and a reader that is already
+// answering requests shares its state with every thread serving one, so a
+// buffer admitted then would be stored into a value those threads already
+// reach.
+//
+// The largest generation that fits the budget is the one held: it is the one
+// the most rows are read from. A generation still being appended to is never
+// admitted, since its bytes are not final.
+pub (package) fn admit_resident(st: &mut kv::Store, gens: Vec<i64>) {
+    if st.resident_budget <= 0 { return }
+    let mut best: i64 = 0
+    let mut best_size: i64 = 0
+    for g in gens {
+        if g == st.gen { continue }
+        if !fs::is_file(log::hint_path(st.dir, g)) { continue }
+        let size = fs::file_size(log::data_path(st.dir, g))
+        if size <= 0 || size > st.resident_budget { continue }
+        if size > best_size { best = g; best_size = size }
+    }
+    if best == 0 { return }
+    match fs::read(log::data_path(st.dir, best)) {
+        Ok(b) => {
+            st.resident_bytes = b
+            st.resident_gen = best
+        }
+        Err(_) => ()
+    }
+}
+
+/// Whether table `tid` holds row `rid`, without reading it.
+pub fn holds(st: &mut kv::Store, tid: i64, rid: i64) -> bool {
+    if tid < 0 || rid < 1 { return false }
+    let s = 3 * rid + 1
+    if s >= st.tables[tid].slots.len() { return false }
+    st.tables[tid].slots[s] != 0
+}
+
+/// How many rows table `tid` holds.
+pub fn count(st: &mut kv::Store, tid: i64) -> i64 {
+    if tid < 0 { return 0 }
+    st.tables[tid].live
+}
+
+/// The highest rowid table `tid` has ever held, which is what the next one is
+/// counted from so a deleted id is not reissued.
+pub fn last_id(st: &mut kv::Store, tid: i64) -> i64 {
+    if tid < 0 { return 0 }
+    st.tables[tid].top
+}
+
+
+/// Stores `val` as row `rid` of table `tid`.
+pub fn write(st: &mut kv::Store, tid: i64, rid: i64, val: Vec<u8>) -> Result<(), String> {
+    if tid < 0 || tid >= st.tables.len() { return Err("put_row: no such table") }
+    if rid < 1 { return Err("put_row: rowid must be positive") }
+    let key = st.tables[tid].prefix + rid.to_string()
+    kv::put(st, key, val)
+}
+
+/// Removes row `rid` of table `tid`, reporting whether it was there.
+pub fn remove(st: &mut kv::Store, tid: i64, rid: i64) -> Result<bool, String> {
+    if tid < 0 || tid >= st.tables.len() { return Err("delete_row: no such table") }
+    if rid < 1 { return Ok(false) }
+    let key = st.tables[tid].prefix + rid.to_string()
+    kv::delete(st, key)
+}
+#[cfg(test)]
+mod tests {
+    use crate::kv
+
+    fn fresh(name: String) -> String {
+        let dir = "/tmp/terndb_kv_test/" + name
+        let _ = fs::remove_dir_all(dir)
+        let _ = fs::create_dir_all(dir)
+        dir
+    }
+
+    fn opened(dir: String) -> kv::Store {
+        kv::open(dir, false).unwrap_or_else(|e| panic("open " + dir + ": " + e))
+    }
+
+    // The bytes a read answered, with an absence or a fault failing the test.
+    fn value(r: kv::Read) -> Vec<u8> {
+        match r {
+            kv::Read::Value(v) => return v
+            kv::Read::Absent => {
+                assert(false, "expected a row")
+                return #[]
+            }
+            kv::Read::Fault(e) => {
+                assert(false, e)
+                return #[]
+            }
+        }
+    }
+
+    fn must_get(st: &mut kv::Store, key: String) -> Vec<u8> {
+        match kv::get(st, key) {
+            kv::Read::Value(v) => return v
+            kv::Read::Fault(e) => panic(e)
+            kv::Read::Absent => {
+                assert(false, "expected a value for '" + key + "'")
+                return #[]
+            }
+        }
+    }
+
+    #[test]
+    fn a_row_key_is_indexed_by_rowid_not_by_string() {
+        let mut st = opened(fresh("dense"))
+        let tid = super::open_table(&mut st, "users")
+        assert(kv::rows::write(&mut st, tid, 1, "a".as_bytes()).is_ok())
+        assert(kv::rows::write(&mut st, tid, 3, "c".as_bytes()).is_ok())
+        assert_eq(value(kv::rows::read(&mut st, tid, 1)), "a".as_bytes())
+        assert(matches(kv::rows::read(&mut st, tid, 2), kv::Read::Absent), "an unused rowid is absent")
+        assert_eq(kv::rows::count(&mut st, tid), 2)
+        assert_eq(kv::rows::last_id(&mut st, tid), 3)
+        assert_eq(must_get(&mut st, "users/r/3"), "c".as_bytes(), "the string key still reaches the row")
+        assert_eq(kv::len(&mut st), 2, "len counts rows and plain keys together")
+        assert(kv::contains(&mut st, "users/r/1"), "a dense row answers contains")
+        assert(!kv::contains(&mut st, "users/r/2"))
+        assert_eq(kv::scan::count_prefix(&mut st, "users/r/"), 2)
+        assert_eq(kv::scan::keys(&mut st, "users/r/"), #["users/r/1", "users/r/3"])
+        assert(kv::delete(&mut st, "users/r/1").unwrap_or(false), "a row deletes through its string key")
+        assert_eq(kv::rows::count(&mut st, tid), 1)
+        assert(matches(kv::rows::read(&mut st, tid, 1), kv::Read::Absent))
+    }
+
+    #[test]
+    fn a_row_index_survives_a_reopen_from_hints_and_from_data() {
+        let dir = fresh("dense_reopen")
+        let mut st = opened(dir)
+        let tid = super::open_table(&mut st, "t")
+        let mut i: i64 = 1
+        while i < 501 {
+            assert(kv::rows::write(&mut st, tid, i, ("v" + i.to_string()).as_bytes()).is_ok())
+            i += 1
+        }
+        assert(kv::rows::remove(&mut st, tid, 250).unwrap_or(false))
+        assert(kv::sync(&mut st).is_ok())
+        let mut re = kv::open(dir, true).unwrap_or_else(|e| panic(e))
+        let rt = super::table_id(&mut re, "t")
+        assert(rt >= 0, "the reopened store found the table by its row keys")
+        assert_eq(kv::rows::count(&mut re, rt), 499)
+        assert(matches(kv::rows::read(&mut re, rt, 250), kv::Read::Absent))
+        assert_eq(value(kv::rows::read(&mut re, rt, 500)), "v500".as_bytes())
+        assert_eq(kv::len(&mut re), 499)
+        assert(kv::compact::run(&mut st).is_ok())
+        let mut re2 = kv::open(dir, true).unwrap_or_else(|e| panic(e))
+        let rt2 = super::table_id(&mut re2, "t")
+        assert_eq(kv::rows::count(&mut re2, rt2), 499, "a compacted store rebuilds the same index from its hint")
+        assert_eq(value(kv::rows::read(&mut re2, rt2, 500)), "v500".as_bytes())
+        assert(matches(kv::rows::read(&mut re2, rt2, 250), kv::Read::Absent))
+    }
+
+    #[test]
+    fn a_row_shaped_key_the_dense_index_declines_still_round_trips() {
+        let mut st = opened(fresh("dense_decline"))
+        // A leading zero is not the canonical spelling of a rowid, and a rowid
+        // far past the table's top names a space the hash index answers better.
+        assert(kv::put(&mut st, "t/r/007", #[7u8]).is_ok())
+        assert(kv::put(&mut st, "t/r/99999999", #[9u8]).is_ok())
+        assert(kv::put(&mut st, "t/r/1", #[1u8]).is_ok())
+        assert_eq(must_get(&mut st, "t/r/007"), #[7u8])
+        assert_eq(must_get(&mut st, "t/r/99999999"), #[9u8])
+        assert_eq(must_get(&mut st, "t/r/1"), #[1u8])
+        assert_eq(kv::len(&mut st), 3)
+        assert_eq(kv::scan::keys(&mut st, "t/r/"), #["t/r/007", "t/r/1", "t/r/99999999"])
+        assert(kv::compact::run(&mut st).is_ok())
+        assert_eq(must_get(&mut st, "t/r/007"), #[7u8], "compaction keeps a declined key")
+        assert_eq(must_get(&mut st, "t/r/1"), #[1u8])
+        assert_eq(kv::len(&mut st), 3)
+    }
+
+    #[test]
+    fn the_row_api_refuses_a_table_or_row_it_does_not_have() {
+        let mut st = opened(fresh("row_api_misuse"))
+        let tid = super::open_table(&mut st, "t")
+        assert(kv::rows::write(&mut st, tid + 5, 1, #[1u8]).is_err(), "no such table")
+        assert(kv::rows::write(&mut st, -1, 1, #[1u8]).is_err())
+        assert(kv::rows::write(&mut st, tid, 0, #[1u8]).is_err(), "a rowid starts at one")
+        assert(kv::rows::remove(&mut st, tid + 5, 1).is_err(), "no such table")
+        assert(!kv::rows::remove(&mut st, tid, 0).unwrap_or(true), "a rowid below one is absent")
+        assert(!kv::rows::remove(&mut st, tid, 99).unwrap_or(true), "a row that was never there")
+        // Reads of what is not there answer nothing rather than failing.
+        assert(matches(kv::rows::read(&mut st, tid, 1), kv::Read::Absent))
+        assert(matches(kv::rows::read(&mut st, -1, 1), kv::Read::Absent))
+        assert(!kv::rows::holds(&mut st, tid, 1))
+        assert(!kv::rows::holds(&mut st, -1, 1))
+        assert_eq(kv::rows::count(&mut st, -1), 0)
+        assert_eq(kv::rows::last_id(&mut st, -1), 0)
+        assert_eq(super::table_id(&mut st, "nope"), -1, "a table nothing has named")
+    }
+
+    // Flips a byte of the first occurrence of `needle` in the file, which for a
+    // value written as text is a byte of that value.
+    fn flip_byte(path: String, needle: String) -> bool {
+        let mut bytes = fs::read(path).unwrap_or(#[])
+        let n = needle.as_bytes()
+        let mut i: i64 = 0
+        while i + n.len() <= bytes.len() {
+            let mut j: i64 = 0
+            let mut hit = true
+            while j < n.len() {
+                if bytes[i + j] != n[j] {
+                    hit = false
+                    break
+                }
+                j += 1
+            }
+            if hit {
+                bytes[i] = 88u8
+                return fs::write(path, bytes).is_ok()
+            }
+            i += 1
+        }
+        false
+    }
+
+    #[test]
+    fn a_row_that_fails_its_checksum_is_reported_and_not_answered_as_absent() {
+        // A sealed generation is described by its hint file, so a read is the
+        // first thing to look at the bytes: this is the shape a corrupted value
+        // actually reaches a caller in.
+        let dir = fresh("row_corrupt")
+        let mut st = opened(dir)
+        let tid = super::open_table(&mut st, "t")
+        assert(kv::rows::write(&mut st, tid, 1, "zzzzzzzz".as_bytes()).is_ok())
+        assert(kv::rows::write(&mut st, tid, 2, "wwwwwwww".as_bytes()).is_ok())
+        assert(kv::compact::run(&mut st).is_ok())
+        assert(kv::sync(&mut st).is_ok())
+
+        let sealed = kv::log::data_generations(dir).unwrap_or(#[])[0]
+        assert(flip_byte(kv::log::data_path(dir, sealed), "zzzzzzzz"), "the value is in the sealed file")
+
+        let mut after = opened(dir)
+        let rt = super::table_id(&mut after, "t")
+        match kv::rows::read(&mut after, rt, 1) {
+            kv::Read::Fault(e) => assert(e.contains("checksum mismatch"), "got: " + e)
+            kv::Read::Value(_) => assert(false, "a corrupted row must not read as a row")
+            kv::Read::Absent => assert(false, "a corrupted row is not an absent one")
+        }
+        match kv::get(&mut after, "t/r/1") {
+            kv::Read::Fault(e) => assert(e.contains("checksum mismatch"), "got: " + e)
+            kv::Read::Value(_) => assert(false, "the keyed path reports it too")
+            kv::Read::Absent => assert(false, "the keyed path does not call it absent")
+        }
+        assert_eq(value(kv::rows::read(&mut after, rt, 2))
+            "wwwwwwww".as_bytes(), "the row beside it still reads")
+    }
+}

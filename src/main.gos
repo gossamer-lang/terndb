@@ -1,0 +1,19 @@
+use std::{env, process}
+use crate::cli
+
+// terndb: a small structured key-value store with a light SQL front, embedded
+// in the process that uses it.
+//
+//   terndb exec  <dir> <sql...>        run statements against a directory
+//   terndb shell <dir>                 one statement per line, from stdin
+//   terndb bench <dir> [n] [size]      queries a second and peak memory, against a raw
+//                                      fs::read of the same bytes, filling an empty or
+//                                      previously benchmarked <dir>
+//
+// Every command lives in [`cli`], which writes through streams its caller
+// supplies; this file binds them to the process's own and leaves.
+
+fn main() {
+    let code = cli::dispatch(env::args())
+    if code != 0 { process::exit(code) }
+}

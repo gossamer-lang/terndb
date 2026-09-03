@@ -1,0 +1,287 @@
+use std::encoding::binary
+use crate::engine
+use crate::codec
+
+// A table's columns: the record its definition is stored as, the narrowing of a
+// literal to a column's declared type, and the ordering every comparison and
+// sort is answered from.
+//
+//   schema record: [namelen u16][name][ncols u16][per column: namelen u16][name][tag u8]
+
+pub (package) fn encode(def: engine::TableDef) -> Vec<u8> {
+    let mut out = put_name(#[], def.name)
+    out.extend(binary::put_u16_le(#[], def.cols.len()))
+    for i in 0..def.cols.len() {
+        out = put_name(out, def.cols[i])
+        out.push(def.tags[i])
+    }
+    out
+}
+
+fn put_name(buf: Vec<u8>, name: String) -> Vec<u8> {
+    let bytes = name.as_bytes()
+    let mut out = buf
+    out.extend(binary::put_u16_le(#[], bytes.len()))
+    out.extend(bytes)
+    out
+}
+
+fn take_name(buf: Vec<u8>, p: i64) -> Result<(String, i64), String> {
+    let n = match binary::get_u16_le_at(buf, p) {
+        Ok(x) => x as i64
+        Err(_) => return Err("schema: truncated name length")
+    }
+    let bytes = match buf.slice(p + 2, p + 2 + n) {
+        Ok(b) => b
+        Err(_) => return Err("schema: truncated name")
+    }
+    match String::from_utf8(bytes) {
+        Ok(s) => return Ok((s, p + 2 + n))
+        Err(_) => return Err("schema: name is not UTF-8")
+    }
+}
+
+pub (package) fn decode(buf: Vec<u8>) -> Result<engine::TableDef, String> {
+    let name, mut p = take_name(buf, 0)?
+    let ncols = match binary::get_u16_le_at(buf, p) {
+        Ok(x) => x as i64
+        Err(_) => return Err("schema: truncated column count")
+    }
+    p += 2
+    let mut def = engine::TableDef { name: name, cols: #[], tags: #[] }
+    let mut i: i64 = 0
+    while i < ncols {
+        let col, next = take_name(buf, p)?
+        p = next
+        if p >= buf.len() { return Err("schema: truncated column type") }
+        def.cols.push(col)
+        def.tags.push(buf[p])
+        p += 1
+        i += 1
+    }
+    if def.name == "" { return Err("schema: empty table name") }
+    if def.cols.len() == 0 { return Err("schema: no columns") }
+    Ok(def)
+}
+
+// A literal is accepted for a column when it names the same kind of value:
+// the parser only ever produces i64, f64, text, bool and nil, so this is where
+// each one is narrowed to the column's declared width.
+pub (package) fn coerce(val: codec::Value, tag: u8, col: String) -> Result<codec::Value, String> {
+    if val.tag == codec::TAG_NIL { return Ok(codec::v_nil()) }
+    if tag == codec::TAG_TEXT && val.tag == codec::TAG_TEXT { return Ok(val) }
+    if tag == codec::TAG_BOOL && val.tag == codec::TAG_BOOL { return Ok(val) }
+    if tag == codec::TAG_DT {
+        if val.tag == codec::TAG_TEXT { return Ok(codec::v_dt(codec::datetime::parse(val.s)?)) }
+        if val.tag == codec::TAG_I64 { return Ok(codec::v_dt(val.i)) }
+    }
+    if val.tag == codec::TAG_I64 {
+        match codec::int_range(tag) {
+            Some((lo, hi)) => {
+                if val.i < lo || val.i > hi {
+                    return Err("column '" + col + "' is " + codec::type_name_for_tag(tag) + "; " + val.i.to_string() + " is out of range")
+                }
+                return Ok(codec::Value { tag: tag, b: false, i: val.i, f: 0.0, s: "" })
+            }
+            None => ()
+        }
+        // An integer literal is a valid float; widening it loses nothing a
+        // float column was going to keep anyway.
+        if tag == codec::TAG_F32 { return Ok(codec::v_f32(val.i as f64)) }
+        if tag == codec::TAG_F64 { return Ok(codec::v_f64(val.i as f64)) }
+    }
+    if val.tag == codec::TAG_F64 {
+        if tag == codec::TAG_F32 { return Ok(codec::v_f32(val.f)) }
+        if tag == codec::TAG_F64 { return Ok(val) }
+    }
+    Err("column '" + col + "' is " + codec::type_name_for_tag(tag) +
+        "; a " + codec::type_name_for_tag(val.tag) + " value does not fit it")
+}
+
+pub (package) fn encode_row(vals: Vec<codec::Value>) -> Vec<u8> {
+    let mut out: Vec<u8> = #[]
+    for v in vals { codec::encode_into(&mut out, v) }
+    out
+}
+
+pub (package) fn col_index(def: &mut engine::TableDef, col: String) -> Result<i64, String> {
+    let want = col.to_lowercase()
+    for i in 0..def.cols.len() {
+        if def.cols[i].to_lowercase() == want { return Ok(i) }
+    }
+    Err("no column '" + col + "' in table " + def.name)
+}
+
+/// Orders two values: NULL sorts first, then by kind-appropriate comparison.
+pub fn cmp_vals(a: codec::Value, b: codec::Value) -> i64 {
+    if a.tag == codec::TAG_NIL || b.tag == codec::TAG_NIL {
+        if a.tag == b.tag { return 0 }
+        return if a.tag == codec::TAG_NIL { -1 } else { 1 }
+    }
+    if a.tag == codec::TAG_TEXT || b.tag == codec::TAG_TEXT {
+        if a.s < b.s { return -1 }
+        if a.s > b.s { return 1 }
+        return 0
+    }
+    if a.tag == codec::TAG_BOOL || b.tag == codec::TAG_BOOL {
+        return (if a.b { 1 } else { 0 }) - (if b.b { 1 } else { 0 })
+    }
+    if is_float(a.tag) || is_float(b.tag) {
+        let af = if is_float(a.tag) { a.f } else { a.i as f64 }
+        let bf = if is_float(b.tag) { b.f } else { b.i as f64 }
+        if af < bf { return -1 }
+        if af > bf { return 1 }
+        return 0
+    }
+    if a.i < b.i { return -1 }
+    if a.i > b.i { return 1 }
+    0
+}
+
+fn is_float(tag: u8) -> bool { tag == codec::TAG_F32 || tag == codec::TAG_F64 }
+
+/// The name that addresses a row by the key it is stored under.
+///
+/// A row's id is its identity in the store, not one of its columns, so it is
+/// spelled the way SQLite spells the same idea. An equality test on it is a
+/// single lookup rather than a walk.
+pub const ROWID: String = "rowid"
+
+#[cfg(test)]
+mod tests {
+    use std::fs
+    use crate::codec
+    use crate::engine
+
+    fn fresh(name: String) -> String {
+        let dir = "/tmp/terndb_engine_test/" + name
+        let _ = fs::remove_dir_all(dir)
+        let _ = fs::create_dir_all(dir)
+        dir
+    }
+
+    fn opened(dir: String) -> engine::Engine {
+        engine::open(dir, false).unwrap_or_else(|e| panic("open " + dir + ": " + e))
+    }
+
+    fn run(eng: &mut engine::Engine, src: String) -> i64 {
+        match engine::exec(eng, src) {
+            Ok((n, _)) => return n
+            Err(e) => {
+                assert(false, src + " -> " + e)
+                return -1
+            }
+        }
+    }
+
+    fn rows(eng: &mut engine::Engine, src: String) -> Vec<Vec<String>> {
+        match engine::exec(eng, src) {
+            Ok((_, res)) => {
+                let mut out: Vec<Vec<String>> = #[]
+                for row in res.rows {
+                    let mut cells: Vec<String> = #[]
+                    for v in row.vals { cells.push(codec::value_to_string(v)) }
+                    out.push(cells)
+                }
+                return out
+            }
+            Err(e) => {
+                assert(false, src + " -> " + e)
+                return #[]
+            }
+        }
+    }
+
+    #[test]
+    fn a_schema_record_round_trips_through_its_encoding() {
+        let def = engine::TableDef { name: "táble", cols: #["a", "wörd", "c"], tags: #[codec::TAG_I32, codec::TAG_TEXT, codec::TAG_DT] }
+        match engine::schema::decode(engine::schema::encode(def)) {
+            Ok(back) => {
+                assert_eq(back.name, def.name)
+                assert_eq(back.cols, def.cols)
+                assert_eq(back.tags, def.tags)
+            }
+            Err(e) => assert(false, e)
+        }
+        assert(engine::schema::decode(#[]).is_err())
+        assert(engine::schema::decode(#[9u8, 0u8]).is_err(), "a truncated name is rejected")
+    }
+
+    #[test]
+    fn cmp_vals_orders_across_the_numeric_kinds() {
+        assert_eq(super::cmp_vals(codec::v_i32(1), codec::v_i32(2)), -1)
+        assert_eq(super::cmp_vals(codec::v_i32(2), codec::v_i32(2)), 0)
+        assert_eq(super::cmp_vals(codec::v_i32(3), codec::v_i32(2)), 1)
+        assert_eq(super::cmp_vals(codec::v_i64(1), codec::v_f64(1.5)), -1, "an int compares against a float by value")
+        assert_eq(super::cmp_vals(codec::v_f64(2.0), codec::v_i64(2)), 0)
+        assert_eq(super::cmp_vals(codec::v_nil(), codec::v_i64(-99)), -1, "NULL sorts before every value")
+        assert_eq(super::cmp_vals(codec::v_nil(), codec::v_nil()), 0)
+        assert_eq(super::cmp_vals(codec::v_text("a"), codec::v_text("b")), -1)
+        assert_eq(super::cmp_vals(codec::v_bool(false), codec::v_bool(true)), -1)
+    }
+
+    #[test]
+    fn values_are_narrowed_to_the_declared_column_width() {
+        let mut eng = opened(fresh("narrowing"))
+        assert_eq(run(&mut eng, "CREATE TABLE t (a INT8, b INT16, c INT32, d INT64, e FLOAT32, f FLOAT64)"), 0)
+        assert_eq(run(&mut eng, "INSERT INTO t VALUES (-128, -32768, -2147483648, -9000000000, 1, 2)"), 1)
+        assert_eq(rows(&mut eng, "SELECT * FROM t"), #[#["-128", "-32768", "-2147483648", "-9000000000", "1", "2"]]
+            "an integer literal widens into a float column")
+        assert(engine::exec(&mut eng, "INSERT INTO t VALUES (128, 0, 0, 0, 0, 0)").is_err(), "128 overflows INT8")
+        assert(engine::exec(&mut eng, "INSERT INTO t VALUES (0, 32768, 0, 0, 0, 0)").is_err(), "32768 overflows INT16")
+        assert(engine::exec(&mut eng, "INSERT INTO t VALUES (0, 0, 2147483648, 0, 0, 0)").is_err(), "2147483648 overflows INT32")
+        assert(engine::exec(&mut eng, "INSERT INTO t VALUES ('x', 0, 0, 0, 0, 0)").is_err(), "text does not fit an integer")
+    }
+
+    #[test]
+    fn a_type_error_names_the_column_and_the_type() {
+        let mut eng = opened(fresh("type_errors"))
+        assert_eq(run(&mut eng, "CREATE TABLE t (age INT32, at DATETIME)"), 0)
+        match engine::exec(&mut eng, "INSERT INTO t VALUES ('old', '2023-01-01T00:00:00Z')") {
+            Ok(_) => assert(false, "text is not an INT32")
+            Err(e) => {
+                assert(e.contains("age"), "the error names the column, got: " + e)
+                assert(e.contains("INT32"), "the error names the type, got: " + e)
+            }
+        }
+        assert(engine::exec(&mut eng, "INSERT INTO t VALUES (1, 'not a date')").is_err())
+    }
+
+    #[test]
+    fn column_names_are_matched_case_insensitively() {
+        let mut eng = opened(fresh("col_case"))
+        assert_eq(run(&mut eng, "CREATE TABLE t (Name TEXT, Age INT32)"), 0)
+        assert_eq(run(&mut eng, "INSERT INTO t VALUES ('a', 1)"), 1)
+        assert_eq(rows(&mut eng, "SELECT NAME FROM t WHERE age = 1"), #[#["a"]])
+        assert_eq(run(&mut eng, "UPDATE t SET AGE = 2 WHERE NaMe = 'a'"), 1)
+        assert_eq(rows(&mut eng, "SELECT age FROM t ORDER BY AGE"), #[#["2"]])
+    }
+
+    #[test]
+    fn datetime_columns_accept_text_and_epoch_millis() {
+        let mut eng = opened(fresh("datetimes"))
+        assert_eq(run(&mut eng, "CREATE TABLE t (at DATETIME)"), 0)
+        assert_eq(run(&mut eng, "INSERT INTO t VALUES ('2023-11-14T22:13:20.123Z'), (0)"), 2)
+        assert_eq(rows(&mut eng, "SELECT at FROM t ORDER BY at")
+            #[#["1970-01-01T00:00:00.000Z"], #["2023-11-14T22:13:20.123Z"]])
+    }
+
+    #[test]
+    fn text_columns_keep_multibyte_content() {
+        let mut eng = opened(fresh("utf8"))
+        assert_eq(run(&mut eng, "CREATE TABLE t (v TEXT)"), 0)
+        assert_eq(run(&mut eng, "INSERT INTO t VALUES ('héllo wörld'), ('日本語'), ('🌍 earth')"), 3)
+        assert_eq(rows(&mut eng, "SELECT v FROM t WHERE v = 'héllo wörld'"), #[#["héllo wörld"]])
+        assert_eq(rows(&mut eng, "SELECT v FROM t WHERE v = '日本語'"), #[#["日本語"]])
+        assert_eq(rows(&mut eng, "SELECT v FROM t WHERE v = '🌍 earth'"), #[#["🌍 earth"]])
+    }
+
+    #[test]
+    fn null_is_accepted_and_sorts_first() {
+        let mut eng = opened(fresh("nulls"))
+        assert_eq(run(&mut eng, "CREATE TABLE t (name TEXT, age INT32)"), 0)
+        assert_eq(run(&mut eng, "INSERT INTO t VALUES ('a', 2), ('b', NULL), ('c', 1)"), 3)
+        assert_eq(rows(&mut eng, "SELECT name FROM t ORDER BY age"), #[#["b"], #["c"], #["a"]])
+        assert_eq(rows(&mut eng, "SELECT age FROM t WHERE name = 'b'"), #[#["NULL"]])
+    }
+}

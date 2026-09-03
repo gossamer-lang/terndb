@@ -1,0 +1,560 @@
+use std::fs
+use std::encoding::binary
+use crate::kv
+use super::log
+use super::scan
+
+// Merging the log: the live records of the generations worth rewriting go into
+// one sealed generation, and the space the superseded ones held is reclaimed.
+//
+// A merge is what makes an append-only log bounded by its live data rather than
+// by everything ever written to it.
+
+const HINT_FLUSH: i64 = 65_536
+
+// A store merges itself when this much of its log is superseded, and only once
+// it is large enough for the merge to be worth its own writes. Half is the
+// point where a merge rewrites less than it reclaims, and because a merge
+// leaves nothing dead behind it the log has to roughly double before the next
+// one, so merges space themselves out however hard the store is written.
+pub (package) const AUTO_COMPACT_RATIO: f64 = 0.5
+
+const AUTO_COMPACT_MIN_BYTES: i64 = 1_048_576
+
+/// Whether the log holds enough superseded bytes to be worth merging.
+///
+/// Both halves matter: the ratio says a merge reclaims more than it rewrites,
+/// and the floor keeps a small store from merging on its first overwrite, when
+/// the ratio is easy to reach and there is nothing to reclaim.
+pub fn due(st: &mut kv::Store) -> bool {
+    if st.read_only || st.auto_compact <= 0.0 { return false }
+    if st.live_bytes + st.dead_bytes < AUTO_COMPACT_MIN_BYTES { return false }
+    dead_ratio(st) >= st.auto_compact
+}
+
+/// Sets the fraction of superseded log a commit will tolerate before merging,
+/// or 0 to leave merging to the caller.
+pub fn set_ratio(st: &mut kv::Store, ratio: f64) { st.auto_compact = ratio }
+
+/// Fraction of the log occupied by superseded records, as a value in [0, 1].
+pub fn dead_ratio(st: &mut kv::Store) -> f64 {
+    let total = st.live_bytes + st.dead_bytes
+    if total <= 0 { return 0.0 }
+    (st.dead_bytes as f64) / (total as f64)
+}
+
+// Hint records are written out in blocks rather than accumulated whole: the
+// hint file for a large store is otherwise held in memory in its entirety.
+fn flush_hints(f: fs::File, buf: Vec<u8>, off: i64) -> Result<i64, String> {
+    if buf.len() == 0 { return Ok(off) }
+    match f.write_at(buf, off) {
+        Ok(n) => {
+            if n != buf.len() { return Err("compact: short hint write") }
+            Ok(off + n)
+        }
+        Err(e) => Err("compact: hint write: " + e.message())
+    }
+}
+
+// What each generation's live records occupy, keyed by generation. The index is
+// the only thing that knows which records are still live, so this is where a
+// generation's waste is worked out from.
+fn live_by_gen(st: &mut kv::Store) -> Map<i64, i64> {
+    let mut live_in: Map<i64, i64> = Map::new()
+    for k in st.index.keys() {
+        if let Some(e) = st.index.get(k) {
+            let n = log::record_len(k, e.vlen)
+            let _ = live_in.insert(e.file, live_in.get(e.file).unwrap_or(0) + n)
+        }
+    }
+    let mut t: i64 = 0
+    while t < st.tables.len() {
+        let top = st.tables[t].top
+        let mut rid: i64 = 1
+        while rid <= top {
+            let gc = st.tables[t].slots[3 * rid + 1]
+            if gc != 0 {
+                let n = rows::row_record_len(st, t, rid, log::loc_vlen(st.tables[t].slots[3 * rid]))
+                let g = log::gc_gen(gc)
+                let _ = live_in.insert(g, live_in.get(g).unwrap_or(0) + n)
+            }
+            rid += 1
+        }
+        t += 1
+    }
+    live_in
+}
+
+// Recomputes what the log holds, from the records the index points at and the
+// sizes of the files they sit in. A merge that left generations alone cannot
+// work its accounting out from what it moved, so it asks the files.
+//
+// `framing` is the bytes among them that structure the log rather than waste
+// space in it - the commit record a merge seals its generation with - so that a
+// freshly merged store reports nothing dead rather than its own framing.
+fn reaccount(st: &mut kv::Store, framing: i64) -> Result<(), String> {
+    let live_in = live_by_gen(st)
+    let mut live: i64 = 0
+    for k in st.index.keys() {
+        if let Some(e) = st.index.get(k) { live += e.vlen }
+    }
+    let mut t: i64 = 0
+    while t < st.tables.len() {
+        let top = st.tables[t].top
+        let mut rid: i64 = 1
+        while rid <= top {
+            if st.tables[t].slots[3 * rid + 1] != 0 {
+                live += log::loc_vlen(st.tables[t].slots[3 * rid])
+            }
+            rid += 1
+        }
+        t += 1
+    }
+    let mut dead: i64 = 0
+    for e in log::dir_entries(st.dir)? {
+        if let Some(g) = log::parse_gen(e.name, ".data") {
+            let held = live_in.get(g).unwrap_or(0)
+            if e.size > held { dead += e.size - held }
+        }
+    }
+    st.live_bytes = live
+    st.dead_bytes = if dead > framing { dead - framing } else { 0 }
+    Ok(())
+}
+
+// The generations worth merging: the active one, whose dead bytes cannot be
+// reclaimed until it is sealed, and every sealed one that is mostly dead. A
+// generation still nearly all live is left where it is, so a large cold table
+// is not rewritten every time a small hot one is merged.
+fn dirty_generations(st: &mut kv::Store) -> Result<Vec<i64>, String> {
+    let live_in = live_by_gen(st)
+    let mut out: Vec<i64> = #[]
+    for e in log::dir_entries(st.dir)? {
+        if let Some(g) = log::parse_gen(e.name, ".data") {
+            if g == st.gen {
+                out.push(g)
+            } else if e.size > 0 {
+                let held = live_in.get(g).unwrap_or(0)
+                let dead = if e.size > held { e.size - held } else { 0 }
+                if (dead as f64) / (e.size as f64) >= st.auto_compact { out.push(g) }
+            }
+        }
+    }
+    out.sort()
+    Ok(out)
+}
+
+/// Rewrites the live records of every generation into one sealed generation and
+/// starts a fresh active file.
+pub fn run(st: &mut kv::Store) -> Result<(), String> {
+    let all = log::data_generations(st.dir)?
+    compact_into(st, all)
+}
+
+// Merges only the generations that are mostly dead, which is what a store
+// merging itself does: a record that is not wasting space is left where it is
+// rather than rewritten for the sake of records that are.
+pub (package) fn compact_dirty(st: &mut kv::Store) -> Result<(), String> {
+    let dirty = dirty_generations(st)?
+    compact_into(st, dirty)
+}
+
+// Points `key` at a record that has just been moved. The accounting is left to
+// `reaccount`, because a partial merge cannot work it out from what it moved.
+fn relocate(st: &mut kv::Store, key: String, e: kv::Entry) {
+    let tid, rid = rows::locate_row(st, key)
+    if tid >= 0 && rid >= 1 {
+        let s = 3 * rid
+        if s + 2 < st.tables[tid].slots.len() && st.tables[tid].slots[s + 1] != 0 {
+            st.tables[tid].slots[s] = log::pack_loc(e.offset, e.vlen)
+            st.tables[tid].slots[s + 1] = log::pack_gc(e.file, e.crc)
+            return
+        }
+    }
+    let _ = st.index.insert(key, e)
+}
+
+// Which generation holds the live record for `key`, or -1 when nothing does.
+fn entry_gen(st: &mut kv::Store, key: String) -> i64 {
+    let tid, rid = rows::locate_row(st, key)
+    if tid >= 0 && rid >= 1 {
+        let s = 3 * rid
+        if s + 2 < st.tables[tid].slots.len() && st.tables[tid].slots[s + 1] != 0 {
+            return log::gc_gen(st.tables[tid].slots[s + 1])
+        }
+    }
+    match st.index.get(key) {
+        Some(e) => e.file
+        None => -1
+    }
+}
+
+// Where the merge put each record it moved, and where the merged generation
+// ends. The index is only pointed at them once the walk is over: the index the
+// walk reads to find the live records is the one it would otherwise rewrite.
+struct Moved {
+    keys: Vec<String>
+    entries: Vec<kv::Entry>
+    end: i64
+}
+
+fn compact_into(st: &mut kv::Store, merging: Vec<i64>) -> Result<(), String> {
+    if st.read_only { return Err("store is read-only") }
+    if merging.len() == 0 { return Ok(()) }
+    let merged = newest_generation(st)? + 1
+    let mf = log::open_append(log::data_path(st.dir, merged))?
+    // The hint file is built through a staging path so the merged generation is
+    // only ever sealed by a hint that is complete and describes durable data.
+    let hstage = log::hint_path(st.dir, merged) + ".part"
+    let hf = log::open_fresh(hstage)?
+    let moved = move_live(st, merging, mf, hf, merged)?
+    seal(mf, hf, hstage, log::hint_path(st.dir, merged), moved.end, st.dir)?
+    start_active(st, merged + 1)?
+    for i in 0..moved.keys.len() { relocate(st, moved.keys[i], moved.entries[i]) }
+    drop_merged(st, merging, merged)?
+    // The merge wrote one commit record to seal the generation it made.
+    reaccount(st, log::HEADER_LEN)?
+    Ok(())
+}
+
+// The highest generation the store holds, which the merge writes past.
+fn newest_generation(st: &mut kv::Store) -> Result<i64, String> {
+    let mut newest = st.gen
+    for g in log::data_generations(st.dir)? {
+        if g > newest { newest = g }
+    }
+    Ok(newest)
+}
+
+// Copies the live records of `merging` into the merged generation, writing the
+// hint that will seal it as it goes. A record in a generation nobody is merging
+// stays where it is, and so does the index entry pointing at it.
+fn move_live(st: &mut kv::Store, merging: Vec<i64>, mf: fs::File, hf: fs::File, merged: i64) -> Result<Moved, String> {
+    let mut moved = Moved { keys: #[], entries: #[], end: 0 }
+    let mut hbuf: Vec<u8> = #[]
+    let mut hoff: i64 = 0
+    for k in scan::keys(st, "") {
+        if !merging.contains(entry_gen(st, k)) { continue }
+        // A record the merge cannot read is one it would drop on the floor: the
+        // generations it came from are removed once the merge is done, so a
+        // record that fails its checksum stops the merge instead.
+        let v = match kv::get(st, k) {
+            kv::Read::Value(v) => v
+            kv::Read::Absent => continue
+            kv::Read::Fault(e) => return Err("compact: " + e)
+        }
+        let crc = log::record_crc(k, v)
+        let rec = log::record(k, log::KIND_PUT, v, crc)
+        match mf.write_at(rec, moved.end) {
+            Ok(n) => {
+                if n != rec.len() { return Err("compact: short write") }
+            }
+            Err(e) => return Err("compact: write: " + e.message())
+        }
+        moved.keys.push(k)
+        moved.entries.push(kv::Entry { file: merged, offset: moved.end, vlen: v.len(), crc: crc })
+        hint_into(&mut hbuf, k, v.len(), crc, moved.end)
+        if hbuf.len() >= HINT_FLUSH {
+            hoff = flush_hints(hf, hbuf, hoff)?
+            hbuf = #[]
+        }
+        moved.end += rec.len()
+    }
+    let _ = flush_hints(hf, hbuf, hoff)?
+    Ok(moved)
+}
+
+// One hint record: what the reader needs to place a value without reading it.
+fn hint_into(buf: &mut Vec<u8>, key: String, vlen: i64, crc: i64, off: i64) {
+    buf.extend(binary::put_u16_le(#[], key.byte_len()))
+    buf.extend(binary::put_u32_le(#[], vlen))
+    buf.extend(binary::put_u32_le(#[], crc))
+    buf.extend(binary::put_u64_le(#[], off))
+    buf.extend(key.as_bytes())
+}
+
+// Closes the merged generation: the commit record a rebuild reads up to, both
+// files made durable, and the hint moved into place.
+//
+// The hint file is what seals the generation, so it appears only once the data
+// it describes is durable; the fresh active file keeps that seal true.
+fn seal(mf: fs::File, hf: fs::File, hstage: String, hpath: String, end: i64, dir: String) -> Result<(), String> {
+    let commit = log::record("", log::KIND_COMMIT, #[], log::record_crc("", #[]))
+    match mf.write_at(commit, end) {
+        Ok(n) => {
+            if n != commit.len() { return Err("compact: short commit write") }
+        }
+        Err(e) => return Err("compact: commit: " + e.message())
+    }
+    if let Err(e) = mf.sync_all() { return Err("compact: sync: " + e.message()) }
+    if let Err(e) = hf.sync_all() { return Err("compact: hint sync: " + e.message()) }
+    if let Err(e) = fs::rename(hstage, hpath) { return Err("compact: hint: " + e.message()) }
+    // The hint is what seals the generation, so the entry naming it is made
+    // durable here rather than left to whatever writes the directory next.
+    log::sync_dir(dir)
+
+}
+
+// Opens the generation writes go to after the merge. The readers go with the
+// generations they served, which this one replaces.
+fn start_active(st: &mut kv::Store, active: i64) -> Result<(), String> {
+    st.data = Some(log::open_append(log::data_path(st.dir, active))?)
+    log::sync_dir(st.dir)?
+    st.gen = active
+    st.cur_off = 0
+    st.readers = Map::new()
+    Ok(())
+}
+
+// Removes the generations the merge rewrote; the rest still hold the records
+// the index points at.
+//
+// A generation left behind is replayed at the next open, where it would restore
+// the values the merge superseded and the rows it dropped, so a removal that
+// does not happen is reported rather than passed over.
+fn drop_merged(st: &mut kv::Store, merging: Vec<i64>, merged: i64) -> Result<(), String> {
+    for g in merging {
+        if g < merged {
+            if let Err(e) = fs::remove_file(log::data_path(st.dir, g)) {
+                return Err("compact: " + log::data_path(st.dir, g) + ": " + e.message())
+            }
+            if fs::exists(log::hint_path(st.dir, g)) {
+                if let Err(e) = fs::remove_file(log::hint_path(st.dir, g)) {
+                    return Err("compact: " + log::hint_path(st.dir, g) + ": " + e.message())
+                }
+            }
+        }
+    }
+    log::sync_dir(st.dir)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::fs
+    use crate::kv
+
+    fn fresh(name: String) -> String {
+        let dir = "/tmp/terndb_kv_test/" + name
+        let _ = fs::remove_dir_all(dir)
+        let _ = fs::create_dir_all(dir)
+        dir
+    }
+
+    fn opened(dir: String) -> kv::Store {
+        kv::open(dir, false).unwrap_or_else(|e| panic("open " + dir + ": " + e))
+    }
+
+    fn must_get(st: &mut kv::Store, key: String) -> Vec<u8> {
+        match kv::get(st, key) {
+            kv::Read::Value(v) => return v
+            kv::Read::Fault(e) => panic(e)
+            kv::Read::Absent => {
+                assert(false, "expected a value for '" + key + "'")
+                return #[]
+            }
+        }
+    }
+
+    // Overwrites eight keys `rounds` times with a payload big enough that the
+    // log passes the size a merge is worth doing above.
+    fn churn(st: &mut kv::Store, rounds: i64) {
+        let payload: Vec<u8> = #[7u8; 8192]
+        let mut i: i64 = 0
+        while i < rounds * 8 {
+            assert(kv::put(st, "k/" + (i % 8).to_string(), payload).is_ok())
+            i += 1
+        }
+    }
+
+    #[test]
+    fn compaction_keeps_live_data_and_drops_the_rest() {
+        let dir = fresh("compact")
+        let mut st = opened(dir)
+        assert(kv::put(&mut st, "keep", #[1u8]).is_ok())
+        assert(kv::put(&mut st, "keep", #[2u8]).is_ok())
+        assert(kv::put(&mut st, "drop", #[3u8]).is_ok())
+        assert_eq(kv::delete(&mut st, "drop").unwrap_or(false), true)
+        assert(st.dead_bytes > 0)
+
+        if let Err(e) = kv::compact::run(&mut st) { assert(false, "compact: " + e) }
+        assert_eq(must_get(&mut st, "keep"), #[2u8])
+        assert(matches(kv::get(&mut st, "drop"), kv::Read::Absent))
+        assert_eq(kv::len(&mut st), 1)
+        assert_eq(st.dead_bytes, 0, "compaction reclaims every retired byte")
+
+        let mut after = opened(dir)
+        assert_eq(must_get(&mut after, "keep"), #[2u8], "the merged generation reloads from its hint")
+        assert(matches(kv::get(&mut after, "drop"), kv::Read::Absent))
+        assert_eq(kv::len(&mut after), 1)
+    }
+
+    #[test]
+    fn writes_after_a_compaction_survive_a_restart() {
+        let dir = fresh("compact_then_write")
+        let mut st = opened(dir)
+        assert(kv::put(&mut st, "old", #[1u8]).is_ok())
+        if let Err(e) = kv::compact::run(&mut st) { assert(false, "compact: " + e) }
+        assert(kv::put(&mut st, "new", #[2u8]).is_ok())
+        assert(kv::put(&mut st, "old", #[3u8]).is_ok())
+        assert(kv::sync(&mut st).is_ok())
+
+        let mut after = opened(dir)
+        assert_eq(must_get(&mut after, "new"), #[2u8], "a post-compaction append is not lost to a stale hint")
+        assert_eq(must_get(&mut after, "old"), #[3u8], "the newer value outranks the merged one")
+        assert_eq(kv::len(&mut after), 2)
+    }
+
+    #[test]
+    fn repeated_compaction_stays_consistent() {
+        let dir = fresh("compact_repeat")
+        let mut st = opened(dir)
+        let mut round: i64 = 0
+        while round < 4 {
+            let mut i: i64 = 0
+            while i < 10 {
+                assert(kv::put(&mut st, "k" + i.to_string(), #[round as u8, i as u8]).is_ok())
+                i += 1
+            }
+            assert_eq(kv::delete(&mut st, "k" + round.to_string()).unwrap_or(false), true)
+            if let Err(e) = kv::compact::run(&mut st) { assert(false, "compact round " + round.to_string() + ": " + e) }
+            assert_eq(kv::len(&mut st), 9, "round " + round.to_string())
+            round += 1
+        }
+        let mut after = opened(dir)
+        assert_eq(kv::len(&mut after), 9)
+        assert_eq(must_get(&mut after, "k5"), #[3u8, 5u8])
+    }
+
+    #[test]
+    fn compaction_leaves_only_the_merged_and_active_generations() {
+        let dir = fresh("compact_files")
+        let mut st = opened(dir)
+        assert(kv::put(&mut st, "k", #[1u8]).is_ok())
+        if let Err(e) = kv::compact::run(&mut st) { assert(false, e) }
+        let mut data_files: i64 = 0
+        for e in fs::read_dir(dir).unwrap_or(#[]) {
+            if e.name.ends_with(".data") { data_files += 1 }
+        }
+        assert_eq(data_files, 2, "the merged generation plus the fresh active one")
+    }
+
+    #[test]
+    fn dead_ratio_tracks_the_superseded_share() {
+        let mut st = opened(fresh("ratio"))
+        assert_eq(super::dead_ratio(&mut st), 0.0, "an empty store has nothing dead")
+        assert(kv::put(&mut st, "k", #[0u8; 100]).is_ok())
+        assert_eq(super::dead_ratio(&mut st), 0.0)
+        assert(kv::put(&mut st, "k", #[0u8; 100]).is_ok())
+        assert(super::dead_ratio(&mut st) > 0.4, "one of two equal records is now dead")
+        assert(super::dead_ratio(&mut st) < 0.6)
+        if let Err(e) = kv::compact::run(&mut st) { assert(false, e) }
+        assert_eq(super::dead_ratio(&mut st), 0.0, "compaction clears the dead share")
+    }
+
+    #[test]
+    fn a_log_that_is_mostly_superseded_merges_itself() {
+        let dir = fresh("auto_compact")
+        let mut st = opened(dir)
+        churn(&mut st, 20)
+        // A generation past the first is one a merge opened.
+        assert(st.gen > 1, "the log merged itself, gen is " + st.gen.to_string())
+        assert_eq(kv::len(&mut st), 8)
+        let mut j: i64 = 0
+        while j < 8 {
+            assert_eq(must_get(&mut st, "k/" + j.to_string()).len(), 8192, "key " + j.to_string())
+            j += 1
+        }
+        // Every merged record is still there after a restart.
+        assert(kv::sync(&mut st).is_ok())
+        let mut after = opened(dir)
+        assert_eq(kv::len(&mut after), 8)
+        assert_eq(must_get(&mut after, "k/3").len(), 8192)
+    }
+
+    #[test]
+    fn a_generation_that_is_still_live_is_not_rewritten_by_a_merge() {
+        let dir = fresh("selective_merge")
+        let mut st = opened(dir)
+        let payload: Vec<u8> = #[7u8; 8192]
+        // A cold set, sealed into a generation of its own and never touched again.
+        let mut i: i64 = 0
+        while i < 160 {
+            assert(kv::put(&mut st, "cold/" + i.to_string(), payload).is_ok())
+            i += 1
+        }
+        assert(kv::compact::run(&mut st).is_ok())
+        let cold_gen = st.gen - 1
+        assert(fs::is_file(kv::log::data_path(dir, cold_gen)), "the cold records are sealed in one generation")
+
+        // A hot set churned until the store merges itself.
+        let mut h: i64 = 0
+        while h < 400 {
+            assert(kv::put(&mut st, "hot/" + (h % 4).to_string(), payload).is_ok())
+            h += 1
+        }
+        assert(st.gen > cold_gen + 1, "the store merged itself again")
+        assert(fs::is_file(kv::log::data_path(dir, cold_gen))
+            "a generation with nothing dead in it is left where it is")
+
+        // And every record is still readable, from both sets.
+        assert_eq(kv::len(&mut st), 164)
+        assert_eq(must_get(&mut st, "cold/0").len(), 8192)
+        assert_eq(must_get(&mut st, "cold/159").len(), 8192)
+        assert_eq(must_get(&mut st, "hot/3").len(), 8192)
+        assert(kv::sync(&mut st).is_ok())
+        let mut after = opened(dir)
+        assert_eq(kv::len(&mut after), 164)
+        assert_eq(must_get(&mut after, "cold/80").len(), 8192)
+        assert_eq(must_get(&mut after, "hot/1").len(), 8192)
+    }
+
+    #[test]
+    fn an_explicit_merge_still_rewrites_the_whole_store() {
+        let dir = fresh("full_merge")
+        let mut st = opened(dir)
+        kv::compact::set_ratio(&mut st, 0.0)
+        let payload: Vec<u8> = #[7u8; 4096]
+        let mut i: i64 = 0
+        while i < 40 {
+            assert(kv::put(&mut st, "cold/" + i.to_string(), payload).is_ok())
+            i += 1
+        }
+        assert(kv::compact::run(&mut st).is_ok())
+        let cold_gen = st.gen - 1
+        assert(kv::put(&mut st, "hot", payload).is_ok())
+        // COMPACT means the whole store, so the clean generation goes too.
+        assert(kv::compact::run(&mut st).is_ok())
+        assert(!fs::is_file(kv::log::data_path(dir, cold_gen)), "an explicit merge leaves nothing behind")
+        assert_eq(kv::len(&mut st), 41)
+        assert_eq(must_get(&mut st, "cold/7").len(), 4096)
+        assert_eq(super::dead_ratio(&mut st), 0.0)
+    }
+
+    #[test]
+    fn merging_is_the_callers_business_when_it_is_turned_off() {
+        let dir = fresh("no_auto_compact")
+        let mut st = opened(dir)
+        kv::compact::set_ratio(&mut st, 0.0)
+        churn(&mut st, 20)
+        assert_eq(st.gen, 1, "nothing merged the log")
+        assert(super::dead_ratio(&mut st) > 0.5)
+        assert_eq(kv::len(&mut st), 8)
+        assert(kv::compact::run(&mut st).is_ok())
+        assert_eq(super::dead_ratio(&mut st), 0.0)
+        assert_eq(kv::len(&mut st), 8)
+        assert_eq(must_get(&mut st, "k/5").len(), 8192)
+    }
+
+    #[test]
+    fn a_small_store_does_not_merge_on_every_overwrite() {
+        let mut st = opened(fresh("small_no_compact"))
+        let mut i: i64 = 0
+        while i < 40 {
+            assert(kv::put(&mut st, "k", #[1u8, 2u8, 3u8]).is_ok())
+            i += 1
+        }
+        assert_eq(st.gen, 1, "a store this small is left alone")
+        assert(super::dead_ratio(&mut st) > 0.9)
+        assert_eq(kv::len(&mut st), 1)
+    }
+}

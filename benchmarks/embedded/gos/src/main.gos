@@ -1,0 +1,149 @@
+use std::{env, process, time}
+
+// terndb queried in process, with nothing above it: no socket, no HTTP, no
+// load generator. One thread asks for a row by primary key and renders it as
+// JSON, over and over, for a fixed window - so the number is the store's read
+// path and the rendering, and not a web tier's.
+//
+//   bench-embedded <sql|kv> <dir> <rows> <seconds>
+//
+// `sql` reaches the row through a prepared `SELECT ... WHERE rowid = ?`;
+// `kv` reaches the same bytes through the keyed get the storage layer answers
+// with no statement layer above it. Both render the same JSON.
+
+const SELECT: String = "SELECT name, email, score, active FROM users WHERE rowid = ?"
+
+// Every target walks the same id sequence, so each one decodes the same rows in
+// the same order and no target is handed a friendlier access pattern. The
+// stride is coprime with any row count, so the walk visits the whole key space.
+const STRIDE: i64 = 2654435761
+
+fn id_at(i: i64, rows: i64) -> i64 { (i * STRIDE) % rows + 1 }
+
+// Queries between two clock reads. The clock is the only thing in the loop that
+// is not the store, so it is read once a batch rather than once a query.
+const BATCH: i64 = 1024
+
+/// What one measured window did.
+struct Run {
+    queries: i64
+    elapsed_ms: i64
+    bytes: i64
+}
+
+fn main() {
+    let args = env::args()
+    if args.len() < 4 {
+        eprintln("usage: bench-embedded <sql|kv> <dir> <rows> <seconds>")
+        process::exit(2)
+    }
+    let mode = args[0]
+    let dir = args[1]
+    let rows = args[2].to_i64().unwrap_or(0)
+    let seconds = args[3].to_i64().unwrap_or(5)
+    if rows < 1 {
+        eprintln("bench-embedded: rows must be positive")
+        process::exit(2)
+    }
+    let outcome = match mode {
+        "sql" => run_sql(dir, rows, seconds)
+        "kv" => run_kv(dir, rows, seconds)
+        _ => Err("unknown mode '" + mode + "', want sql or kv")
+    }
+    match outcome {
+        Ok(run) => println("{}", report("gos-" + mode, run))
+        Err(e) => {
+            eprintln("bench-embedded: {}", e)
+            process::exit(1)
+        }
+    }
+}
+
+/// The result line, as the JSON the runner collects.
+fn report(target: String, run: Run) -> String {
+    let secs = (run.elapsed_ms as f64) / 1000.0
+    let qps = if secs > 0.0 { (run.queries as f64) / secs } else { 0.0 }
+    let ns = if run.queries > 0 { (run.elapsed_ms as f64) * 1000000.0 / (run.queries as f64) } else { 0.0 }
+    format("{{\"target\":\"{}\",\"queries\":{},\"seconds\":{:.3},\"qps\":{:.1},\"ns_per_query\":{:.1},\"bytes\":{}}}",
+        target, run.queries, secs, qps, ns, run.bytes)
+}
+
+fn run_sql(dir: String, rows: i64, seconds: i64) -> Result<Run, String> {
+    let mut eng = engine::open(dir, true)?
+    // The statement is parsed and planned once, which is how an embedded caller
+    // holding a hot query uses it.
+    let mut plan = engine::plan::prepare(&mut eng, SELECT)?
+    let probe = engine::plan::read_json(&mut eng, &mut plan, 1)?
+    if probe.byte_len() == 0 { return Err("row 1 is missing from " + dir) }
+
+    let mut i = 0
+    while i < BATCH * 8 {
+        let _ = engine::plan::read_json(&mut eng, &mut plan, id_at(i, rows))?
+        i += 1
+    }
+
+    let start = time::monotonic_ms()
+    let deadline = start + seconds * 1000
+    let mut queries = 0
+    let mut bytes = 0
+    loop {
+        let mut k = 0
+        while k < BATCH {
+            let body = engine::plan::read_json(&mut eng, &mut plan, id_at(queries + k, rows))?
+            bytes += body.byte_len()
+            k += 1
+        }
+        queries += BATCH
+        if time::monotonic_ms() >= deadline { break }
+    }
+    Ok(Run { queries: queries, elapsed_ms: time::monotonic_ms() - start, bytes: bytes })
+}
+
+fn run_kv(dir: String, rows: i64, seconds: i64) -> Result<Run, String> {
+    let mut st = kv::open(dir, true)?
+    let tid = kv::rows::open_table(&mut st, "users")
+    let keys = codec::json::keys(#["name", "email", "score", "active"])
+    if matches(kv::rows::read(&mut st, tid, 1), kv::Read::Absent) {
+        return Err("row 1 is missing from " + dir)
+    }
+
+    let mut i = 0
+    while i < BATCH * 8 {
+        let _ = read_kv(&mut st, tid, keys, id_at(i, rows))?
+        i += 1
+    }
+
+    let start = time::monotonic_ms()
+    let deadline = start + seconds * 1000
+    let mut queries = 0
+    let mut bytes = 0
+    loop {
+        let mut k = 0
+        while k < BATCH {
+            bytes += read_kv(&mut st, tid, keys, id_at(queries + k, rows))?
+            k += 1
+        }
+        queries += BATCH
+        if time::monotonic_ms() >= deadline { break }
+    }
+    Ok(Run { queries: queries, elapsed_ms: time::monotonic_ms() - start, bytes: bytes })
+}
+
+/// One keyed read rendered as JSON; the byte count is what the caller received.
+///
+/// A row in a generation the store holds is rendered where it lies, which is
+/// the same path `engine::plan::read_json` takes for a keyed `SELECT`: the two
+/// benchmark targets differ by the statement layer and by nothing below it.
+/// The buffer is handed to the renderer straight off the store, because
+/// binding it to a local here would copy the whole file per read.
+fn read_kv(st: &mut kv::Store, tid: i64, keys: Vec<String>, id: i64) -> Result<i64, String> {
+    let start, end = kv::rows::span(st, tid, id)
+    if end > start {
+        return Ok(codec::json::render_window(st.resident_bytes, start, end, keys, id).byte_len())
+    }
+    match kv::rows::read(st, tid, id) {
+        kv::Read::Value(row) => Ok(codec::json::render(row, keys, id).byte_len())
+        kv::Read::Absent => Ok(0)
+        kv::Read::Fault(e) => Err(e)
+    }
+}

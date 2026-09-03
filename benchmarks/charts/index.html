@@ -1,0 +1,52 @@
+<!doctype html>
+<meta charset="utf-8"><title>terndb benchmarks</title>
+<style>
+  body { font: 14px/1.5 system-ui, sans-serif; margin: 2rem auto; max-width: 60rem; color: #0b0b0b; }
+  h1 { font-size: 1.4rem; }
+  figure { margin: 2rem 0; } img { max-width: 100%; }
+  figcaption { font-size: .85rem; color: #52514e; margin-top: .4rem; }
+  table { border-collapse: collapse; width: 100%; font-variant-numeric: tabular-nums;
+           margin: 2rem 0; }
+  th, td { padding: .4rem .6rem; border-bottom: 1px solid #e5e5e5; text-align: right; }
+  th:first-child, td:first-child { text-align: left; }
+  caption { text-align: left; font-size: .85rem; color: #52514e; padding-bottom: .6rem; }
+</style>
+<h1>terndb benchmarks</h1>
+<p>Over HTTP: 50,000 rows, 8 concurrent workers,
+5s measured per target. In process: 50,000 rows, one thread, 5s measured per target.
+On 24 cores (Linux 7.0.0-28-generic).</p>
+<p>The HTTP charts report the three numbers a deployment is chosen on - response rate, CPU per request and peak memory. A Go client drives concurrent GETs at a web server, and the store runs in that server's own process. The query-only charts have no HTTP in them at all - one thread calling the store it is linked against - so they report queries per second and the memory the store costs to run. Every bar in a chart answered the same request against the same seeded dataset. A variant - the `gos run` tier, or redb holding typed columns - is hatched and shares its path's colour.</p>
+<figure><img src="web-embedded-db-response-rate.png" alt="Web server, embedded DB: the store in the web server's own process - response rate, HTTP requests / second"><figcaption>Web server, embedded DB: the store in the web server's own process - response rate, HTTP requests / second</figcaption></figure>
+<figure><img src="web-embedded-db-cpu.png" alt="Web server, embedded DB: the store in the web server's own process - CPU, microseconds / request"><figcaption>Web server, embedded DB: the store in the web server's own process - CPU, microseconds / request</figcaption></figure>
+<figure><img src="web-embedded-db-memory.png" alt="Web server, embedded DB: the store in the web server's own process - memory, peak resident MiB under load"><figcaption>Web server, embedded DB: the store in the web server's own process - memory, peak resident MiB under load</figcaption></figure>
+<figure><img src="query-only-queries.png" alt="Query only: one thread querying the store it is linked against, no HTTP - queries / second"><figcaption>Query only: one thread querying the store it is linked against, no HTTP - queries / second</figcaption></figure>
+<figure><img src="query-only-memory.png" alt="Query only: one thread querying the store it is linked against, no HTTP - memory, peak resident MiB"><figcaption>Query only: one thread querying the store it is linked against, no HTTP - memory, peak resident MiB</figcaption></figure>
+<table>
+  <caption>Every HTTP target, sorted by response rate. The store runs in the
+  web server's own process, so the memory is that one process.</caption>
+  <tr><th>target</th><th>response rate, req/s</th><th>CPU, us/req</th><th>memory, peak MiB</th></tr>
+  <tr><td>Gos terndb Embedded: KV (gos-terndb-embedded-kv)</td><td>304,910</td><td>6.7</td><td>13.5</td></tr>
+<tr><td>Gos terndb Embedded: SQL (gos-terndb-embedded-sql)</td><td>296,012</td><td>6.9</td><td>13.2</td></tr>
+<tr><td>Rust redb Embedded: KV (rust-redb-embedded-kv)</td><td>217,973</td><td>8.2</td><td>17.9</td></tr>
+<tr><td>Gos terndb (gos run) Embedded: KV (gos-terndb-embedded-kv-gos-run)</td><td>133,315</td><td>36.1</td><td>140.7</td></tr>
+<tr><td>Rust SQLite Embedded: SQL (rust-sqlite-embedded-sql)</td><td>122,525</td><td>23.8</td><td>89.4</td></tr>
+<tr><td>Go SQLite Embedded: SQL (go-sqlite-embedded-sql)</td><td>88,935</td><td>37.9</td><td>53.4</td></tr>
+<tr><td>Gos terndb (gos run) Embedded: SQL (gos-terndb-embedded-sql-gos-run)</td><td>17,579</td><td>55.5</td><td>100.6</td></tr>
+<tr><td>Python SQLite Embedded: SQL (python-sqlite-embedded-sql)</td><td>5,438</td><td>139.0</td><td>138.8</td></tr>
+
+</table>
+<table>
+  <caption>Every query-only target, sorted by queries per second. One thread, no
+  socket and no HTTP: the store is linked into the caller, asked for a row by
+  primary key, and the row is rendered as the same JSON every HTTP target
+  returns. The memory is the whole process, which is what the store costs to
+  run.</caption>
+  <tr><th>target</th><th>queries/s</th><th>memory, peak MiB</th></tr>
+  <tr><td>Gos terndb Embedded: KV (gos-terndb-embedded-kv)</td><td>3,586,662</td><td>11.8</td></tr>
+<tr><td>Gos terndb Embedded: SQL (gos-terndb-embedded-sql)</td><td>3,474,022</td><td>12.8</td></tr>
+<tr><td>Rust redb Embedded: KV (rust-redb-embedded-kv)</td><td>2,461,743</td><td>15.6</td></tr>
+<tr><td>Rust redb (typed) Embedded: KV (rust-redb-embedded-kv-typed)</td><td>1,804,314</td><td>11.6</td></tr>
+<tr><td>Rust SQLite Embedded: SQL (rust-sqlite-embedded-sql)</td><td>656,555</td><td>5.8</td></tr>
+<tr><td>Go SQLite Embedded: SQL (go-sqlite-embedded-sql)</td><td>95,104</td><td>18.1</td></tr>
+
+</table>

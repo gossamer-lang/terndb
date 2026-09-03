@@ -1,0 +1,57 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: Tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install Gossamer
+        run: |
+          curl -fsSL https://raw.githubusercontent.com/gossamer-lang/gossamer/main/scripts/install.sh | sh
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+
+      - run: gos --version
+
+      - run: gos fmt --check
+
+      - run: gos check
+
+      - run: gos test
+
+      - run: ./scripts/check-benchmarks.sh
+
+  tier-parity:
+    name: Tier parity and server soak
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      # `gos build --release` shells out to llc / opt / clang, and links
+      # the release binary statically against musl. The distribution
+      # packages satisfy the supported LLVM floor.
+      - name: Install LLVM and musl
+        run: sudo apt-get update && sudo apt-get install -y llvm clang musl-tools
+
+      - name: Install Gossamer
+        run: |
+          curl -fsSL https://raw.githubusercontent.com/gossamer-lang/gossamer/main/scripts/install.sh | sh
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+
+      - run: gos --version
+
+      - run: ./scripts/tier-parity.sh

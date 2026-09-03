@@ -1,0 +1,311 @@
+use std::{fs, time}
+use crate::engine
+use crate::kv
+use crate::sql
+
+// The read benchmark PLAN.md's headline claim rests on: a get is one index
+// lookup plus one pread, so it should land within a small factor of reading the
+// same bytes back with fs::read. Both sides are measured over the same key set
+// in the same directory, and the payload sizes match, so the difference is the
+// index lookup, the record framing and the CRC check - nothing else.
+
+/// What one measured phase cost.
+pub struct Timing {
+    pub label: String
+    pub ops: i64
+    pub total_ms: i64
+}
+
+/// Nanoseconds per operation, as a float so a sub-microsecond op still reads.
+pub fn ns_per_op(t: Timing) -> f64 {
+    if t.ops <= 0 { 0.0 } else { (t.total_ms as f64) * 1000000.0 / (t.ops as f64) }
+}
+
+/// Operations per second, the rate the report is written in.
+pub fn per_second(t: Timing) -> f64 {
+    if t.total_ms <= 0 { 0.0 } else { (t.ops as f64) * 1000.0 / (t.total_ms as f64) }
+}
+
+/// One line describing a timing: what was measured, and how many a second.
+pub fn render(t: Timing) -> String {
+    format("{:<30} {:>14.0} queries/s", t.label, per_second(t))
+}
+
+/// The peak resident set of this process in MiB, where the kernel publishes one.
+///
+/// Linux keeps the high-water mark since exec in `/proc/self/status`, which is
+/// the whole store's cost in a benchmark that links it into the caller. A host
+/// with no such file reports nothing rather than a number it cannot stand behind.
+pub fn peak_rss_mb() -> Option<f64> {
+    let text = match fs::read_to_string("/proc/self/status") {
+        Ok(t) => t
+        Err(_) => return None
+    }
+    for line in text.split("\n") {
+        if !line.starts_with("VmHWM:") { continue }
+        for word in line.split(" ") {
+            match word.trim().to_i64() {
+                Some(kb) => return Some((kb as f64) / 1024.0)
+                None => continue
+            }
+        }
+    }
+    None
+}
+
+/// The closing line of a run: what the process cost to run.
+pub fn memory_line() -> String {
+    match peak_rss_mb() {
+        Some(mb) => format("{:<30} {:>14.1} MiB", "peak resident memory", mb)
+        None => format("{:<30} {:>14} MiB", "peak resident memory", "-")
+    }
+}
+
+// A directory the benchmark filled carries this marker. A rerun may clear what
+// a previous run wrote; a directory holding anything else is somebody's store
+// and the benchmark refuses it rather than deleting it.
+const OWNED: String = ".terndb-bench"
+
+/// Ok when `dir` is free for the benchmark: absent, empty, or one it filled before.
+pub fn claim(dir: String) -> Result<(), String> {
+    match fs::read_dir(dir) {
+        Err(_) => Ok(())
+        Ok(entries) => {
+            for entry in entries {
+                if entry.name == OWNED { return Ok(()) }
+            }
+            if entries.is_empty() { return Ok(()) }
+            Err("bench: " + dir + " holds data the benchmark did not write; "
+                + "pass an empty or new directory")
+        }
+    }
+}
+
+fn mark_owned(dir: String) -> Result<(), String> {
+    match fs::write(dir + "/" + OWNED, "terndb bench scratch\n".as_bytes()) {
+        Ok(_) => Ok(())
+        Err(e) => Err("bench: marking " + dir + ": " + e.message())
+    }
+}
+
+fn key_of(i: i64) -> String { "bench/key/" + i.to_string() }
+
+fn payload(i: i64, size: i64) -> Vec<u8> {
+    let seed = ("value-" + i.to_string() + "-").as_bytes()
+    let mut out: Vec<u8> = #[]
+    while out.len() < size { out.extend(seed) }
+    out.truncate(size)
+    out
+}
+
+/// Fills `dir` with `n` records of `size` bytes, plus one plain file of the same
+/// payload for the fs::read baseline to read.
+pub fn prepare(dir: String, n: i64, size: i64) -> Result<(), String> {
+    let _ = fs::remove_dir_all(dir)
+    let mut st = kv::open(dir, false)?
+    mark_owned(dir)?
+    // One batch for the load: a per-key commit would measure fsync, not the store.
+    kv::batch::begin(&mut st)?
+    let mut i: i64 = 0
+    while i < n {
+        if let Err(e) = kv::put(&mut st, key_of(i), payload(i, size)) {
+            return Err(kv::batch::undo(&mut st, e))
+        }
+        i += 1
+    }
+    kv::batch::commit(&mut st)?
+    kv::sync(&mut st)?
+    match fs::write(dir + "/baseline.bin", payload(0, size)) {
+        Ok(_) => Ok(())
+        Err(e) => Err("bench: baseline: " + e.message())
+    }
+}
+
+/// Times `n` point reads through the KV index, reopening the store cold first.
+///
+/// The keys are built before the clock starts: the baseline does no string work,
+/// so building one inside the loop would charge the store for it.
+pub fn time_get(dir: String, n: i64) -> Result<Timing, String> {
+    let mut st = kv::open(dir, true)?
+    let mut keys: Vec<String> = #[]
+    let mut k: i64 = 0
+    while k < n {
+        keys.push(key_of(k))
+        k += 1
+    }
+    let start = time::now_ms()
+    let mut hits: i64 = 0
+    let mut i: i64 = 0
+    while i < n {
+        match kv::get(&mut st, keys[i]) {
+            kv::Read::Value(v) => hits += v.len()
+            kv::Read::Absent => return Err("bench: missing key " + keys[i])
+            kv::Read::Fault(e) => return Err("bench: " + e)
+        }
+        i += 1
+    }
+    let elapsed = time::now_ms() - start
+    if hits <= 0 { return Err("bench: read nothing") }
+    Ok(Timing { label: "kv::get", ops: n, total_ms: elapsed })
+}
+
+/// Times `n` whole-file reads of the baseline payload.
+pub fn time_fs_read(dir: String, n: i64) -> Result<Timing, String> {
+    let path = dir + "/baseline.bin"
+    let start = time::now_ms()
+    let mut bytes: i64 = 0
+    let mut i: i64 = 0
+    while i < n {
+        match fs::read(path) {
+            Ok(b) => bytes += b.len()
+            Err(e) => return Err("bench: fs::read: " + e.message())
+        }
+        i += 1
+    }
+    let elapsed = time::now_ms() - start
+    if bytes <= 0 { return Err("bench: read nothing") }
+    Ok(Timing { label: "fs::read (same payload)", ops: n, total_ms: elapsed })
+}
+
+/// Fills a table with `rows` rows for the statement benchmarks.
+pub fn prepare_sql(dir: String, rows: i64) -> Result<engine::Engine, String> {
+    let _ = fs::remove_dir_all(dir)
+    let mut eng = engine::open(dir, false)?
+    mark_owned(dir)?
+    let _ = engine::exec(&mut eng, "CREATE TABLE bench (id INT32, name TEXT, score FLOAT64, active BOOL)")?
+    // Rows go in a few hundred at a time: one statement is one transaction, and
+    // a row-at-a-time load would measure the commit rather than the insert.
+    let mut i: i64 = 0
+    while i < rows {
+        let mut stmt = "INSERT INTO bench VALUES "
+        let mut c: i64 = 0
+        while c < 500 && i < rows {
+            if c > 0 { stmt = stmt + ", " }
+            stmt = stmt + "(" + i.to_string() + ", 'name-" + i.to_string() + "', 1.5, true)"
+            c += 1
+            i += 1
+        }
+        let _ = engine::exec(&mut eng, stmt)?
+    }
+    engine::sync(&mut eng)?
+    Ok(eng)
+}
+
+/// Times `reps` runs of one statement against an already-filled engine.
+pub fn time_stmt(eng: &mut engine::Engine, label: String, src: String, reps: i64) -> Result<Timing, String> {
+    let start = time::now_ms()
+    let mut i: i64 = 0
+    while i < reps {
+        let _ = engine::exec(eng, src)?
+        i += 1
+    }
+    Ok(Timing { label: label, ops: reps, total_ms: time::now_ms() - start })
+}
+
+/// Times parsing one statement, which is where a long VALUES list is felt.
+pub fn time_parse(label: String, src: String, reps: i64) -> Result<Timing, String> {
+    let start = time::now_ms()
+    let mut i: i64 = 0
+    while i < reps {
+        let _ = sql::parser::parse(src)?
+        i += 1
+    }
+    Ok(Timing { label: label, ops: reps, total_ms: time::now_ms() - start })
+}
+
+/// Runs the statement benchmarks and returns the report lines.
+pub fn sql_report(dir: String, rows: i64) -> Result<Vec<String>, String> {
+    let mut eng = prepare_sql(dir, rows)?
+    let mut out = #[format("terndb statement benchmark: {} rows in {}", rows, dir)]
+    let reps: i64 = 200
+    out.push(render(time_stmt(&mut eng, "SELECT COUNT(*) + WHERE", "SELECT COUNT(*) FROM bench WHERE id > " + (rows / 2).to_string(), reps)?))
+    out.push(render(time_stmt(&mut eng, "SELECT one col + WHERE eq", "SELECT name FROM bench WHERE id = " + (rows / 2).to_string(), reps)?))
+    out.push(render(time_stmt(&mut eng, "SELECT * (all rows)", "SELECT * FROM bench", reps)?))
+    out.push(render(time_stmt(&mut eng, "SELECT ORDER BY + LIMIT 10", "SELECT name FROM bench ORDER BY id LIMIT 10", reps)?))
+    out.push(render(time_stmt(&mut eng, "UPDATE one row", "UPDATE bench SET score = 2.5 WHERE id = 1", reps)?))
+
+    let mut wide = "INSERT INTO bench VALUES "
+    let mut i: i64 = 0
+    while i < 200 {
+        if i > 0 { wide = wide + ", " }
+        wide = wide + "(" + i.to_string() + ", 'row-" + i.to_string() + "', 1.5, true)"
+        i += 1
+    }
+    out.push(render(time_parse("parse 200-row INSERT", wide, reps)?))
+    Ok(out)
+}
+
+/// Runs the whole benchmark and returns the report lines.
+pub fn report(dir: String, n: i64, size: i64) -> Result<Vec<String>, String> {
+    prepare(dir, n, size)?
+    let mut out = #[format("terndb read benchmark: {} keys of {} bytes in {}", n, size, dir)]
+    let get = time_get(dir, n)?
+    let raw = time_fs_read(dir, n)?
+    out.push(render(get))
+    out.push(render(raw))
+    Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn the_benchmark_measures_reads_that_actually_happen() {
+        let dir = "/tmp/terndb_bench_test/small"
+        match super::report(dir, 200, 64) {
+            Ok(lines) => {
+                assert_eq(lines.len(), 3)
+                assert(lines[0].contains("200 keys"))
+                assert(lines[1].contains("kv::get"), "got: " + lines[1])
+                assert(lines[1].contains("queries/s"), "got: " + lines[1])
+                assert(lines[2].contains("fs::read"), "got: " + lines[2])
+            }
+            Err(e) => assert(false, e)
+        }
+    }
+
+    #[test]
+    fn a_prepared_directory_holds_every_key_at_its_payload_size() {
+        let dir = "/tmp/terndb_bench_test/prepared"
+        assert(super::prepare(dir, 50, 128).is_ok())
+        let mut st = kv::open(dir, true).unwrap_or_else(|e| panic(e))
+        assert_eq(kv::len(&mut st), 50)
+        for i in 0..50 {
+            match kv::get(&mut st, super::key_of(i)) {
+                kv::Read::Value(v) => assert_eq(v.len(), 128, "key " + i.to_string())
+                kv::Read::Absent => assert(false, "missing key " + i.to_string())
+                kv::Read::Fault(e) => assert(false, e)
+            }
+        }
+    }
+
+    #[test]
+    fn the_benchmark_refuses_a_directory_it_did_not_fill() {
+        let dir = "/tmp/terndb_bench_test/claimed"
+        let _ = fs::remove_dir_all(dir)
+
+        // Nothing there yet: free to use.
+        assert(super::claim(dir).is_ok(), "an absent directory is free")
+
+        // Somebody's store: refused, and still there afterwards.
+        let mut st = kv::open(dir, false).unwrap_or_else(|e| panic(e))
+        assert(kv::put(&mut st, "keep/me", #[1u8, 2u8, 3u8]).is_ok())
+        assert(kv::sync(&mut st).is_ok())
+        match super::claim(dir) {
+            Ok(()) => assert(false, "a directory holding a store must be refused")
+            Err(e) => assert(e.contains("empty or new directory"), "got: " + e)
+        }
+        let mut still = kv::open(dir, true).unwrap_or_else(|e| panic(e))
+        assert(!matches(kv::get(&mut still, "keep/me"), kv::Read::Absent), "the refusal left the store intact")
+
+        // A directory the benchmark filled is its own to clear again.
+        let scratch = "/tmp/terndb_bench_test/claimed_scratch"
+        assert(super::prepare(scratch, 10, 32).is_ok())
+        assert(super::claim(scratch).is_ok(), "a benchmark directory is reusable")
+    }
+
+    #[test]
+    fn ns_per_op_divides_the_measured_total() {
+        assert_eq(super::ns_per_op(super::Timing { label: "x", ops: 1000, total_ms: 1 }), 1000.0)
+        assert_eq(super::ns_per_op(super::Timing { label: "x", ops: 0, total_ms: 5 }), 0.0)
+    }
+}

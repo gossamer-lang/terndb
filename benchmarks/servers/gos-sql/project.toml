@@ -1,0 +1,6 @@
+[project]
+id = "terndb.db/bench-sql"
+version = "0.1.0"
+gossamer-version = "^v0.58.7"
+
+[dependencies]

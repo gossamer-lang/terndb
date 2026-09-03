@@ -1,0 +1,470 @@
+use crate::engine
+use crate::codec
+use crate::kv
+use crate::sql
+use super::scan
+
+// One statement carried out against the store, from the `Stmt` the parser
+// produced.
+
+pub (package) fn create(eng: &mut engine::Engine, name: String, cols: Vec<(String, u8)>) -> Result<(i64, engine::QueryResult), String> {
+    engine::read_only_refuses(eng)?
+    if eng.tables.contains(name) { return Err("table already exists: " + name) }
+    let mut def = engine::TableDef { name: name, cols: #[], tags: #[] }
+    for (col, tag) in cols {
+        def.cols.push(col)
+        def.tags.push(tag)
+    }
+    kv::put(&mut eng.store, engine::schema_key(name), schema::encode(def))?
+    eng.tables.insert(name, def)
+    // The row index is opened with the table, so every later statement resolves
+    // it by lookup: a read that opened one would be writing to a store its
+    // fellow readers are reading.
+    let _ = kv::rows::open_table(&mut eng.store, name)
+    eng.next_rowid.insert(name, 1)
+    Ok((0, engine::empty_result()))
+}
+
+pub (package) fn create_index(eng: &mut engine::Engine, table: String, col: String) -> Result<(i64, engine::QueryResult), String> {
+    engine::read_only_refuses(eng)?
+    let mut def = engine::get_def(eng, table)?
+    let ci = schema::col_index(&mut def, col)?
+    let name = def.cols[ci]
+    if index::of(eng, table, name) >= 0 {
+        return Err("create index: " + table + "." + name + " is already indexed")
+    }
+    // The declaration is what the store keeps; the index is built from the rows
+    // here and again at every open, so it is never stale and never in the log.
+    kv::put(&mut eng.store, index::declaration_key(table, name), #[])?
+    index::attach(eng, table, name, ci)?
+    Ok((0, engine::empty_result()))
+}
+
+pub (package) fn insert(eng: &mut engine::Engine, table: String, rows: Vec<Vec<codec::Value>>) -> Result<(i64, engine::QueryResult), String> {
+    engine::read_only_refuses(eng)?
+    let mut def = engine::get_def(eng, table)?
+    // Every row is narrowed before any is written, so a rejected statement
+    // leaves the table exactly as it found it.
+    let mut encoded: Vec<Vec<u8>> = #[]
+    // An indexed table needs the rows themselves once they are written, so they
+    // are kept here rather than decoded back out of what was encoded.
+    let indexed = index::covers(eng, table)
+    let mut narrowed: Vec<Vec<codec::Value>> = #[]
+    for invals in rows {
+        if invals.len() != def.cols.len() {
+            return Err("insert: table " + table + " has " + def.cols.len().to_string() +
+                " columns, got " + invals.len().to_string() + " values")
+        }
+        let mut vals: Vec<codec::Value> = #[]
+        for c in 0..invals.len() {
+            vals.push(schema::coerce(invals[c], def.tags[c], def.cols[c])?)
+        }
+        encoded.push(schema::encode_row(vals))
+        if indexed { narrowed.push(vals) }
+    }
+    // Every row of the statement lands together or not at all.
+    let first_rid = eng.next_rowid.get(table).unwrap_or(1)
+    let mut rid = first_rid
+    let tid = kv::rows::table_id(&mut eng.store, table)
+    kv::batch::begin(&mut eng.store)?
+    for bytes in encoded {
+        if let Err(e) = kv::rows::write(&mut eng.store, tid, rid, bytes) {
+            return Err(kv::batch::undo(&mut eng.store, e))
+        }
+        rid += 1
+    }
+    kv::batch::commit(&mut eng.store)?
+    eng.next_rowid.insert(table, rid)
+    // The indexes follow the commit, so a statement that failed to land leaves
+    // them describing the rows that are actually there.
+    for r in 0..narrowed.len() {
+        index::row_added(eng, table, first_rid + r, narrowed[r])
+    }
+    Ok((encoded.len(), engine::empty_result()))
+}
+
+pub (package) fn select(eng: &mut engine::Engine, q: sql::Query) -> Result<(i64, engine::QueryResult), String> {
+    let mut def = engine::get_def(eng, q.table)?
+    let filter = filter::compile(&mut def, q.conds)?
+    let want = if q.count_only { scan::Want::Count } else { scan::Want::Values }
+    // A statement that names one row by its id is answered by the one read
+    // that holds it, the way a prepared `WHERE rowid = ?` is: the walk exists
+    // to find rows the key does not already name.
+    if names_one_row(filter, q.has_order, q.limit) {
+        return by_id(eng, &mut def, q.cols, q.count_only, filter.id_vals[0])
+    }
+    // An ORDER BY has to see every match before it can say which ones survive
+    // the limit; without one, the walk stops as soon as the limit is filled.
+    let cap = if q.has_order { -1 } else { q.limit }
+    let matched, mut kept = scan::table(eng, &mut def, filter, want, cap)?
+    if q.count_only {
+        return engine::counted(if q.limit >= 0 && matched > q.limit { q.limit } else { matched })
+    }
+    if q.has_order {
+        let oi = schema::col_index(&mut def, q.order_col)?
+        if q.order_asc {
+            kept.sort_by(|a, b| schema::cmp_vals(a.vals[oi], b.vals[oi]))
+        } else {
+            kept.sort_by(|a, b| schema::cmp_vals(b.vals[oi], a.vals[oi]))
+        }
+        if q.limit >= 0 && kept.len() > q.limit { kept.truncate(q.limit) }
+    }
+    project(&mut def, q.cols, kept)
+}
+
+// Whether the statement names one row by its id and nothing else, which one
+// read answers: the walk exists to find rows the key does not already name.
+fn names_one_row(filter: filter::Filter, has_order: bool, limit: i64) -> bool {
+    filter.cols.len() == 0 && filter.id_ops.len() == 1 && filter.id_ops[0] == sql::OP_EQ
+    && filter.id_args[0] < 0 && !has_order && limit != 0
+}
+
+// The one row `rid` names, projected the way the statement asked for it.
+fn by_id(eng: &mut engine::Engine, def: &mut engine::TableDef, cols: Vec<String>, count_only: bool, rid: i64) -> Result<(i64, engine::QueryResult), String> {
+    let tid = kv::rows::table_id(&mut eng.store, def.name)
+    if count_only {
+        return engine::counted(if kv::rows::holds(&mut eng.store, tid, rid) { 1 } else { 0 })
+    }
+    let mut hit: Vec<engine::Row> = #[]
+    if rid >= 1 {
+        match kv::rows::read(&mut eng.store, tid, rid) {
+            kv::Read::Value(bytes) => {
+                hit.push(engine::Row { rowid: rid, vals: codec::decode_row(bytes, def.cols.len())? })
+            }
+            kv::Read::Absent => ()
+            kv::Read::Fault(e) => return Err(e)
+        }
+    }
+    project(def, cols, hit)
+}
+
+/// The columns a SELECT answers, given the rows its plan produced: the rows as
+/// they stand when the projection names every column in order, and the picked
+/// columns in the order they were written otherwise.
+fn project(def: &mut engine::TableDef, cols: Vec<String>, kept: Vec<engine::Row>) -> Result<(i64, engine::QueryResult), String> {
+    let mut out_cols: Vec<String> = #[]
+    let mut picks: Vec<i64> = #[]
+    if cols.len() == 0 {
+        for i in 0..def.cols.len() {
+            out_cols.push(def.cols[i])
+            picks.push(i)
+        }
+    } else {
+        for c in cols {
+            picks.push(schema::col_index(def, c)?)
+            out_cols.push(c)
+        }
+    }
+    // A projection of every column in order is the row as it already stands.
+    if picks.len() == def.cols.len() {
+        let mut identity = true
+        for i in 0..picks.len() {
+            if picks[i] != i { identity = false; break }
+        }
+        if identity { return Ok((kept.len(), engine::QueryResult { cols: out_cols, rows: kept })) }
+    }
+    let mut projected: Vec<engine::Row> = #[]
+    for row in kept {
+        let mut vals: Vec<codec::Value> = #[]
+        for i in picks { vals.push(row.vals[i]) }
+        projected.push(engine::Row { rowid: row.rowid, vals: vals })
+    }
+    Ok((projected.len(), engine::QueryResult { cols: out_cols, rows: projected }))
+}
+
+pub (package) fn update(eng: &mut engine::Engine, table: String, sets: Vec<(String, codec::Value)>, conds: Vec<sql::Cond>) -> Result<(i64, engine::QueryResult), String> {
+    engine::read_only_refuses(eng)?
+    let mut def = engine::get_def(eng, table)?
+    let filter = filter::compile(&mut def, conds)?
+    // Each assignment is resolved and narrowed once, not once per row.
+    let mut targets: Vec<i64> = #[]
+    let mut values: Vec<codec::Value> = #[]
+    for (col, val) in sets {
+        let ci = schema::col_index(&mut def, col)?
+        targets.push(ci)
+        values.push(schema::coerce(val, def.tags[ci], def.cols[ci])?)
+    }
+    let _, hits = scan::table(eng, &mut def, filter, scan::Want::Values, -1)?
+    let tid = kv::rows::table_id(&mut eng.store, table)
+    let indexed = index::covers(eng, table)
+    let mut writes: Vec<(i64, Vec<u8>)> = #[]
+    let mut before: Vec<Vec<codec::Value>> = #[]
+    let mut after: Vec<Vec<codec::Value>> = #[]
+    for row in hits {
+        let mut vals = row.vals
+        if indexed { before.push(vals) }
+        for i in 0..targets.len() { vals[targets[i]] = values[i] }
+        if indexed { after.push(vals) }
+        writes.push((row.rowid, schema::encode_row(vals)))
+    }
+    kv::batch::begin(&mut eng.store)?
+    for (rid, bytes) in writes {
+        if let Err(e) = kv::rows::write(&mut eng.store, tid, rid, bytes) {
+            return Err(kv::batch::undo(&mut eng.store, e))
+        }
+    }
+    kv::batch::commit(&mut eng.store)?
+    // A row moves between chains once its new value is the one on disk.
+    for w in 0..before.len() {
+        index::row_removed(eng, table, writes[w].0, before[w])
+        index::row_added(eng, table, writes[w].0, after[w])
+    }
+    Ok((writes.len(), engine::empty_result()))
+}
+
+pub (package) fn delete(eng: &mut engine::Engine, table: String, conds: Vec<sql::Cond>) -> Result<(i64, engine::QueryResult), String> {
+    engine::read_only_refuses(eng)?
+    let mut def = engine::get_def(eng, table)?
+    let filter = filter::compile(&mut def, conds)?
+    // A delete needs the row ids alone, unless an index has to be told which
+    // values are going, in which case it needs the rows as well.
+    let indexed = index::covers(eng, table)
+    let want = if indexed { scan::Want::Values } else { scan::Want::Ids }
+    let _, hits = scan::table(eng, &mut def, filter, want, -1)?
+    let tid = kv::rows::table_id(&mut eng.store, table)
+    let mut ids: Vec<i64> = #[]
+    let mut gone: Vec<Vec<codec::Value>> = #[]
+    for row in hits {
+        ids.push(row.rowid)
+        if indexed { gone.push(row.vals) }
+    }
+    kv::batch::begin(&mut eng.store)?
+    for rid in ids {
+        if let Err(e) = kv::rows::remove(&mut eng.store, tid, rid) {
+            return Err(kv::batch::undo(&mut eng.store, e))
+        }
+    }
+    kv::batch::commit(&mut eng.store)?
+    for d in 0..gone.len() {
+        index::row_removed(eng, table, ids[d], gone[d])
+    }
+    Ok((ids.len(), engine::empty_result()))
+}
+
+#[cfg(test)]
+mod tests {
+    use std::fs
+    use crate::engine
+
+    fn fresh(name: String) -> String {
+        let dir = "/tmp/terndb_engine_test/" + name
+        let _ = fs::remove_dir_all(dir)
+        let _ = fs::create_dir_all(dir)
+        dir
+    }
+
+    fn opened(dir: String) -> engine::Engine {
+        engine::open(dir, false).unwrap_or_else(|e| panic("open " + dir + ": " + e))
+    }
+
+    fn run(eng: &mut engine::Engine, src: String) -> i64 {
+        match engine::exec(eng, src) {
+            Ok((n, _)) => return n
+            Err(e) => {
+                assert(false, src + " -> " + e)
+                return -1
+            }
+        }
+    }
+
+    fn rows(eng: &mut engine::Engine, src: String) -> Vec<Vec<String>> {
+        match engine::exec(eng, src) {
+            Ok((_, res)) => {
+                let mut out: Vec<Vec<String>> = #[]
+                for row in res.rows {
+                    let mut cells: Vec<String> = #[]
+                    for v in row.vals { cells.push(codec::value_to_string(v)) }
+                    out.push(cells)
+                }
+                return out
+            }
+            Err(e) => {
+                assert(false, src + " -> " + e)
+                return #[]
+            }
+        }
+    }
+
+    fn users(eng: &mut engine::Engine) {
+        assert_eq(run(eng, "CREATE TABLE users (name TEXT, age INT32, active BOOL, at DATETIME, score FLOAT)"), 0)
+        assert_eq(run(eng, "INSERT INTO users VALUES ('alice', 30, true, '2023-11-14T22:13:20Z', 1.5)"), 1)
+        assert_eq(run(eng, "INSERT INTO users VALUES ('bob', 40, false, '2023-12-01T10:00:00Z', 2.5)"), 1)
+        assert_eq(run(eng, "INSERT INTO users VALUES ('carol', 25, true, '2024-01-01T00:00:00Z', 3.5)"), 1)
+    }
+
+    #[test]
+    fn create_insert_and_select_round_trip_every_column_type() {
+        let mut eng = opened(fresh("crud"))
+        users(&mut eng)
+        let all = rows(&mut eng, "SELECT * FROM users WHERE name = 'alice'")
+        assert_eq(all.len(), 1)
+        assert_eq(all[0], #["alice", "30", "true", "2023-11-14T22:13:20.000Z", "1.5"])
+    }
+
+    #[test]
+    fn a_projection_selects_the_named_columns_in_order() {
+        let mut eng = opened(fresh("projection"))
+        users(&mut eng)
+        let got = rows(&mut eng, "SELECT age, name FROM users WHERE name = 'bob'")
+        assert_eq(got, #[#["40", "bob"]], "columns come back in the order asked for")
+        assert_eq(rows(&mut eng, "SELECT name FROM users WHERE name = 'bob'"), #[#["bob"]])
+        assert(engine::exec(&mut eng, "SELECT nope FROM users").is_err(), "an unknown column is an error")
+    }
+
+    #[test]
+    fn order_by_and_limit_shape_the_result() {
+        let mut eng = opened(fresh("order_limit"))
+        users(&mut eng)
+        assert_eq(rows(&mut eng, "SELECT name FROM users ORDER BY age"), #[#["carol"], #["alice"], #["bob"]])
+        assert_eq(rows(&mut eng, "SELECT name FROM users ORDER BY age DESC"), #[#["bob"], #["alice"], #["carol"]])
+        assert_eq(rows(&mut eng, "SELECT name FROM users ORDER BY name"), #[#["alice"], #["bob"], #["carol"]])
+        assert_eq(rows(&mut eng, "SELECT name FROM users ORDER BY age DESC LIMIT 2"), #[#["bob"], #["alice"]])
+        assert_eq(run(&mut eng, "SELECT * FROM users LIMIT 0"), 0)
+        assert_eq(run(&mut eng, "SELECT * FROM users LIMIT 99"), 3, "a LIMIT past the end keeps everything")
+    }
+
+    #[test]
+    fn rowid_addresses_a_row_by_the_key_it_is_stored_under() {
+        let mut eng = opened(fresh("rowid"))
+        assert_eq(run(&mut eng, "CREATE TABLE t (name TEXT, score INT32)"), 0)
+        assert_eq(run(&mut eng, "INSERT INTO t VALUES ('a', 10), ('b', 20), ('c', 30)"), 3)
+        assert_eq(rows(&mut eng, "SELECT name FROM t WHERE rowid = 2"), #[#["b"]])
+        assert_eq(rows(&mut eng, "SELECT name FROM t WHERE ROWID = 1"), #[#["a"]], "the name is case-insensitive")
+        assert_eq(run(&mut eng, "SELECT * FROM t WHERE rowid = 99"), 0, "an absent id matches nothing")
+        assert_eq(rows(&mut eng, "SELECT name FROM t WHERE rowid > 1"), #[#["b"], #["c"]])
+        assert_eq(rows(&mut eng, "SELECT name FROM t WHERE rowid <= 2"), #[#["a"], #["b"]])
+        assert_eq(rows(&mut eng, "SELECT name FROM t WHERE rowid != 2"), #[#["a"], #["c"]])
+        assert_eq(rows(&mut eng, "SELECT COUNT(*) FROM t WHERE rowid >= 2"), #[#["2"]])
+        assert_eq(rows(&mut eng, "SELECT name FROM t WHERE rowid = 3 AND score = 30"), #[#["c"]]
+            "a row id combines with an ordinary column")
+        assert_eq(run(&mut eng, "SELECT * FROM t WHERE rowid = 3 AND score = 10"), 0)
+    }
+
+    #[test]
+    fn rowid_drives_update_and_delete_too() {
+        let mut eng = opened(fresh("rowid_write"))
+        assert_eq(run(&mut eng, "CREATE TABLE t (v TEXT)"), 0)
+        assert_eq(run(&mut eng, "INSERT INTO t VALUES ('a'), ('b'), ('c')"), 3)
+        assert_eq(run(&mut eng, "UPDATE t SET v = 'B' WHERE rowid = 2"), 1)
+        assert_eq(rows(&mut eng, "SELECT v FROM t"), #[#["a"], #["B"], #["c"]])
+        assert_eq(run(&mut eng, "DELETE FROM t WHERE rowid = 1"), 1)
+        assert_eq(rows(&mut eng, "SELECT v FROM t"), #[#["B"], #["c"]])
+        assert_eq(run(&mut eng, "DELETE FROM t WHERE rowid = 1"), 0, "the id is gone, not reused")
+    }
+
+    #[test]
+    fn update_rewrites_only_the_matching_rows() {
+        let mut eng = opened(fresh("update"))
+        users(&mut eng)
+        assert_eq(run(&mut eng, "UPDATE users SET score = 9.5 WHERE name = 'bob'"), 1)
+        assert_eq(rows(&mut eng, "SELECT score FROM users WHERE name = 'bob'"), #[#["9.5"]])
+        assert_eq(rows(&mut eng, "SELECT score FROM users WHERE name = 'alice'"), #[#["1.5"]], "other rows are untouched")
+        assert_eq(run(&mut eng, "UPDATE users SET active = false, age = 41 WHERE name = 'bob'"), 2 - 1)
+        assert_eq(rows(&mut eng, "SELECT age, active FROM users WHERE name = 'bob'"), #[#["41", "false"]])
+        assert_eq(run(&mut eng, "UPDATE users SET active = true"), 3, "an unfiltered UPDATE touches every row")
+        assert_eq(run(&mut eng, "SELECT * FROM users WHERE active = true"), 3)
+        assert_eq(run(&mut eng, "UPDATE users SET age = 1 WHERE name = 'nobody'"), 0)
+    }
+
+    #[test]
+    fn delete_removes_only_the_matching_rows() {
+        let mut eng = opened(fresh("delete"))
+        users(&mut eng)
+        assert_eq(run(&mut eng, "DELETE FROM users WHERE name = 'alice'"), 1)
+        assert_eq(run(&mut eng, "SELECT * FROM users"), 2)
+        assert_eq(run(&mut eng, "DELETE FROM users WHERE name = 'alice'"), 0, "deleting twice is not an error")
+        assert_eq(run(&mut eng, "DELETE FROM users"), 2, "an unfiltered DELETE empties the table")
+        assert_eq(run(&mut eng, "SELECT * FROM users"), 0)
+    }
+
+    #[test]
+    fn rowids_are_not_reused_after_a_delete() {
+        let mut eng = opened(fresh("rowids"))
+        assert_eq(run(&mut eng, "CREATE TABLE t (v TEXT)"), 0)
+        assert_eq(run(&mut eng, "INSERT INTO t VALUES ('a'), ('b'), ('c')"), 3)
+        assert_eq(run(&mut eng, "DELETE FROM t WHERE v = 'b'"), 1)
+        assert_eq(run(&mut eng, "INSERT INTO t VALUES ('d')"), 1)
+        assert_eq(rows(&mut eng, "SELECT v FROM t"), #[#["a"], #["c"], #["d"]])
+        assert_eq(run(&mut eng, "UPDATE t SET v = 'z' WHERE v = 'c'"), 1, "the surviving row is still addressable")
+        assert_eq(rows(&mut eng, "SELECT v FROM t ORDER BY v"), #[#["a"], #["d"], #["z"]])
+    }
+
+    #[test]
+    fn a_multi_row_insert_writes_every_row() {
+        let mut eng = opened(fresh("multi_insert"))
+        assert_eq(run(&mut eng, "CREATE TABLE t (a INT32, b TEXT)"), 0)
+        assert_eq(run(&mut eng, "INSERT INTO t VALUES (1, 'one'), (2, 'two'), (3, 'three')"), 3)
+        assert_eq(rows(&mut eng, "SELECT b FROM t ORDER BY a"), #[#["one"], #["two"], #["three"]])
+    }
+
+    #[test]
+    fn a_rejected_insert_leaves_the_table_unchanged() {
+        let mut eng = opened(fresh("atomic_insert"))
+        assert_eq(run(&mut eng, "CREATE TABLE t (a INT8)"), 0)
+        assert_eq(run(&mut eng, "INSERT INTO t VALUES (1)"), 1)
+        assert(engine::exec(&mut eng, "INSERT INTO t VALUES (2), (999)").is_err(), "999 does not fit an INT8")
+        assert_eq(run(&mut eng, "SELECT * FROM t"), 1, "neither row of the rejected statement was written")
+    }
+
+    #[test]
+    fn insert_checks_the_value_count() {
+        let mut eng = opened(fresh("arity"))
+        assert_eq(run(&mut eng, "CREATE TABLE t (a INT32, b TEXT)"), 0)
+        assert(engine::exec(&mut eng, "INSERT INTO t VALUES (1)").is_err())
+        assert(engine::exec(&mut eng, "INSERT INTO t VALUES (1, 'x', 2)").is_err())
+        assert_eq(run(&mut eng, "INSERT INTO t VALUES (1, 'x')"), 1)
+    }
+
+    #[test]
+    fn a_row_that_cannot_be_read_stops_the_statement_rather_than_thinning_the_answer() {
+        // A sealed generation is described by its hint file, so a corrupted
+        // value reaches the statement layer as a read that fails. Leaving the
+        // row out would answer the query with a table the store does not hold.
+        let dir = fresh("corrupt_row")
+        let mut eng = opened(dir)
+        assert_eq(run(&mut eng, "CREATE TABLE t (v TEXT, n INT32)"), 0)
+        assert_eq(run(&mut eng, "INSERT INTO t VALUES ('zzzzzzzz', 1), ('wwwwwwww', 2)"), 2)
+        assert_eq(run(&mut eng, "COMPACT"), 0)
+        assert(engine::sync(&mut eng).is_ok())
+
+        let sealed = kv::log::data_generations(dir).unwrap_or(#[])[0]
+        let path = kv::log::data_path(dir, sealed)
+        let mut bytes = fs::read(path).unwrap_or(#[])
+        let needle = "zzzzzzzz".as_bytes()
+        let mut at: i64 = -1
+        let mut i: i64 = 0
+        while i + needle.len() <= bytes.len() {
+            let mut j: i64 = 0
+            let mut hit = true
+            while j < needle.len() {
+                if bytes[i + j] != needle[j] {
+                    hit = false
+                    break
+                }
+                j += 1
+            }
+            if hit {
+                at = i
+                break
+            }
+            i += 1
+        }
+        assert(at >= 0, "the value is in the sealed generation")
+        bytes[at] = 88u8
+        assert(fs::write(path, bytes).is_ok())
+
+        let mut after = opened(dir)
+        match engine::exec(&mut after, "SELECT v FROM t") {
+            Ok(_) => assert(false, "a walk over a row it cannot read must report it")
+            Err(e) => assert(e.contains("checksum mismatch"), "got: " + e)
+        }
+        match engine::exec(&mut after, "SELECT v FROM t WHERE rowid = 1") {
+            Ok(_) => assert(false, "so must the keyed read")
+            Err(e) => assert(e.contains("checksum mismatch"), "got: " + e)
+        }
+        assert_eq(rows(&mut after, "SELECT v FROM t WHERE rowid = 2"), #[#["wwwwwwww"]]
+            "the row beside it still answers")
+        assert(engine::exec(&mut after, "CREATE INDEX ON t (v)").is_err()
+            "and an index over the table is not built around what it cannot read")
+    }
+}

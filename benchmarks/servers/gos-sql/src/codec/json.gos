@@ -1,0 +1,294 @@
+use crate::codec
+
+// A row's JSON spelling, rendered straight from the encoded bytes.
+//
+// A read that answers JSON never builds a `codec::Value`: the render walks the record
+// the store handed back and writes each column into the answer as it goes,
+// which is the whole of what the key-value front end does above the store.
+
+/// The `,"<name>":` fragment each column is written under, built once so a
+/// render appends one piece per column rather than three.
+///
+/// A statement's columns are settled when it is planned, so this belongs
+/// wherever the plan does; [`render`] takes what it produces.
+pub fn keys(names: Vec<String>) -> Vec<String> {
+    let mut keys: Vec<String> = #[]
+    for name in names { keys.push(",\"" + name + "\":") }
+    keys
+}
+
+/// Renders one row's encoded columns as `{"id":<id>,"<name>":<value>,...}`,
+/// or the empty string when the buffer does not hold them all.
+///
+/// `keys` is what [`keys`] builds, one `,"<name>":` per column in the
+/// order the row encodes them.
+///
+/// The row is read once, straight into the answer: no `codec::Value` is built and no
+/// column is turned into a string of its own on the way, which is the work a
+/// request answering a row as JSON does not otherwise need. The answer is built
+/// here and returned rather than appended to a caller's buffer, so the answer
+/// is one allocation sized for the row rather than a caller's buffer regrown
+/// per column.
+pub fn render(buf: Vec<u8>, keys: Vec<String>, id: i64) -> String {
+    render_window(buf, 0, buf.len(), keys, id)
+}
+
+/// The same rendering over `buf[start..end]`, for a caller holding the row
+/// inside a larger buffer.
+///
+/// A store that keeps a sealed file in memory reads a row by naming where it
+/// sits rather than by copying it out, so the render is the only pass over
+/// those bytes.
+pub fn render_window(buf: Vec<u8>, start: i64, end: i64, keys: Vec<String>, id: i64) -> String {
+    let cols = keys.len()
+    let mut out = String::with_capacity(16 + cols * 24 + (end - start))
+    out.push_str("{\"id\":")
+    out.push_str(id.to_string())
+    let n = end
+    let mut p: i64 = start
+    let mut c: i64 = 0
+    // The row is read straight into the answer, one column at a time: no
+    // `Value` is built, and the buffer is read where it lies.
+    while c < cols {
+        if p >= n { return "" }
+        out.push_str(keys[c])
+        let tag = buf[p]
+        p += 1
+        match tag {
+            codec::TAG_NIL => out.push_str("null")
+            codec::TAG_BOOL => {
+                if p + 1 > n { return "" }
+                out.push_str(if buf[p] != 0u8 { "true" } else { "false" })
+                p += 1
+            }
+            codec::TAG_I8 => {
+                if p + 1 > n { return "" }
+                out.push_str((buf[p] as i8 as i64).to_string())
+                p += 1
+            }
+            codec::TAG_I16 => {
+                if p + 2 > n { return "" }
+                out.push_str(sign_extend((buf[p] as i64) | ((buf[p + 1] as i64) << 8), 2).to_string())
+                p += 2
+            }
+            codec::TAG_I32 => {
+                if p + 4 > n { return "" }
+                out.push_str(sign_extend(u32_at(buf, p), 4).to_string())
+                p += 4
+            }
+            codec::TAG_I64 => {
+                if p + 8 > n { return "" }
+                out.push_str(i64_at(buf, p).to_string())
+                p += 8
+            }
+            codec::TAG_DT => {
+                if p + 8 > n { return "" }
+                out.push_str("\"")
+                out.push_str(datetime::render(i64_at(buf, p)))
+                out.push_str("\"")
+                p += 8
+            }
+            codec::TAG_F32 | codec::TAG_F64 => {
+                if p + 8 > n { return "" }
+                out.push_str(f64::from_bits(i64_at(buf, p) as u64).to_string())
+                p += 8
+            }
+            codec::TAG_TEXT => {
+                if p + 4 > n { return "" }
+                let body = p + 4
+                let stop = body + u32_at(buf, p)
+                if stop > n { return "" }
+                if !text_into(&mut out, buf, body, stop) { return "" }
+                p = stop
+            }
+            _ => return ""
+        }
+        c += 1
+    }
+    out.push_str("}")
+    out
+}
+
+// A text column's bytes as a JSON string, escaped where JSON asks for it.
+//
+// Every byte JSON escapes is ASCII, so a run of text may be cut at one and the
+// multi-byte characters either side of the cut stay whole. False means the
+// bytes are not the UTF-8 the column claims.
+fn text_into(out: &mut String, buf: Vec<u8>, start: i64, end: i64) -> bool {
+    out.push_str("\"")
+    let mut run = start
+    let mut b = start
+    while b < end {
+        let byte = buf[b]
+        if byte == 34u8 || byte == 92u8 || byte < 32u8 {
+            if b > run && !out.push_utf8(buf, run, b) { return false }
+            out.push_str(escape_byte(byte))
+            run = b + 1
+        }
+        b += 1
+    }
+    if end > run && !out.push_utf8(buf, run, end) { return false }
+    out.push_str("\"")
+    true
+}
+
+// The escape JSON spells a byte with, for the bytes it does not take as they
+// are.
+fn escape_byte(byte: u8) -> String {
+    match byte {
+        34u8 => "\\\""
+        92u8 => "\\\\"
+        10u8 => "\\n"
+        13u8 => "\\r"
+        9u8 => "\\t"
+        _ => "\\u00" + hex_byte(byte as i64)
+    }
+}
+
+// A raw fixed-width field read as the signed integer it stands for.
+fn sign_extend(raw: i64, width: i64) -> i64 {
+    let sign = 1 << (8 * width - 1)
+    if raw >= sign { raw - 2 * sign } else { raw }
+}
+
+// The four little-endian bytes at `p`, unsigned. A fixed-width field is a
+// handful of shifts, where a slice of the buffer would be an allocation.
+fn u32_at(buf: Vec<u8>, p: i64) -> i64 {
+    (buf[p] as i64) | ((buf[p + 1] as i64) << 8) | ((buf[p + 2] as i64) << 16) | ((buf[p + 3] as i64) << 24)
+}
+
+// The eight little-endian bytes at `p`, read by index. A fixed-width field is
+// a handful of shifts, where a slice of the buffer would be an allocation.
+fn i64_at(buf: Vec<u8>, p: i64) -> i64 {
+    let lo = (buf[p] as i64) | ((buf[p + 1] as i64) << 8) | ((buf[p + 2] as i64) << 16) | ((buf[p + 3] as i64) << 24)
+    let hi = (buf[p + 4] as i64) | ((buf[p + 5] as i64) << 8) | ((buf[p + 6] as i64) << 16) | ((buf[p + 7] as i64) << 24)
+    (hi << 32) | lo
+}
+
+/// One decoded value in the JSON spelling [`render`] gives it.
+///
+/// This is the projection path's renderer: a statement naming its columns out
+/// of table order has to reach them through the decoded row, and renders each
+/// the same way a whole row does.
+pub fn value(v: codec::Value) -> String {
+    if v.tag == codec::TAG_NIL { return "null" }
+    if v.tag == codec::TAG_BOOL { return if v.b { "true" } else { "false" } }
+    if v.tag == codec::TAG_TEXT { return "\"" + escape(v.s) + "\"" }
+    if v.tag == codec::TAG_DT { return "\"" + datetime::render(v.i) + "\"" }
+    if v.tag == codec::TAG_F32 || v.tag == codec::TAG_F64 { return v.f.to_string() }
+    v.i.to_string()
+}
+
+// `text` with the two characters JSON reserves inside a string escaped, and
+// anything below a space written as an escape of its own. A string holding none
+// of them is its own answer, which is what almost every column is.
+fn escape(text: String) -> String {
+    let n = text.byte_len()
+    let mut i: i64 = 0
+    while i < n {
+        let b = text.byte_at(i)
+        if b == 34 || b == 92 || b < 32 { break }
+        i += 1
+    }
+    if i == n { return text }
+    let mut out = String::with_capacity(n + 8)
+    for ch in text {
+        let code = ch as i64
+        match code {
+            34 => out.push_str("\\\"")
+            92 => out.push_str("\\\\")
+            10 => out.push_str("\\n")
+            13 => out.push_str("\\r")
+            9 => out.push_str("\\t")
+            _ => {
+                if code < 32 {
+                    out.push_str("\\u00")
+                    out.push_str(hex_byte(code))
+                } else {
+                    out.push_str(ch.to_string())
+                }
+            }
+        }
+    }
+    out
+}
+
+// Two lowercase hex digits of a byte, for the escapes JSON spells that way.
+fn hex_byte(v: i64) -> String {
+    let digits = "0123456789abcdef"
+    digits[(v >> 4) & 15].to_string() + digits[v & 15].to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::codec
+
+    #[test]
+    fn a_row_renders_as_json_without_materialising_values() {
+        let mut buf: Vec<u8> = #[]
+        codec::encode_into(&mut buf, codec::v_text("user-1"))
+        codec::encode_into(&mut buf, codec::v_text("u\"q\\b"))
+        codec::encode_into(&mut buf, codec::v_f64(1.5))
+        codec::encode_into(&mut buf, codec::v_bool(true))
+        codec::encode_into(&mut buf, codec::v_nil())
+        assert_eq(super::render(buf, super::keys(#["name", "email", "score", "active", "note"]), 7)
+            "{\"id\":7,\"name\":\"user-1\",\"email\":\"u\\\"q\\\\b\",\"score\":1.5,\"active\":true,\"note\":null}")
+        assert_eq(super::render(buf.slice(0, 5).unwrap_or(#[]), super::keys(#["name"]), 1), "", "a truncated row is refused")
+    }
+
+    #[test]
+    fn escapes_survive_beside_the_multi_byte_text_around_them() {
+        // Every byte JSON escapes is ASCII, so a run of text may be cut at one.
+        // The cut has to leave the multi-byte characters either side of it
+        // whole, which is what this pins.
+        let raw = "é\"🌍\\x\u{1}y\tz"
+        let mut buf: Vec<u8> = #[]
+        codec::encode_into(&mut buf, codec::v_text(raw))
+        assert_eq(super::render(buf, super::keys(#["t"]), 3)
+            "{\"id\":3,\"t\":\"é\\\"🌍\\\\x\\u0001y\\tz\"}")
+        // A text column with nothing to escape, and an empty one.
+        let mut plain: Vec<u8> = #[]
+        codec::encode_into(&mut plain, codec::v_text("héllo 🌍"))
+        codec::encode_into(&mut plain, codec::v_text(""))
+        assert_eq(super::render(plain, super::keys(#["a", "b"]), 1)
+            "{\"id\":1,\"a\":\"héllo 🌍\",\"b\":\"\"}")
+        // A row whose text length runs past the buffer is refused rather than
+        // rendered short.
+        let mut cut: Vec<u8> = #[]
+        codec::encode_into(&mut cut, codec::v_text("abcdefgh"))
+        assert_eq(super::render(cut.slice(0, 8).unwrap_or(#[]), super::keys(#["a"]), 1), "")
+    }
+
+    #[test]
+    fn every_rendered_column_matches_the_value_it_encodes() {
+        let vals = #[codec::v_i8(-8), codec::v_i16(-300), codec::v_i32(70_000), codec::v_i64(-9_007_199_254_740_993)
+            codec::v_f32(0.5), codec::v_dt(1_699_999_999_000), codec::v_bool(false), codec::v_text("héllo 🌍")]
+        let mut buf: Vec<u8> = #[]
+        for v in vals { codec::encode_into(&mut buf, v) }
+        let mut names: Vec<String> = #[]
+        for i in 0..vals.len() { names.push("c" + i.to_string()) }
+        let out = super::render(buf, super::keys(names), 1)
+        // Every column renders what `value_to_string` renders, quoted where
+        // JSON asks for a string.
+        let mut want = "{\"id\":1"
+        for i in 0..vals.len() {
+            let v = vals[i]
+            let cell = codec::value_to_string(v)
+            let quoted = v.tag == codec::TAG_TEXT || v.tag == codec::TAG_DT
+            want = want + ",\"" + names[i] + "\":" + (if quoted { "\"" + cell + "\"" } else { cell })
+        }
+        want = want + "}"
+        assert_eq(out, want)
+    }
+
+    #[test]
+    fn a_value_renders_the_same_alone_as_it_does_in_a_row() {
+        let vals = #[codec::v_nil(), codec::v_bool(true), codec::v_i32(5), codec::v_f64(2.5)
+            codec::v_text("a\"b"), codec::v_dt(0)]
+        for v in vals {
+            let mut buf: Vec<u8> = #[]
+            codec::encode_into(&mut buf, v)
+            assert_eq(super::render(buf, super::keys(#["n"]), 1), "{\"id\":1,\"n\":" + super::value(v) + "}")
+        }
+    }
+}

@@ -1,0 +1,246 @@
+use crate::sql
+use crate::engine
+use crate::codec
+use crate::kv
+use super::filter
+
+// The walk a statement's rows come from: rowid order, one decode per row, and
+// only the matches retained.
+
+/// What a table walk has to retain from the rows it matches.
+pub enum Want {
+    Count
+    Ids
+    Values
+}
+
+// What a walk keeps from each row it visits: the columns the filter needs
+// decoded, the columns the caller wants, and which of the two the row is held
+// for.
+struct Take {
+    want: Want
+    probe: i64
+    full: i64
+}
+
+// Walks the table in rowid order, decoding each row once and testing it as it
+// goes, so only the matches are ever held. `cap` stops the walk as soon as the
+// caller can take no more, which is what makes LIMIT without ORDER BY cheap.
+//
+// The walk visits rowids rather than index keys: it costs one map lookup per
+// id, against iterating and sorting every key in the store for each statement.
+pub (package) fn table(eng: &mut engine::Engine, def: &mut engine::TableDef, filter: filter::Filter, want: Want, cap: i64) -> Result<(i64, Vec<engine::Row>), String> {
+    let table = def.name
+    // Every row of the table is reached by its id, so the walk builds no key.
+    let tid = kv::rows::table_id(&mut eng.store, table)
+    // A row is decoded twice over: first just the columns the filter names, and
+    // then, only if it matched and the caller wants values, the whole of it. A
+    // selective statement therefore decodes the full row only for its matches.
+    let take = Take {
+        want: want
+        probe: probe_width(filter)
+        full: if want == Want::Values { def.cols.len() } else { 0 }
+    }
+    // A bare COUNT(*) is answered from the index, without building a key or
+    // reading a row.
+    if take.probe == 0 && take.full == 0 && want == Want::Count && filter.id_ops.len() == 0 {
+        let live = kv::rows::count(&mut eng.store, tid)
+        return Ok((if cap >= 0 && live > cap { cap } else { live }, #[]))
+    }
+    // An equality test on the row id names one row, so the walk is that row.
+    let mut first: i64 = 1
+    let mut past = eng.next_rowid.get(table).unwrap_or(1)
+    if filter.id_eq >= 0 {
+        first = filter.id_eq
+        past = filter.id_eq + 1
+    }
+    let mut wanted = codec::v_nil()
+    let chain = indexed_chain(eng, def, filter, &mut wanted)
+    let mut f = filter
+    let mut rows: Vec<engine::Row> = #[]
+    let mut matched: i64 = 0
+    if chain >= 0 {
+        for rid in chain_rows(eng, chain, wanted) {
+            if cap >= 0 && matched >= cap { break }
+            if rid < first || rid >= past { continue }
+            if filter::id_holds(&mut f, rid) && row(eng, tid, rid, &mut f, take, &mut rows)? {
+                matched += 1
+            }
+        }
+        return Ok((matched, rows))
+    }
+    let mut rid: i64 = first
+    while rid < past {
+        if cap >= 0 && matched >= cap { break }
+        if filter::id_holds(&mut f, rid) && row(eng, tid, rid, &mut f, take, &mut rows)? {
+            matched += 1
+        }
+        rid += 1
+    }
+    Ok((matched, rows))
+}
+
+// How much of a row the filter has to see: one past the last column it names.
+fn probe_width(filter: filter::Filter) -> i64 {
+    let mut probe: i64 = 0
+    for c in filter.cols {
+        if c + 1 > probe { probe = c + 1 }
+    }
+    probe
+}
+
+// The index a filter can be answered through, with the value to look up in it
+// left in `wanted`.
+//
+// An equality on an indexed column names the rows to visit outright, so the
+// walk is those rows rather than the table. Every one of them is still put
+// through the whole filter, so the index decides what is looked at and never
+// what the answer is. A statement that already names one row by its id has
+// nothing to gain from one.
+fn indexed_chain(eng: &mut engine::Engine, def: &mut engine::TableDef, f: filter::Filter, wanted: &mut codec::Value) -> i64 {
+    if f.id_eq >= 0 || f.id_eq_arg >= 0 { return -1 }
+    let mut k: i64 = 0
+    while k < f.cols.len() {
+        if f.ops[k] == sql::OP_EQ {
+            let ix = index::of(eng, def.name, def.cols[f.cols[k]])
+            if ix >= 0 {
+                *wanted = f.vals[k]
+                return ix
+            }
+        }
+        k += 1
+    }
+    -1
+}
+
+// The rows an index files under `wanted`, in rowid order.
+//
+// A chain is in the order rows joined it, which is not the order the table is
+// walked in, so it is sorted: a statement answers the same whether or not an
+// index exists.
+fn chain_rows(eng: &mut engine::Engine, chain: i64, wanted: codec::Value) -> Vec<i64> {
+    let mut candidates: Vec<i64> = #[]
+    let mut at = eng.indexes[chain].head.get(index::key_of(wanted)).unwrap_or(0)
+    while at != 0 {
+        candidates.push(at)
+        at = eng.indexes[chain].next[at]
+    }
+    candidates.sort()
+    candidates
+}
+
+// One row of a walk: reads it, tests it against every comparison, and keeps
+// what the caller asked for. Answers whether it matched.
+//
+// A row is read twice over at most: the columns the filter names, and then, for
+// a match the caller wants values from, the rest of it.
+fn row(eng: &mut engine::Engine, tid: i64, rid: i64, filter: &mut filter::Filter, take: Take, rows: &mut Vec<engine::Row>) -> Result<bool, String> {
+    // When nothing about the row's contents is needed - an unfiltered delete,
+    // say - its presence in the index is the whole answer.
+    if take.probe == 0 && take.full == 0 {
+        if !kv::rows::holds(&mut eng.store, tid, rid) { return Ok(false) }
+        rows.push(engine::Row { rowid: rid, vals: #[] })
+        return Ok(true)
+    }
+    let bytes = match kv::rows::read(&mut eng.store, tid, rid) {
+        kv::Read::Value(b) => b
+        kv::Read::Absent => return Ok(false)
+        kv::Read::Fault(e) => return Err(e)
+    }
+    let mut vals: Vec<codec::Value> = #[]
+    if take.probe > 0 {
+        vals = codec::decode_row(bytes, take.probe)?
+        let nconds = filter.cols.len()
+        let mut c: i64 = 0
+        while c < nconds {
+            if !filter::op_holds(filter.ops[c], schema::cmp_vals(vals[filter.cols[c]], filter.vals[c])) {
+                return Ok(false)
+            }
+            c += 1
+        }
+    }
+    match take.want {
+        Want::Count => ()
+        Want::Ids => rows.push(engine::Row { rowid: rid, vals: #[] })
+        Want::Values => {
+            if take.probe < take.full { vals = codec::decode_row(bytes, take.full)? }
+            rows.push(engine::Row { rowid: rid, vals: vals })
+        }
+    }
+    Ok(true)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::fs
+    fn fresh(name: String) -> String {
+        let dir = "/tmp/terndb_engine_test/" + name
+        let _ = fs::remove_dir_all(dir)
+        let _ = fs::create_dir_all(dir)
+        dir
+    }
+
+    fn opened(dir: String) -> engine::Engine {
+        engine::open(dir, false).unwrap_or_else(|e| panic("open " + dir + ": " + e))
+    }
+
+    fn run(eng: &mut engine::Engine, src: String) -> i64 {
+        match engine::exec(eng, src) {
+            Ok((n, _)) => return n
+            Err(e) => {
+                assert(false, src + " -> " + e)
+                return -1
+            }
+        }
+    }
+
+    fn rows(eng: &mut engine::Engine, src: String) -> Vec<Vec<String>> {
+        match engine::exec(eng, src) {
+            Ok((_, res)) => {
+                let mut out: Vec<Vec<String>> = #[]
+                for row in res.rows {
+                    let mut cells: Vec<String> = #[]
+                    for v in row.vals { cells.push(codec::value_to_string(v)) }
+                    out.push(cells)
+                }
+                return out
+            }
+            Err(e) => {
+                assert(false, src + " -> " + e)
+                return #[]
+            }
+        }
+    }
+
+    fn users(eng: &mut engine::Engine) {
+        assert_eq(run(eng, "CREATE TABLE users (name TEXT, age INT32, active BOOL, at DATETIME, score FLOAT)"), 0)
+        assert_eq(run(eng, "INSERT INTO users VALUES ('alice', 30, true, '2023-11-14T22:13:20Z', 1.5)"), 1)
+        assert_eq(run(eng, "INSERT INTO users VALUES ('bob', 40, false, '2023-12-01T10:00:00Z', 2.5)"), 1)
+        assert_eq(run(eng, "INSERT INTO users VALUES ('carol', 25, true, '2024-01-01T00:00:00Z', 3.5)"), 1)
+    }
+
+    #[test]
+    fn an_unfiltered_count_and_delete_agree_with_the_filtered_ones() {
+        let mut eng = opened(fresh("index_paths"))
+        assert_eq(run(&mut eng, "CREATE TABLE t (a INT32, b TEXT)"), 0)
+        assert_eq(run(&mut eng, "INSERT INTO t VALUES (1, 'x'), (2, 'y'), (3, 'z')"), 3)
+        assert_eq(rows(&mut eng, "SELECT COUNT(*) FROM t"), #[#["3"]])
+        assert_eq(rows(&mut eng, "SELECT COUNT(*) FROM t WHERE a > 0"), #[#["3"]], "both paths agree")
+        assert_eq(run(&mut eng, "SELECT COUNT(*) FROM t LIMIT 2"), 2, "a limit still caps the count")
+        assert_eq(run(&mut eng, "DELETE FROM t WHERE a = 2"), 1)
+        assert_eq(rows(&mut eng, "SELECT COUNT(*) FROM t"), #[#["2"]])
+        assert_eq(run(&mut eng, "DELETE FROM t"), 2, "an unfiltered delete finds the surviving rows")
+        assert_eq(rows(&mut eng, "SELECT COUNT(*) FROM t"), #[#["0"]])
+        assert_eq(run(&mut eng, "DELETE FROM t"), 0)
+    }
+
+    #[test]
+    fn count_reports_the_matching_rows_without_projecting_them() {
+        let mut eng = opened(fresh("count"))
+        users(&mut eng)
+        assert_eq(rows(&mut eng, "SELECT COUNT(*) FROM users"), #[#["3"]])
+        assert_eq(rows(&mut eng, "SELECT COUNT(*) FROM users WHERE age > 26"), #[#["2"]])
+        assert_eq(rows(&mut eng, "SELECT COUNT(*) FROM users WHERE age > 100"), #[#["0"]])
+        assert_eq(run(&mut eng, "SELECT COUNT(*) FROM users WHERE age > 26"), 2)
+    }
+}

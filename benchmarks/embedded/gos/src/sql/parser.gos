@@ -1,0 +1,492 @@
+use crate::codec
+use crate::sql
+use super::lexer
+
+// The parser: recursive descent over the token stream, one statement per call.
+
+/// Cursor over a token stream.
+pub struct Parser {
+    pub toks: Vec<sql::Tok>
+    pub pos: i64
+    /// How many `?` placeholders have been numbered so far.
+    pub params: i64
+}
+
+/// Parses one statement, rejecting anything left over after it.
+pub fn parse(src: String) -> Result<sql::Stmt, String> {
+    let mut p = Parser { toks: lexer::lex(src)?, pos: 0, params: 0 }
+    let stmt = parse_stmt(&mut p)?
+    let rest = p.toks[p.pos]
+    if rest.kind != sql::T_EOF { return Err("parse: unexpected trailing input at '" + rest.text + "'") }
+    Ok(stmt)
+}
+
+fn parse_stmt(p: &mut Parser) -> Result<sql::Stmt, String> {
+    let kw = take_word(p)?.to_uppercase()
+    if kw == "CREATE" { return parse_create(p) }
+    if kw == "INSERT" { return parse_insert(p) }
+    if kw == "SELECT" { return parse_select(p) }
+    if kw == "UPDATE" { return parse_update(p) }
+    if kw == "DELETE" { return parse_delete(p) }
+    if kw == "COMPACT" { return Ok(sql::Stmt::Compact) }
+    Err("parse: expected CREATE, INSERT, SELECT, UPDATE, DELETE or COMPACT, got '" + kw + "'")
+}
+
+fn parse_create(p: &mut Parser) -> Result<sql::Stmt, String> {
+    if take_word_opt(p, "INDEX") {
+        expect_word(p, "ON")?
+        let table = take_word(p)?
+        expect_punct(p, "(")?
+        let col = take_word(p)?
+        expect_punct(p, ")")?
+        return Ok(sql::Stmt::CreateIndex { table: table, col: col })
+    }
+    expect_word(p, "TABLE")?
+    let name = take_word(p)?
+    expect_punct(p, "(")?
+    let mut cols: Vec<(String, u8)> = #[]
+    loop {
+        let cn = take_word(p)?
+        let tn = take_word(p)?
+        let tag = codec::tag_for_type_name(tn)
+        if tag == 0 { return Err("create: unknown column type '" + tn + "'") }
+        for existing in cols {
+            if existing.0.to_lowercase() == cn.to_lowercase() { return Err("create: duplicate column '" + cn + "'") }
+        }
+        cols.push((cn, tag))
+        if take_punct(p, ",") { continue }
+        break
+    }
+    expect_punct(p, ")")?
+    Ok(sql::Stmt::Create { name: name, cols: cols })
+}
+
+fn parse_insert(p: &mut Parser) -> Result<sql::Stmt, String> {
+    expect_word(p, "INTO")?
+    let table = take_word(p)?
+    expect_word(p, "VALUES")?
+    let mut rows: Vec<Vec<codec::Value>> = #[]
+    loop {
+        expect_punct(p, "(")?
+        let mut vals: Vec<codec::Value> = #[]
+        loop {
+            vals.push(parse_value(p)?)
+            if take_punct(p, ",") { continue }
+            break
+        }
+        expect_punct(p, ")")?
+        rows.push(vals)
+        if take_punct(p, ",") { continue }
+        break
+    }
+    Ok(sql::Stmt::Insert { table: table, rows: rows })
+}
+
+fn parse_select(p: &mut Parser) -> Result<sql::Stmt, String> {
+    let mut cols: Vec<String> = #[]
+    let mut count_only = false
+    if take_word_opt(p, "COUNT") {
+        expect_punct(p, "(")?
+        expect_punct(p, "*")?
+        expect_punct(p, ")")?
+        count_only = true
+    } else if !take_punct(p, "*") {
+        loop {
+            cols.push(take_word(p)?)
+            if take_punct(p, ",") { continue }
+            break
+        }
+    }
+    expect_word(p, "FROM")?
+    let table = take_word(p)?
+    let mut conds: Vec<sql::Cond> = #[]
+    if take_word_opt(p, "WHERE") { conds = parse_conds(p)? }
+    let mut order_col = ""
+    let mut order_asc = true
+    let mut has_order = false
+    if take_word_opt(p, "ORDER") {
+        expect_word(p, "BY")?
+        order_col = take_word(p)?
+        if take_word_opt(p, "DESC") {
+            order_asc = false
+        } else {
+            let _ = take_word_opt(p, "ASC")
+        }
+        has_order = true
+    }
+    let mut limit: i64 = -1
+    if take_word_opt(p, "LIMIT") {
+        limit = take_int(p)?
+        if limit < 0 { return Err("select: LIMIT must not be negative") }
+    }
+    Ok(sql::Stmt::Select(sql::Query {
+        table: table, cols: cols, count_only: count_only, conds: conds
+        order_col: order_col, order_asc: order_asc, has_order: has_order, limit: limit
+    }))
+}
+
+fn parse_update(p: &mut Parser) -> Result<sql::Stmt, String> {
+    let table = take_word(p)?
+    expect_word(p, "SET")?
+    let mut sets: Vec<(String, codec::Value)> = #[]
+    loop {
+        let c = take_word(p)?
+        expect_punct(p, "=")?
+        sets.push((c, parse_value(p)?))
+        if take_punct(p, ",") { continue }
+        break
+    }
+    let mut conds: Vec<sql::Cond> = #[]
+    if take_word_opt(p, "WHERE") { conds = parse_conds(p)? }
+    Ok(sql::Stmt::Update { table: table, sets: sets, conds: conds })
+}
+
+fn parse_delete(p: &mut Parser) -> Result<sql::Stmt, String> {
+    expect_word(p, "FROM")?
+    let table = take_word(p)?
+    let mut conds: Vec<sql::Cond> = #[]
+    if take_word_opt(p, "WHERE") { conds = parse_conds(p)? }
+    Ok(sql::Stmt::Delete { table: table, conds: conds })
+}
+
+fn parse_conds(p: &mut Parser) -> Result<Vec<sql::Cond>, String> {
+    let mut conds: Vec<sql::Cond> = #[]
+    loop {
+        let col = take_word(p)?
+        let t = p.toks[p.pos]
+        if t.kind != sql::T_PUNCT { return Err("parse: expected a comparison operator after '" + col + "'") }
+        let op = match sql::op_code(t.text) {
+            Some(o) => o
+            None => return Err("parse: '" + t.text + "' is not a comparison operator")
+        }
+        p.pos += 1
+        conds.push(sql::Cond { col: col, op: op, val: parse_value(p)? })
+        if take_word_opt(p, "AND") { continue }
+        if take_word_opt(p, "OR") { return Err("parse: OR is not supported; WHERE takes an AND of comparisons") }
+        break
+    }
+    Ok(conds)
+}
+
+fn parse_value(p: &mut Parser) -> Result<codec::Value, String> {
+    let t = p.toks[p.pos]
+    if t.kind == sql::T_PARAM {
+        p.pos += 1
+        let n = p.params
+        p.params += 1
+        return Ok(codec::v_param(n))
+    }
+    if t.kind == sql::T_STR {
+        p.pos += 1
+        return Ok(codec::v_text(t.text))
+    }
+    if t.kind == sql::T_INT {
+        p.pos += 1
+        match t.text.to_i64() {
+            Some(v) => return Ok(codec::v_i64(v))
+            None => return Err("parse: '" + t.text + "' does not fit a 64-bit integer")
+        }
+    }
+    if t.kind == sql::T_FLOAT {
+        p.pos += 1
+        match t.text.to_f64() {
+            Some(v) => return Ok(codec::v_f64(v))
+            None => return Err("parse: '" + t.text + "' is not a number")
+        }
+    }
+    if t.kind == sql::T_WORD {
+        let up = t.text.to_uppercase()
+        if up == "TRUE" || up == "FALSE" || up == "NULL" {
+            p.pos += 1
+            if up == "TRUE" { return Ok(codec::v_bool(true)) }
+            if up == "FALSE" { return Ok(codec::v_bool(false)) }
+            return Ok(codec::v_nil())
+        }
+        return Err("parse: expected a value, got the word '" + t.text + "'")
+    }
+    Err("parse: expected a value, got '" + t.text + "'")
+}
+
+fn take_word(p: &mut Parser) -> Result<String, String> {
+    let t = p.toks[p.pos]
+    if t.kind == sql::T_EOF { return Err("parse: unexpected end of statement") }
+    if t.kind != sql::T_WORD { return Err("parse: expected a name, got '" + t.text + "'") }
+    p.pos += 1
+    Ok(t.text)
+}
+
+fn take_word_opt(p: &mut Parser, kw: String) -> bool {
+    let t = p.toks[p.pos]
+    if t.kind == sql::T_WORD && t.text.to_uppercase() == kw {
+        p.pos += 1
+        return true
+    }
+    false
+}
+
+fn take_punct(p: &mut Parser, ch: String) -> bool {
+    let t = p.toks[p.pos]
+    if t.kind == sql::T_PUNCT && t.text == ch {
+        p.pos += 1
+        return true
+    }
+    false
+}
+
+fn take_int(p: &mut Parser) -> Result<i64, String> {
+    let t = p.toks[p.pos]
+    if t.kind != sql::T_INT { return Err("parse: expected an integer, got '" + t.text + "'") }
+    p.pos += 1
+    match t.text.to_i64() {
+        Some(v) => return Ok(v)
+        None => return Err("parse: '" + t.text + "' does not fit a 64-bit integer")
+    }
+}
+
+fn expect_word(p: &mut Parser, kw: String) -> Result<(), String> {
+    if take_word_opt(p, kw) { return Ok(()) }
+    Err("parse: expected " + kw + ", got '" + p.toks[p.pos].text + "'")
+}
+
+fn expect_punct(p: &mut Parser, ch: String) -> Result<(), String> {
+    if take_punct(p, ch) { return Ok(()) }
+    Err("parse: expected '" + ch + "', got '" + p.toks[p.pos].text + "'")
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::sql
+
+    #[test]
+    fn create_table_parses_columns_and_types() {
+        match super::parse("CREATE TABLE users (name TEXT, age INT32, active BOOL, at DATETIME, score FLOAT)") {
+            Ok(sql::Stmt::Create { name, cols }) => {
+                assert_eq(name, "users")
+                assert_eq(cols.len(), 5)
+                assert_eq(cols[0].0, "name")
+                assert_eq(cols[0].1, codec::TAG_TEXT)
+                assert_eq(cols[1].1, codec::TAG_I32)
+                assert_eq(cols[2].1, codec::TAG_BOOL)
+                assert_eq(cols[3].1, codec::TAG_DT)
+                assert_eq(cols[4].1, codec::TAG_F64)
+            }
+            Ok(_) => assert(false, "expected a CREATE statement")
+            Err(e) => assert(false, e)
+        }
+        assert(super::parse("CREATE TABLE t (a BLOB)").is_err(), "an unknown type is rejected")
+        assert(super::parse("CREATE TABLE t (a INT, A TEXT)").is_err(), "a duplicate column is rejected")
+        assert(super::parse("CREATE TABLE t ()").is_err())
+        assert(super::parse("CREATE TABLE t (a INT").is_err(), "the closing paren is required")
+    }
+
+    #[test]
+    fn insert_parses_one_or_many_rows() {
+        match super::parse("INSERT INTO t VALUES ('a', 1), ('b', -2)") {
+            Ok(sql::Stmt::Insert { table, rows }) => {
+                assert_eq(table, "t")
+                assert_eq(rows.len(), 2)
+                assert_eq(rows[0][0].s, "a")
+                assert_eq(rows[0][1].i, 1)
+                assert_eq(rows[1][1].i, -2)
+            }
+            Ok(_) => assert(false, "expected an INSERT statement")
+            Err(e) => assert(false, e)
+        }
+    }
+
+    #[test]
+    fn insert_parses_every_literal_form() {
+        match super::parse("INSERT INTO t VALUES ('s', 42, -7, 1.5, -2.5, true, FALSE, NULL)") {
+            Ok(sql::Stmt::Insert { table, rows }) => {
+                let r = rows[0]
+                assert_eq(r[0].tag, codec::TAG_TEXT)
+                assert_eq(r[1].i, 42)
+                assert_eq(r[2].i, -7)
+                assert_eq(r[3].f, 1.5)
+                assert_eq(r[4].f, -2.5)
+                assert_eq(r[5].b, true)
+                assert_eq(r[6].b, false)
+                assert_eq(r[7].tag, codec::TAG_NIL)
+            }
+            Ok(_) => assert(false, "expected an INSERT statement")
+            Err(e) => assert(false, e)
+        }
+    }
+
+    #[test]
+    fn select_parses_projection_filter_order_and_limit() {
+        match super::parse("SELECT name, age FROM t WHERE age = 30 AND name = 'x' ORDER BY age DESC LIMIT 5") {
+            Ok(sql::Stmt::Select(s)) => {
+                assert_eq(s.table, "t")
+                assert_eq(s.cols, #["name", "age"])
+                assert_eq(s.count_only, false)
+                assert_eq(s.conds.len(), 2)
+                assert_eq(s.conds[0].col, "age")
+                assert_eq(s.conds[0].op, sql::OP_EQ)
+                assert_eq(s.conds[0].val.i, 30)
+                assert_eq(s.conds[1].val.s, "x")
+                assert_eq(s.order_col, "age")
+                assert_eq(s.order_asc, false)
+                assert_eq(s.has_order, true)
+                assert_eq(s.limit, 5)
+            }
+            Ok(_) => assert(false, "expected a SELECT statement")
+            Err(e) => assert(false, e)
+        }
+    }
+
+    #[test]
+    fn select_star_and_count_are_distinct_projections() {
+        match super::parse("SELECT * FROM t") {
+            Ok(sql::Stmt::Select(s)) => {
+                assert_eq(s.cols.len(), 0, "* projects every column")
+                assert_eq(s.count_only, false)
+                assert_eq(s.limit, -1, "no LIMIT means unbounded")
+                assert_eq(s.has_order, false)
+            }
+            Ok(_) => assert(false, "expected a SELECT statement")
+            Err(e) => assert(false, e)
+        }
+        match super::parse("SELECT COUNT(*) FROM t WHERE a > 1") {
+            Ok(sql::Stmt::Select(s)) => {
+                assert_eq(s.count_only, true)
+                assert_eq(s.conds.len(), 1)
+            }
+            Ok(_) => assert(false, "expected a SELECT statement")
+            Err(e) => assert(false, e)
+        }
+        assert(super::parse("SELECT COUNT(a) FROM t").is_err(), "only COUNT(*) is supported")
+    }
+
+    #[test]
+    fn select_parses_every_comparison_operator() {
+        let ops = #[("=", sql::OP_EQ), ("!=", sql::OP_NE), ("<", sql::OP_LT), (">", sql::OP_GT), ("<=", sql::OP_LE), (">=", sql::OP_GE)]
+        for (spelling, code) in ops {
+            match super::parse("SELECT * FROM t WHERE a " + spelling + " 1") {
+                Ok(sql::Stmt::Select(s)) => {
+                    assert_eq(s.conds[0].op, code, "operator " + spelling)
+                    assert_eq(sql::op_text(code), spelling)
+                }
+                Ok(_) => assert(false, "expected a SELECT statement")
+                Err(e) => assert(false, spelling + ": " + e)
+            }
+        }
+    }
+
+    #[test]
+    fn order_by_defaults_to_ascending() {
+        match super::parse("SELECT * FROM t ORDER BY a") {
+            Ok(sql::Stmt::Select(s)) => {
+                assert_eq(s.has_order, true)
+                assert_eq(s.order_asc, true)
+            }
+            Ok(_) => assert(false, "expected a SELECT statement")
+            Err(e) => assert(false, e)
+        }
+        match super::parse("SELECT * FROM t ORDER BY a ASC") {
+            Ok(sql::Stmt::Select(s)) => assert_eq(s.order_asc, true)
+            Ok(_) => assert(false, "expected a SELECT statement")
+            Err(e) => assert(false, e)
+        }
+    }
+
+    #[test]
+    fn update_and_delete_parse_their_targets() {
+        match super::parse("UPDATE t SET a = 1, b = 'x' WHERE c > 2") {
+            Ok(sql::Stmt::Update { table, sets, conds }) => {
+                assert_eq(table, "t")
+                assert_eq(sets.len(), 2)
+                assert_eq(sets[0].0, "a")
+                assert_eq(sets[0].1.i, 1)
+                assert_eq(sets[1].1.s, "x")
+                assert_eq(conds.len(), 1)
+                assert_eq(conds[0].op, sql::OP_GT)
+            }
+            Ok(_) => assert(false, "expected an UPDATE statement")
+            Err(e) => assert(false, e)
+        }
+        match super::parse("DELETE FROM t") {
+            Ok(sql::Stmt::Delete { table, conds }) => {
+                assert_eq(table, "t")
+                assert_eq(conds.len(), 0, "an unfiltered DELETE empties the table")
+            }
+            Ok(_) => assert(false, "expected a DELETE statement")
+            Err(e) => assert(false, e)
+        }
+    }
+
+    #[test]
+    fn create_index_parses_its_table_and_column() {
+        match super::parse("CREATE INDEX ON users (name)") {
+            Ok(sql::Stmt::CreateIndex { table, col }) => {
+                assert_eq(table, "users")
+                assert_eq(col, "name")
+            }
+            Ok(_) => assert(false, "not a CREATE INDEX")
+            Err(e) => assert(false, e)
+        }
+        // The word is what tells the two CREATEs apart, in either case.
+        match super::parse("create index on t (c)") {
+            Ok(sql::Stmt::CreateIndex { table, col }) => assert_eq(table + "." + col, "t.c")
+            Ok(_) => assert(false, "not a CREATE INDEX")
+            Err(e) => assert(false, e)
+        }
+        assert(super::parse("CREATE INDEX users (name)").is_err(), "ON is required")
+        assert(super::parse("CREATE INDEX ON users name").is_err(), "the column is parenthesised")
+        assert(super::parse("CREATE INDEX ON users (a, b)").is_err(), "one column at a time")
+        match super::parse("CREATE TABLE t (v TEXT)") {
+            Ok(sql::Stmt::Create { name, cols }) => assert_eq(name + "/" + cols.len().to_string(), "t/1")
+            Ok(_) => assert(false, "CREATE TABLE still parses as itself")
+            Err(e) => assert(false, e)
+        }
+    }
+
+    #[test]
+    fn compact_parses_on_its_own() {
+        match super::parse("COMPACT") {
+            Ok(sql::Stmt::Compact) => assert(true)
+            Ok(_) => assert(false, "expected COMPACT")
+            Err(e) => assert(false, e)
+        }
+        match super::parse("compact") {
+            Ok(sql::Stmt::Compact) => assert(true)
+            Ok(_) => assert(false, "keywords are case-insensitive")
+            Err(e) => assert(false, e)
+        }
+    }
+
+    #[test]
+    fn keywords_and_type_names_are_case_insensitive() {
+        assert(super::parse("select * from t where a = 1 order by a desc limit 2").is_ok())
+        assert(super::parse("InSeRt InTo t VaLuEs (1)").is_ok())
+        assert(super::parse("create table t (a text)").is_ok())
+        assert(super::parse("delete from t").is_ok())
+    }
+
+    #[test]
+    fn the_parser_rejects_what_the_grammar_excludes() {
+        let bad = #[
+            "", "SELECT", "SELECT * FROM", "SELECT * FROM t WHERE"
+            "SELECT * FROM t WHERE a", "SELECT * FROM t WHERE a = "
+            "SELECT * FROM t LIMIT x", "SELECT * FROM t LIMIT -1"
+            "SELECT * FROM t ORDER a", "INSERT INTO t VALUES 1"
+            "UPDATE t a = 1", "DELETE t", "DROP TABLE t"
+            "SELECT * FROM t JOIN u ON t.a = u.a"
+            "SELECT * FROM t WHERE a = 1 OR b = 2"
+            "SELECT * FROM t GARBAGE"
+        ]
+        for src in bad { assert(super::parse(src).is_err(), "must reject: " + src) }
+    }
+
+    #[test]
+    fn parse_errors_name_what_was_expected() {
+        match super::parse("SELECT * FROM t WHERE a = 1 OR b = 2") {
+            Ok(_) => assert(false, "OR is not in the grammar")
+            Err(e) => assert(e.contains("OR"), "the error should mention OR, got: " + e)
+        }
+        match super::parse("CREATE TABLE t (a BLOB)") {
+            Ok(_) => assert(false, "BLOB is not a type")
+            Err(e) => assert(e.contains("BLOB"), "the error should name the type, got: " + e)
+        }
+    }
+}

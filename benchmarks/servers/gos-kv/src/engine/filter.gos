@@ -1,0 +1,259 @@
+use crate::engine
+use crate::codec
+use crate::sql
+
+// A WHERE clause resolved against one table: the column's index, the operator,
+// and the literal already narrowed to that column's type.
+//
+// Resolving a column name means lowercasing every candidate, so a filter is
+// compiled once per statement rather than once per row.
+
+// A WHERE clause resolved against one table: the column's index, the operator,
+// and the literal already narrowed to that column's type. Resolving a column
+// name means lowercasing every candidate, so it is done once per statement
+// rather than once per row.
+pub (package) struct Filter {
+    pub (package) cols: Vec<i64>
+    /// The column each comparison names, kept so a value that cannot be
+    /// narrowed to it is reported against the column that refused it.
+    pub (package) names: Vec<String>
+    pub (package) ops: Vec<u8>
+    pub (package) vals: Vec<codec::Value>
+    /// The column tag each comparison narrows its value to, kept so a bound
+    /// parameter can be narrowed the same way a literal was.
+    pub (package) tags: Vec<u8>
+    pub (package) id_ops: Vec<u8>
+    pub (package) id_vals: Vec<i64>
+    /// For each row-id comparison, the argument that fills it, or -1 when the
+    /// statement wrote a literal.
+    pub (package) id_args: Vec<i64>
+    pub (package) id_eq: i64
+    pub (package) id_eq_arg: i64
+}
+
+fn empty() -> Filter {
+    Filter {
+        cols: #[], names: #[], ops: #[], vals: #[], tags: #[]
+        id_ops: #[], id_vals: #[], id_args: #[], id_eq: -1, id_eq_arg: -1
+    }
+}
+
+pub (package) fn compile(def: &mut engine::TableDef, conds: Vec<sql::Cond>) -> Result<Filter, String> {
+    let mut f = empty()
+    for cond in conds {
+        if cond.col.to_lowercase() == schema::ROWID {
+            let is_param = cond.val.tag == codec::TAG_PARAM
+            if !is_param && cond.val.tag != codec::TAG_I64 && cond.val.tag != codec::TAG_I32 {
+                return Err("rowid compares against a whole number, not " + codec::type_name_for_tag(cond.val.tag))
+            }
+            if cond.op == sql::OP_EQ {
+                f.id_eq = if is_param { -1 } else { cond.val.i }
+                f.id_eq_arg = if is_param { cond.val.i } else { -1 }
+            }
+            f.id_ops.push(cond.op)
+            f.id_vals.push(if is_param { 0 } else { cond.val.i })
+            f.id_args.push(if is_param { cond.val.i } else { -1 })
+            continue
+        }
+        let idx = schema::col_index(def, cond.col)?
+        f.cols.push(idx)
+        f.names.push(def.cols[idx])
+        f.ops.push(cond.op)
+        f.tags.push(def.tags[idx])
+        // A placeholder is narrowed when it is bound, not now.
+        f.vals.push(if cond.val.tag == codec::TAG_PARAM {
+            cond.val
+        } else {
+            coerce_for_compare(cond.val, def.tags[idx], def.cols[idx])?
+        })
+    }
+    Ok(f)
+}
+
+// Fills a compiled filter's placeholders from the bound arguments, leaving the
+// prepared statement's own filter untouched so it can be run again.
+pub (package) fn bind(template: Filter, args: Vec<codec::Value>) -> Result<Filter, String> {
+    let mut f = template
+    for i in 0..f.vals.len() {
+        if f.vals[i].tag != codec::TAG_PARAM { continue }
+        let n = f.vals[i].i
+        if n >= args.len() { return Err(missing_arg(n, args.len())) }
+        f.vals[i] = coerce_for_compare(args[n], f.tags[i], f.names[i])?
+    }
+    for i in 0..f.id_args.len() {
+        let n = f.id_args[i]
+        if n < 0 { continue }
+        if n >= args.len() { return Err(missing_arg(n, args.len())) }
+        if args[n].tag != codec::TAG_I64 && args[n].tag != codec::TAG_I32 {
+            return Err("rowid compares against a whole number, not " +
+                codec::type_name_for_tag(args[n].tag))
+        }
+        f.id_vals[i] = args[n].i
+    }
+    if f.id_eq_arg >= 0 {
+        let n = f.id_eq_arg
+        if n >= args.len() { return Err(missing_arg(n, args.len())) }
+        f.id_eq = args[n].i
+    }
+    Ok(f)
+}
+
+fn missing_arg(n: i64, given: i64) -> String {
+    "statement wants an argument for placeholder " + (n + 1).to_string() +
+        ", but " + given.to_string() + " were bound"
+}
+
+pub (package) fn id_holds(filter: &mut Filter, rid: i64) -> bool {
+    let mut i: i64 = 0
+    while i < filter.id_ops.len() {
+        if !op_holds(filter.id_ops[i], rid - filter.id_vals[i]) { return false }
+        i += 1
+    }
+    true
+}
+
+pub (package) fn op_holds(op: u8, c: i64) -> bool {
+    match op {
+        sql::OP_EQ => c == 0
+        sql::OP_NE => c != 0
+        sql::OP_LT => c < 0
+        sql::OP_GT => c > 0
+        sql::OP_LE => c <= 0
+        _ => c >= 0
+    }
+}
+
+// A comparison narrows the literal the way an insert would, so `at = '2023-..'`
+// meets a stored datetime rather than comparing text against a number. A value
+// the column cannot hold is a question the table cannot answer, and saying so
+// is the answer: matching nothing would read as a table that holds nothing.
+fn coerce_for_compare(val: codec::Value, tag: u8, col: String) -> Result<codec::Value, String> {
+    schema::coerce(val, tag, col)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::fs
+    use crate::engine
+
+    fn fresh(name: String) -> String {
+        let dir = "/tmp/terndb_engine_test/" + name
+        let _ = fs::remove_dir_all(dir)
+        let _ = fs::create_dir_all(dir)
+        dir
+    }
+
+    fn opened(dir: String) -> engine::Engine {
+        engine::open(dir, false).unwrap_or_else(|e| panic("open " + dir + ": " + e))
+    }
+
+    fn run(eng: &mut engine::Engine, src: String) -> i64 {
+        match engine::exec(eng, src) {
+            Ok((n, _)) => return n
+            Err(e) => {
+                assert(false, src + " -> " + e)
+                return -1
+            }
+        }
+    }
+
+    fn rows(eng: &mut engine::Engine, src: String) -> Vec<Vec<String>> {
+        match engine::exec(eng, src) {
+            Ok((_, res)) => {
+                let mut out: Vec<Vec<String>> = #[]
+                for row in res.rows {
+                    let mut cells: Vec<String> = #[]
+                    for v in row.vals { cells.push(codec::value_to_string(v)) }
+                    out.push(cells)
+                }
+                return out
+            }
+            Err(e) => {
+                assert(false, src + " -> " + e)
+                return #[]
+            }
+        }
+    }
+
+    fn users(eng: &mut engine::Engine) {
+        assert_eq(run(eng, "CREATE TABLE users (name TEXT, age INT32, active BOOL, at DATETIME, score FLOAT)"), 0)
+        assert_eq(run(eng, "INSERT INTO users VALUES ('alice', 30, true, '2023-11-14T22:13:20Z', 1.5)"), 1)
+        assert_eq(run(eng, "INSERT INTO users VALUES ('bob', 40, false, '2023-12-01T10:00:00Z', 2.5)"), 1)
+        assert_eq(run(eng, "INSERT INTO users VALUES ('carol', 25, true, '2024-01-01T00:00:00Z', 3.5)"), 1)
+    }
+
+    #[test]
+    fn where_filters_on_each_operator() {
+        let mut eng = opened(fresh("where_ops"))
+        users(&mut eng)
+        assert_eq(run(&mut eng, "SELECT * FROM users WHERE age = 30"), 1)
+        assert_eq(run(&mut eng, "SELECT * FROM users WHERE age != 30"), 2)
+        assert_eq(run(&mut eng, "SELECT * FROM users WHERE age < 30"), 1)
+        assert_eq(run(&mut eng, "SELECT * FROM users WHERE age > 30"), 1)
+        assert_eq(run(&mut eng, "SELECT * FROM users WHERE age <= 30"), 2)
+        assert_eq(run(&mut eng, "SELECT * FROM users WHERE age >= 30"), 2)
+        assert_eq(run(&mut eng, "SELECT * FROM users WHERE age > 20 AND age < 35"), 2, "AND intersects")
+        assert_eq(run(&mut eng, "SELECT * FROM users WHERE active = true"), 2)
+        assert_eq(run(&mut eng, "SELECT * FROM users WHERE name > 'b'"), 2, "text compares lexicographically")
+        assert_eq(run(&mut eng, "SELECT * FROM users WHERE score >= 2.5"), 2)
+    }
+
+    #[test]
+    fn where_compares_a_datetime_against_its_text_spelling() {
+        let mut eng = opened(fresh("where_dt"))
+        users(&mut eng)
+        assert_eq(run(&mut eng, "SELECT * FROM users WHERE at = '2023-11-14T22:13:20Z'"), 1)
+        assert_eq(run(&mut eng, "SELECT * FROM users WHERE at > '2023-11-30T00:00:00Z'"), 2)
+        assert_eq(run(&mut eng, "SELECT * FROM users WHERE at < '2023-01-01T00:00:00Z'"), 0)
+    }
+
+    #[test]
+    fn a_filter_on_a_later_column_still_sees_it() {
+        // Only the columns a statement reads are decoded, so a filter that
+        // reaches the last column of a wide row is the case to pin down.
+        let mut eng = opened(fresh("column_pruning"))
+        assert_eq(run(&mut eng, "CREATE TABLE w (a INT32, b INT32, c TEXT, d BOOL, e INT32)"), 0)
+        assert_eq(run(&mut eng, "INSERT INTO w VALUES (1, 2, 'three', true, 5), (9, 8, 'seven', false, 6)"), 2)
+        assert_eq(rows(&mut eng, "SELECT COUNT(*) FROM w WHERE e = 6"), #[#["1"]], "the last column is decoded when read")
+        assert_eq(rows(&mut eng, "SELECT COUNT(*) FROM w WHERE c = 'three'"), #[#["1"]])
+        assert_eq(rows(&mut eng, "SELECT COUNT(*) FROM w WHERE a = 1"), #[#["1"]])
+        assert_eq(rows(&mut eng, "SELECT COUNT(*) FROM w WHERE a = 1 AND e = 5"), #[#["1"]])
+        assert_eq(rows(&mut eng, "SELECT e, c FROM w WHERE a = 9"), #[#["6", "seven"]], "a projection still reads every column")
+        assert_eq(rows(&mut eng, "SELECT * FROM w WHERE d = false"), #[#["9", "8", "seven", "false", "6"]])
+        assert_eq(run(&mut eng, "UPDATE w SET c = 'nine' WHERE e = 6"), 1)
+        assert_eq(rows(&mut eng, "SELECT c FROM w WHERE a = 9"), #[#["nine"]], "an update rewrites the whole row")
+        assert_eq(rows(&mut eng, "SELECT * FROM w WHERE a = 9"), #[#["9", "8", "nine", "false", "6"]])
+    }
+
+    #[test]
+    fn rowid_rejects_a_value_that_is_not_a_whole_number() {
+        let mut eng = opened(fresh("rowid_types"))
+        assert_eq(run(&mut eng, "CREATE TABLE t (v TEXT)"), 0)
+        assert_eq(run(&mut eng, "INSERT INTO t VALUES ('a')"), 1)
+        match engine::exec(&mut eng, "SELECT * FROM t WHERE rowid = 'x'") {
+            Ok(_) => assert(false, "a text row id is not a row id")
+            Err(e) => assert(e.contains("rowid"), "the error should name rowid, got: " + e)
+        }
+        assert(engine::exec(&mut eng, "SELECT * FROM t WHERE rowid = 1.5").is_err())
+    }
+
+    #[test]
+    fn a_comparison_value_the_column_cannot_hold_is_refused() {
+        // Matching nothing would read as a table that holds nothing, which is
+        // an answer to a question the table was never asked.
+        let mut eng = opened(fresh("where_types"))
+        users(&mut eng)
+        match engine::exec(&mut eng, "SELECT * FROM users WHERE age = 'thirty'") {
+            Ok(_) => assert(false, "text does not fit an INT32 column")
+            Err(e) => assert(e.contains("'age'"), "the error should name the column, got: " + e)
+        }
+        assert(engine::exec(&mut eng, "SELECT * FROM users WHERE age > 99999999999").is_err()
+            "a value outside the column's range")
+        assert(engine::exec(&mut eng, "SELECT * FROM users WHERE at = 'not a date'").is_err())
+        assert(engine::exec_args(&mut eng, "SELECT * FROM users WHERE age = ?"
+            #[codec::v_text("thirty")]).is_err(), "a bound value is narrowed the same way")
+        // The comparisons a column can hold still answer.
+        assert_eq(run(&mut eng, "SELECT * FROM users WHERE age = 30"), 1)
+        assert_eq(run(&mut eng, "SELECT * FROM users WHERE score > 1"), 3, "an integer fits a float column")
+    }
+}

@@ -1,0 +1,384 @@
+use crate::sql
+use crate::codec
+use crate::kv
+
+// terndb engine: the SQL statement layer over the KV store.
+//
+//   "schema/<table>"      the table definition
+//   "<table>/r/<rowid>"   one row, its columns encoded back to back in
+//                         schema order
+//
+// A schema record carries the table's own name, so reopening a directory
+// rebuilds the catalogue from the values alone and never has to reparse a key.
+//
+// The parts: [`schema`] is a table's columns and the values that fit them,
+// [`index`] the optional per-column index, [`filter`] a WHERE clause resolved
+// against one table, [`bind`] the values a caller supplied for its `?`
+// placeholders, [`scan`] the walk that answers it, [`stmt`] one statement
+// carried out, [`plan`] a statement parsed and planned once, and [`cache`] the
+// plans one caller keeps.
+
+/// A table's name and its columns, in declaration order.
+pub struct TableDef {
+    pub name: String
+    pub cols: Vec<String>
+    pub tags: Vec<u8>
+}
+
+/// One row: its identity in the store and its column values.
+pub struct Row {
+    pub rowid: i64
+    pub vals: Vec<codec::Value>
+}
+
+/// The rows a statement produced, with the column names they are keyed by.
+pub struct QueryResult {
+    pub cols: Vec<String>
+    pub rows: Vec<Row>
+}
+
+/// An open database: the KV store plus the table catalogue and rowid counters.
+pub struct Engine {
+    pub store: kv::Store
+    pub tables: Map<String, TableDef>
+    pub next_rowid: Map<String, i64>
+    /// Indexed columns, in the order they were declared.
+    pub indexes: Vec<index::ColIndex>
+}
+
+pub (package) fn row_prefix(table: String) -> String { table + "/r/" }
+
+pub (package) fn schema_key(table: String) -> String { "schema/" + table }
+
+/// Opens the database in `dir` and loads its table catalogue.
+pub fn open(dir: String, read_only: bool) -> Result<Engine, String> {
+    let mut eng = Engine { store: kv::open(dir, read_only)?, tables: Map::new(), next_rowid: Map::new(), indexes: #[] }
+    for pair in kv::scan::pairs(&mut eng.store, "schema/")? {
+        match schema::decode(pair.val) {
+            Ok(def) => {
+                // The row index is opened for every table the catalogue names,
+                // so a table answers by id whether or not it holds a row yet.
+                let tid = kv::rows::open_table(&mut eng.store, def.name)
+                eng.next_rowid.insert(def.name, kv::rows::last_id(&mut eng.store, tid) + 1)
+                eng.tables.insert(def.name, def)
+            }
+            Err(e) => return Err("open: " + pair.key + ": " + e)
+        }
+    }
+    // An index is declared in the store and built from the rows: what is
+    // written down is that the column is indexed, and the index itself is
+    // whatever the table currently holds.
+    for pair in kv::scan::pairs(&mut eng.store, "index/")? {
+        let table, col = index::split_key(pair.key)
+        if table == "" { return Err("open: " + pair.key + " is not an index declaration") }
+        let mut def = get_def(&mut eng, table)?
+        let ci = schema::col_index(&mut def, col)?
+        index::attach(&mut eng, table, def.cols[ci], ci)?
+    }
+    Ok(eng)
+}
+
+/// Parses and runs one statement, returning the affected-row count and any rows.
+///
+/// The parse is the larger part of a small statement's cost, so a read served
+/// over and over should `prepare` it once and `run` it instead.
+pub fn exec(eng: &mut Engine, src: String) -> Result<(i64, QueryResult), String> {
+    exec_args(eng, src, #[])
+}
+
+/// Parses and runs one statement with `args` filling its `?` placeholders, in
+/// the order they were written.
+///
+/// A bound value is narrowed to its column's type the way a literal is, and the
+/// text it carries never reaches the parser: a value a caller did not write is
+/// the way to put one in a statement without building the statement around it.
+pub fn exec_args(eng: &mut Engine, src: String, args: Vec<codec::Value>) -> Result<(i64, QueryResult), String> {
+    match bind::stmt(sql::parser::parse(src)?, args)? {
+        sql::Stmt::Create { name, cols } => return stmt::create(eng, name, cols)
+        sql::Stmt::CreateIndex { table, col } => return stmt::create_index(eng, table, col)
+        sql::Stmt::Insert { table, rows } => return stmt::insert(eng, table, rows)
+        sql::Stmt::Select(q) => return stmt::select(eng, q)
+        sql::Stmt::Update { table, sets, conds } => return stmt::update(eng, table, sets, conds)
+        sql::Stmt::Delete { table, conds } => return stmt::delete(eng, table, conds)
+        sql::Stmt::Compact => {
+            read_only_refuses(eng)?
+            kv::compact::run(&mut eng.store)?
+            return Ok((0, empty_result()))
+        }
+    }
+}
+
+/// Runs a statement and returns only its rows, for read paths that ignore counts.
+pub fn query(eng: &mut Engine, src: String) -> Result<QueryResult, String> {
+    let _, res = exec(eng, src)?
+    Ok(res)
+}
+
+/// Runs a statement with `args` filling its `?` placeholders and returns only
+/// its rows.
+pub fn query_args(eng: &mut Engine, src: String, args: Vec<codec::Value>) -> Result<QueryResult, String> {
+    let _, res = exec_args(eng, src, args)?
+    Ok(res)
+}
+
+pub (package) fn empty_result() -> QueryResult { QueryResult { cols: #[], rows: #[] } }
+
+// A result carrying one count, which is what COUNT(*) answers with.
+pub (package) fn counted(n: i64) -> Result<(i64, QueryResult), String> {
+    Ok((n, QueryResult { cols: #["count"], rows: #[Row { rowid: 0, vals: #[codec::v_i64(n)] }] }))
+}
+
+// The catalogue is reached through the engine rather than a copy of it: an
+// engine holds the store's whole index, so a by-value read would copy every
+// key on the way to one table definition.
+pub (package) fn get_def(eng: &mut Engine, table: String) -> Result<TableDef, String> {
+    match eng.tables.get(table) {
+        Some(d) => Ok(d)
+        None => Err("no such table: " + table)
+    }
+}
+
+// A statement that would write is refused before it reaches anything mutable.
+// A read-only engine is what several readers share, so a write that got as far
+// as the catalogue would be one reader writing to another's store.
+pub (package) fn read_only_refuses(eng: &mut Engine) -> Result<(), String> {
+    if eng.store.read_only { return Err("store is read-only") }
+    Ok(())
+}
+
+/// What the open read past in the log, one line each, empty for a clean store.
+///
+/// A store recovers to its last good commit and opens, so this is what a caller
+/// says out loud rather than serving a log that quietly ends early.
+pub fn faults(eng: &mut Engine) -> Vec<String> { eng.store.faults }
+
+/// The table names in the catalogue, in order.
+pub fn table_names(eng: &mut Engine) -> Vec<String> {
+    let mut names: Vec<String> = #[]
+    for name in eng.tables.keys() { names.push(name) }
+    names.sort()
+    names
+}
+
+/// Makes every completed write durable.
+///
+/// The engine is reached by reference: a by-value struct argument deep-copies
+/// every growable field it carries, which for an engine is its whole index.
+pub fn sync(eng: &mut Engine) -> Result<(), String> { kv::sync(&mut eng.store) }
+
+/// Sets whether a statement is flushed to the platter before it reports success.
+///
+/// Durable is the default and is what makes a committed statement survive a
+/// power loss. Turning it off keeps every other guarantee - a statement is
+/// still all-or-nothing, and a crash still leaves the store consistent - but a
+/// commit may be lost if the machine stops before the operating system writes
+/// it out. It is for bulk loading, not for serving.
+pub fn set_durable(eng: &mut Engine, durable: bool) { eng.store.durable = durable }
+
+/// Renders a result as one pipe-separated line per row.
+pub fn render(res: &mut QueryResult) -> Vec<String> {
+    let mut out: Vec<String> = #[]
+    for row in res.rows {
+        let mut line = String::with_capacity(16 * row.vals.len())
+        // The separator goes between values rather than after them, and an
+        // empty text column is a value like any other, so the count decides it
+        // rather than what has been written so far.
+        let mut c: i64 = 0
+        for v in row.vals {
+            if c > 0 { line.push_str("|") }
+            line.push_str(codec::value_to_string(v))
+            c += 1
+        }
+        out.push(line)
+    }
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use std::fs
+    use crate::codec
+
+    fn fresh(name: String) -> String {
+        let dir = "/tmp/terndb_engine_test/" + name
+        let _ = fs::remove_dir_all(dir)
+        let _ = fs::create_dir_all(dir)
+        dir
+    }
+
+    fn opened(dir: String) -> super::Engine {
+        super::open(dir, false).unwrap_or_else(|e| panic("open " + dir + ": " + e))
+    }
+
+    fn run(eng: &mut super::Engine, src: String) -> i64 {
+        match super::exec(eng, src) {
+            Ok((n, _)) => return n
+            Err(e) => {
+                assert(false, src + " -> " + e)
+                return -1
+            }
+        }
+    }
+
+    fn rows(eng: &mut super::Engine, src: String) -> Vec<Vec<String>> {
+        match super::exec(eng, src) {
+            Ok((_, res)) => {
+                let mut out: Vec<Vec<String>> = #[]
+                for row in res.rows {
+                    let mut cells: Vec<String> = #[]
+                    for v in row.vals { cells.push(codec::value_to_string(v)) }
+                    out.push(cells)
+                }
+                return out
+            }
+            Err(e) => {
+                assert(false, src + " -> " + e)
+                return #[]
+            }
+        }
+    }
+
+    fn users(eng: &mut super::Engine) {
+        assert_eq(run(eng, "CREATE TABLE users (name TEXT, age INT32, active BOOL, at DATETIME, score FLOAT)"), 0)
+        assert_eq(run(eng, "INSERT INTO users VALUES ('alice', 30, true, '2023-11-14T22:13:20Z', 1.5)"), 1)
+        assert_eq(run(eng, "INSERT INTO users VALUES ('bob', 40, false, '2023-12-01T10:00:00Z', 2.5)"), 1)
+        assert_eq(run(eng, "INSERT INTO users VALUES ('carol', 25, true, '2024-01-01T00:00:00Z', 3.5)"), 1)
+    }
+
+    #[test]
+    fn query_returns_rows_without_the_count() {
+        let mut eng = opened(fresh("query"))
+        users(&mut eng)
+        match super::query(&mut eng, "SELECT name FROM users ORDER BY name LIMIT 1") {
+            Ok(res) => { let mut r = res; assert_eq(super::render(&mut r), #["alice"]) }
+            Err(e) => assert(false, e)
+        }
+    }
+
+    #[test]
+    fn render_joins_a_row_with_pipes() {
+        let mut eng = opened(fresh("render"))
+        users(&mut eng)
+        match super::exec(&mut eng, "SELECT name, age FROM users ORDER BY age") {
+            Ok((_, mut res)) => {
+                assert_eq(super::render(&mut res), #["carol|25", "alice|30", "bob|40"])
+                assert_eq(res.cols, #["name", "age"])
+            }
+            Err(e) => assert(false, e)
+        }
+        let mut none = super::QueryResult { cols: #[], rows: #[] }
+        assert_eq(super::render(&mut none), #[])
+    }
+
+    #[test]
+    fn the_catalogue_and_the_data_survive_a_restart() {
+        let dir = fresh("restart")
+        let mut eng = opened(dir)
+        users(&mut eng)
+        assert_eq(run(&mut eng, "DELETE FROM users WHERE name = 'alice'"), 1)
+        assert(super::sync(&mut eng).is_ok())
+
+        let mut again = opened(dir)
+        assert_eq(super::table_names(&mut again), #["users"], "the schema is read back from the store")
+        assert_eq(run(&mut again, "SELECT * FROM users"), 2)
+        assert_eq(rows(&mut again, "SELECT name, age FROM users ORDER BY age"), #[#["carol", "25"], #["bob", "40"]])
+        assert_eq(run(&mut again, "INSERT INTO users VALUES ('dave', 50, true, '2024-02-02T00:00:00Z', 4.5)"), 1)
+        assert_eq(run(&mut again, "SELECT * FROM users"), 3)
+        assert_eq(rows(&mut again, "SELECT name FROM users ORDER BY age DESC LIMIT 1"), #[#["dave"]])
+    }
+
+    #[test]
+    fn several_tables_stay_independent() {
+        let dir = fresh("multi_table")
+        let mut eng = opened(dir)
+        assert_eq(run(&mut eng, "CREATE TABLE a (v TEXT)"), 0)
+        assert_eq(run(&mut eng, "CREATE TABLE b (v INT32)"), 0)
+        assert_eq(run(&mut eng, "INSERT INTO a VALUES ('x'), ('y')"), 2)
+        assert_eq(run(&mut eng, "INSERT INTO b VALUES (1)"), 1)
+        assert_eq(run(&mut eng, "SELECT * FROM a"), 2)
+        assert_eq(run(&mut eng, "SELECT * FROM b"), 1)
+        assert_eq(run(&mut eng, "DELETE FROM a"), 2)
+        assert_eq(run(&mut eng, "SELECT * FROM b"), 1, "emptying one table leaves the other alone")
+        assert_eq(super::table_names(&mut eng), #["a", "b"])
+
+        let mut again = opened(dir)
+        assert_eq(super::table_names(&mut again), #["a", "b"])
+        assert_eq(run(&mut again, "SELECT * FROM b"), 1)
+    }
+
+    #[test]
+    fn compaction_preserves_every_table() {
+        let dir = fresh("compact")
+        let mut eng = opened(dir)
+        users(&mut eng)
+        assert_eq(run(&mut eng, "CREATE TABLE other (v TEXT)"), 0)
+        assert_eq(run(&mut eng, "INSERT INTO other VALUES ('keep')"), 1)
+        assert_eq(run(&mut eng, "DELETE FROM users WHERE name = 'alice'"), 1)
+        assert_eq(run(&mut eng, "UPDATE users SET score = 8.5 WHERE name = 'bob'"), 1)
+        assert_eq(run(&mut eng, "COMPACT"), 0)
+
+        assert_eq(run(&mut eng, "SELECT * FROM users"), 2)
+        assert_eq(rows(&mut eng, "SELECT score FROM users WHERE name = 'bob'"), #[#["8.5"]])
+        assert_eq(rows(&mut eng, "SELECT v FROM other"), #[#["keep"]])
+        assert_eq(run(&mut eng, "INSERT INTO users VALUES ('erin', 60, true, '2024-03-03T00:00:00Z', 5.5)"), 1)
+
+        let mut again = opened(dir)
+        assert_eq(super::table_names(&mut again), #["other", "users"])
+        assert_eq(run(&mut again, "SELECT * FROM users"), 3)
+        assert_eq(rows(&mut again, "SELECT score FROM users WHERE name = 'bob'"), #[#["8.5"]])
+        assert_eq(rows(&mut again, "SELECT v FROM other"), #[#["keep"]])
+    }
+
+    #[test]
+    fn statements_against_a_missing_table_are_rejected() {
+        let mut eng = opened(fresh("missing_table"))
+        assert(super::exec(&mut eng, "SELECT * FROM nope").is_err())
+        assert(super::exec(&mut eng, "INSERT INTO nope VALUES (1)").is_err())
+        assert(super::exec(&mut eng, "UPDATE nope SET a = 1").is_err())
+        assert(super::exec(&mut eng, "DELETE FROM nope").is_err())
+        assert_eq(run(&mut eng, "CREATE TABLE t (a INT32)"), 0)
+        assert(super::exec(&mut eng, "CREATE TABLE t (a INT32)").is_err(), "a table is created once")
+    }
+
+    #[test]
+    fn a_read_only_database_answers_queries_and_refuses_writes() {
+        let dir = fresh("read_only")
+        let mut writer = opened(dir)
+        users(&mut writer)
+        assert(super::sync(&mut writer).is_ok())
+
+        match super::open(dir, true) {
+            Ok(reader) => {
+                let mut r = reader
+                assert_eq(run(&mut r, "SELECT * FROM users"), 3)
+                assert_eq(rows(&mut r, "SELECT COUNT(*) FROM users WHERE age > 26"), #[#["2"]])
+                assert(super::exec(&mut r, "INSERT INTO users VALUES ('x', 1, true, 0, 1)").is_err())
+                assert(super::exec(&mut r, "DELETE FROM users").is_err())
+                assert(super::exec(&mut r, "COMPACT").is_err())
+            }
+            Err(e) => assert(false, e)
+        }
+    }
+
+    #[test]
+    fn many_rows_survive_a_write_compact_restart_cycle() {
+        let dir = fresh("bulk")
+        let mut eng = opened(dir)
+        assert_eq(run(&mut eng, "CREATE TABLE t (id INT32, name TEXT)"), 0)
+        let mut i: i64 = 0
+        while i < 200 {
+            assert_eq(run(&mut eng, "INSERT INTO t VALUES (" + i.to_string() + ", 'row-" + i.to_string() + "')"), 1)
+            i += 1
+        }
+        assert_eq(run(&mut eng, "DELETE FROM t WHERE id < 50"), 50)
+        assert_eq(run(&mut eng, "UPDATE t SET name = 'updated' WHERE id = 100"), 1)
+        assert_eq(run(&mut eng, "COMPACT"), 0)
+        assert(super::sync(&mut eng).is_ok())
+
+        let mut again = opened(dir)
+        assert_eq(rows(&mut again, "SELECT COUNT(*) FROM t"), #[#["150"]])
+        assert_eq(rows(&mut again, "SELECT name FROM t WHERE id = 100"), #[#["updated"]])
+        assert_eq(rows(&mut again, "SELECT name FROM t ORDER BY id LIMIT 1"), #[#["row-50"]])
+        assert_eq(rows(&mut again, "SELECT name FROM t ORDER BY id DESC LIMIT 1"), #[#["row-199"]])
+    }
+}

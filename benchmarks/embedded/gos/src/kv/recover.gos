@@ -1,0 +1,405 @@
+use std::fs
+use std::encoding::binary
+use std::hash::crc32
+use crate::kv
+use super::batch
+use super::log
+use super::rows
+
+// Rebuilding the index at open, from a sealed generation's hint file where
+// there is one and from the data file otherwise.
+
+const SCAN_BLOCK: i64 = 262_144
+
+// Fills the index from a sealed generation's hint file, answering whether the
+// file described every record it holds: a hint that runs out part-way through
+// describes some of the generation, and the caller reads the rest from the data
+// file rather than serving a store that is missing keys.
+pub (package) fn rebuild_from_hints(st: &mut kv::Store, gen: i64, buf: Vec<u8>) -> bool {
+    let mut p: i64 = 0
+    while p + log::HINT_LEN <= buf.len() {
+        let head = match buf.slice(p, p + log::HINT_LEN) {
+            Ok(h) => h
+            Err(_) => return false
+        }
+        let klen = binary::get_u16_le_at(head, 0).unwrap_or(0u16) as i64
+        let vlen = binary::get_u32_le_at(head, 2).unwrap_or(0u32) as i64
+        let crc = binary::get_u32_le_at(head, 6).unwrap_or(0u32) as i64
+        let off = binary::get_u64_le_at(head, 10).unwrap_or(0u64) as i64
+        let kstart = p + log::HINT_LEN
+        let key = match buf.slice(kstart, kstart + klen) {
+            Ok(b) => match log::key_from(b) {
+                Some(k) => k
+                None => return false
+            }
+            Err(_) => return false
+        }
+        rows::remember(st, key, kv::Entry { file: gen, offset: off, vlen: vlen, crc: crc })
+        p = kstart + klen
+    }
+    p == buf.len()
+}
+
+// A sliding window over one file, so a scan costs a block of memory rather
+// than the whole log.
+struct Block {
+    bytes: Vec<u8>
+    off: i64
+}
+
+// Makes `[at, at + len)` available inside the block, refilling from the file if
+// it is not already there.
+//
+// `Ok(false)` is a file that ends before those bytes, which is the tail of an
+// interrupted write; an `Err` is a file that could not be read at all, which is
+// a different thing and is reported as one.
+fn ensure(f: fs::File, blk: &mut Block, at: i64, len: i64) -> Result<bool, String> {
+    if at >= blk.off && at + len <= blk.off + blk.bytes.len() { return Ok(true) }
+    let want = if len > SCAN_BLOCK { len } else { SCAN_BLOCK }
+    match f.read_at(want, at) {
+        Ok(b) => {
+            if b.len() < len { return Ok(false) }
+            blk.bytes = b
+            blk.off = at
+            Ok(true)
+        }
+        Err(e) => Err(e.message())
+    }
+}
+
+// A record's header as the scan reads it: what it claims to hold, and the
+// checksum it was written with.
+struct Header {
+    crc: i64
+    kind: u8
+    klen: i64
+    vlen: i64
+    total: i64
+}
+
+// Returns the offset just past the last commit record. Records are held back
+// until the commit that covers them is seen, so a batch the log ends in the
+// middle of never reaches the index, and the next append overwrites it. A torn
+// tail from an interrupted write stops the scan the same way.
+//
+// A record that is whole and fails its checksum is a different thing from a
+// tail that was never finished: the bytes were written and are now wrong. The
+// scan stops there either way - it cannot tell what follows a record it cannot
+// read - and records the fault on the store, so a caller can say what happened
+// rather than serving a log that quietly ends early.
+pub (package) fn rebuild_from_data(st: &mut kv::Store, gen: i64, path: String) -> i64 {
+    let f = match log::open_read(path) {
+        Some(h) => h
+        // The generation is one the directory listed, so a file that will not
+        // open is every record in it missing from the index, not an empty
+        // generation.
+        None => {
+            st.faults.push("generation " + gen.to_string() + ": " + path + " cannot be read")
+            return 0
+        }
+    }
+    let mut blk = Block { bytes: #[], off: 0 }
+    let mut staged: Vec<batch::Staged> = #[]
+    let mut committed: i64 = 0
+    let mut p: i64 = 0
+    loop {
+        match ensure(f, &mut blk, p, log::HEADER_LEN) {
+            Ok(true) => ()
+            Ok(false) => return committed
+            Err(e) => return unreadable(st, gen, p, committed, e)
+        }
+        let head = header_at(blk, p)
+        match ensure(f, &mut blk, p, head.total) {
+            Ok(true) => ()
+            Ok(false) => return committed
+            Err(e) => return unreadable(st, gen, p, committed, e)
+        }
+        // The block may have moved to cover the whole record.
+        let base = p - blk.off + log::HEADER_LEN
+        let body = match blk.bytes.slice(base, base + head.klen + head.vlen) {
+            Ok(b) => b
+            Err(_) => return committed
+        }
+        if crc32::checksum(body) as i64 != head.crc {
+            damaged(st, gen, p, committed)
+            return committed
+        }
+        let at = p
+        p += head.total
+        if head.kind == log::KIND_COMMIT {
+            apply(st, staged)
+            staged.clear()
+            committed = p
+            continue
+        }
+        let key = match body.slice(0, head.klen) {
+            Ok(b) => match log::key_from(b) {
+                Some(k) => k
+                None => {
+                    damaged(st, gen, at, committed)
+                    return committed
+                }
+            }
+            Err(_) => return committed
+        }
+        staged.push(batch::Staged {
+            key: key
+            entry: kv::Entry { file: gen, offset: at, vlen: head.vlen, crc: head.crc }
+            remove: head.kind == log::KIND_DELETE
+        })
+    }
+}
+
+// The record header at `at`, which the caller has established the block holds.
+fn header_at(blk: Block, at: i64) -> Header {
+    let h = at - blk.off
+    let klen = binary::get_u16_le_at(blk.bytes, h + 5).unwrap_or(0u16) as i64
+    let vlen = binary::get_u32_le_at(blk.bytes, h + 7).unwrap_or(0u32) as i64
+    Header {
+        crc: binary::get_u32_le_at(blk.bytes, h).unwrap_or(0u32) as i64
+        kind: blk.bytes[h + 4]
+        klen: klen
+        vlen: vlen
+        total: log::HEADER_LEN + klen + vlen
+    }
+}
+
+// The log of `gen` could not be read where the scan had reached, which costs
+// whatever lies between the last commit and there.
+fn unreadable(st: &mut kv::Store, gen: i64, at: i64, committed: i64, why: String) -> i64 {
+    st.faults.push("generation " + gen.to_string() + ": offset " + at.to_string() +
+        " could not be read (" + why + "); the log was read up to offset " +
+        committed.to_string())
+    committed
+}
+
+// Records that the log of `gen` holds a written record that cannot be read, and
+// what stopping there cost: the bytes between the last commit and the fault
+// were committed and are not in the index.
+fn damaged(st: &mut kv::Store, gen: i64, at: i64, committed: i64) {
+    st.faults.push("generation " + gen.to_string() + ": the record at offset " +
+        at.to_string() + " failed its checksum; the log was read up to offset " +
+        committed.to_string())
+}
+
+// The index changes of one committed batch.
+fn apply(st: &mut kv::Store, staged: Vec<batch::Staged>) {
+    for change in staged {
+        if change.remove {
+            rows::forget(st, change.key)
+        } else {
+            rows::remember(st, change.key, change.entry)
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::fs
+    use std::time
+    use crate::kv
+
+    fn fresh(name: String) -> String {
+        let dir = "/tmp/terndb_kv_test/" + name
+        let _ = fs::remove_dir_all(dir)
+        let _ = fs::create_dir_all(dir)
+        dir
+    }
+
+    fn opened(dir: String) -> kv::Store {
+        kv::open(dir, false).unwrap_or_else(|e| panic("open " + dir + ": " + e))
+    }
+
+    fn must_get(st: &mut kv::Store, key: String) -> Vec<u8> {
+        match kv::get(st, key) {
+            kv::Read::Value(v) => return v
+            kv::Read::Fault(e) => panic(e)
+            kv::Read::Absent => {
+                assert(false, "expected a value for '" + key + "'")
+                return #[]
+            }
+        }
+    }
+
+    #[test]
+    fn the_index_survives_a_restart() {
+        let dir = fresh("restart")
+        let mut st = opened(dir)
+        assert(kv::put(&mut st, "alpha", #[1u8, 2, 3]).is_ok())
+        assert(kv::put(&mut st, "beta", #[4u8]).is_ok())
+        assert(kv::put(&mut st, "alpha", #[9u8]).is_ok())
+        assert_eq(kv::delete(&mut st, "beta").unwrap_or(false), true)
+        assert(kv::sync(&mut st).is_ok())
+
+        let mut again = opened(dir)
+        assert_eq(must_get(&mut again, "alpha"), #[9u8], "the newest value wins")
+        assert(matches(kv::get(&mut again, "beta"), kv::Read::Absent), "a tombstone survives the restart")
+        assert_eq(kv::len(&mut again), 1)
+        assert(kv::put(&mut again, "gamma", #[7u8]).is_ok(), "the reopened store still appends")
+        assert_eq(must_get(&mut again, "alpha"), #[9u8], "the append did not overwrite live data")
+    }
+
+    #[test]
+    fn writes_go_above_a_sealed_generation_rather_than_below_it() {
+        // What a crash part-way through a merge leaves: a sealed generation
+        // above the file writes were going to. Generations replay in order, so
+        // appending below the seal would put the sealed copy on top of the
+        // newer records at the next open.
+        let dir = fresh("sealed_newest")
+        let mut st = opened(dir)
+        assert(kv::put(&mut st, "k", #[1u8]).is_ok())
+        assert(kv::compact::run(&mut st).is_ok())
+        assert(kv::put(&mut st, "later", #[2u8]).is_ok())
+        assert(kv::sync(&mut st).is_ok())
+
+        let gens = kv::log::data_generations(dir).unwrap_or(#[])
+        assert_eq(gens.len(), 2, "a merged generation and the file writes went to")
+        let sealed = gens[0]
+        let active = gens[1]
+        assert(sealed > 1, "generation 1 is free to move the active file into")
+        assert(fs::rename(kv::log::data_path(dir, active), kv::log::data_path(dir, 1)).is_ok())
+
+        let mut after = opened(dir)
+        assert(after.gen > sealed, "the active file is above every sealed generation")
+        assert_eq(must_get(&mut after, "later"), #[2u8])
+        assert(kv::put(&mut after, "k", #[9u8]).is_ok(), "a key the sealed generation also holds")
+        assert(kv::sync(&mut after).is_ok())
+
+        let mut again = opened(dir)
+        assert_eq(must_get(&mut again, "k"), #[9u8], "the newer value outranks the sealed one")
+        assert_eq(must_get(&mut again, "later"), #[2u8])
+    }
+
+    #[test]
+    fn a_hint_file_that_stops_short_is_answered_by_the_data_file() {
+        // A hint describes a sealed generation; it is not the record of it. One
+        // that was truncated describes some of the generation, and the keys it
+        // does not name are still in the data file.
+        let dir = fresh("hint_short")
+        let mut st = opened(dir)
+        let mut i: i64 = 0
+        while i < 20 {
+            assert(kv::put(&mut st, "key/" + i.to_string(), #[7u8; 32]).is_ok())
+            i += 1
+        }
+        assert(kv::compact::run(&mut st).is_ok())
+        assert(kv::sync(&mut st).is_ok())
+        assert_eq(kv::len(&mut st), 20)
+
+        let sealed = kv::log::data_generations(dir).unwrap_or(#[])[0]
+        let hint = kv::log::hint_path(dir, sealed)
+        let whole = fs::read(hint).unwrap_or(#[])
+        assert(whole.len() > 40, "the hint describes every key")
+        assert(fs::write(hint, whole.slice(0, whole.len() / 2).unwrap_or(#[])).is_ok())
+
+        let mut after = opened(dir)
+        assert_eq(kv::len(&mut after), 20, "every key is still there")
+        assert_eq(must_get(&mut after, "key/0").len(), 32)
+        assert_eq(must_get(&mut after, "key/19").len(), 32)
+    }
+
+    #[test]
+    fn a_torn_tail_is_dropped_and_overwritten() {
+        let dir = fresh("torn")
+        let mut st = opened(dir)
+        assert(kv::put(&mut st, "good", #[1u8, 2, 3]).is_ok())
+        assert(kv::sync(&mut st).is_ok())
+        let intact = st.cur_off
+
+        // A half-written append leaves a record whose declared length runs past
+        // the end of the file.
+        let path = kv::log::data_path(dir, st.gen)
+        let whole = fs::read(path).unwrap_or(#[])
+        let mut torn = whole
+        torn.extend(kv::log::record("bad", 0u8, #[7u8, 7, 7], kv::log::record_crc("bad", #[7u8, 7, 7])).slice(0, 9).unwrap_or(#[]))
+        assert(fs::write(path, torn).is_ok())
+
+        let mut after = opened(dir)
+        assert_eq(must_get(&mut after, "good"), #[1u8, 2, 3])
+        assert(matches(kv::get(&mut after, "bad"), kv::Read::Absent))
+        assert_eq(after.cur_off, intact, "the next append starts where the intact log ended")
+        assert(kv::put(&mut after, "next", #[4u8]).is_ok())
+        assert_eq(must_get(&mut after, "next"), #[4u8])
+        assert_eq(must_get(&mut after, "good"), #[1u8, 2, 3])
+    }
+
+    #[test]
+    fn rebuilding_the_index_is_linear_in_the_record_count() {
+        // Reading a header field straight out of the whole-file buffer costs a
+        // copy of that buffer, which makes the rebuild quadratic. Doubling the
+        // record count must roughly double the work, not quadruple it.
+        //
+        // Each size is rebuilt several times and the fastest run is the
+        // estimate: other load on the machine only ever adds to a wall-clock
+        // reading, so the minimum is the sample that measures the rebuild
+        // rather than what it was competing with.
+        fn rebuild_ms(dir: String, n: i64) -> i64 {
+            let _ = fs::remove_dir_all(dir)
+            let mut st = opened(dir)
+            let mut i: i64 = 0
+            while i < n {
+                assert(kv::put(&mut st, "key/" + i.to_string(), #[7u8; 256]).is_ok())
+                i += 1
+            }
+            assert(kv::sync(&mut st).is_ok())
+            // The first rebuild pays for the path being reached for the first
+            // time, which belongs to neither size's cost.
+            let mut warm = opened(dir)
+            assert_eq(kv::len(&mut warm), n, "every record is in the rebuilt index")
+            let mut best: i64 = 0
+            let mut round: i64 = 0
+            while round < 3 {
+                let start = time::now_ms()
+                let mut reopened = opened(dir)
+                let elapsed = time::now_ms() - start
+                assert_eq(kv::len(&mut reopened), n, "every record is in the rebuilt index")
+                if round == 0 || elapsed < best { best = elapsed }
+                round += 1
+            }
+            best
+        }
+        let small = rebuild_ms("/tmp/terndb_kv_test/scale_4k", 4_000)
+        let large = rebuild_ms("/tmp/terndb_kv_test/scale_8k", 8_000)
+        // Linear work lands near 2x; the quadratic shape lands above 4x.
+        assert(large < (small + 1) * 3, "8000 records rebuilt in " + large.to_string() +
+            "ms against " + small.to_string() + "ms for 4000: the rebuild is superlinear")
+    }
+
+    #[test]
+    fn a_log_larger_than_one_scan_block_rebuilds_correctly() {
+        // The rebuild walks the log through a fixed-size window, so records
+        // that straddle a window boundary are the case worth pinning down.
+        let dir = fresh("block_boundary")
+        let mut st = opened(dir)
+        let n: i64 = 3_000
+        let mut i: i64 = 0
+        while i < n {
+            assert(kv::put(&mut st, "key/" + i.to_string(), #[9u8; 300]).is_ok())
+            i += 1
+        }
+        assert(kv::sync(&mut st).is_ok())
+        assert(st.cur_off > 900_000, "the log is several windows long")
+
+        let mut after = opened(dir)
+        assert_eq(kv::len(&mut after), n)
+        assert_eq(must_get(&mut after, "key/0").len(), 300)
+        assert_eq(must_get(&mut after, "key/" + (n - 1).to_string()).len(), 300)
+        assert_eq(after.cur_off, st.cur_off, "the scan ends where the log does")
+    }
+
+    #[test]
+    fn a_value_larger_than_one_scan_block_rebuilds_correctly() {
+        let dir = fresh("block_oversize")
+        let mut st = opened(dir)
+        let big: Vec<u8> = #[3u8; 700_000]
+        assert(kv::put(&mut st, "small", #[1u8]).is_ok())
+        assert(kv::put(&mut st, "big", big).is_ok())
+        assert(kv::put(&mut st, "after", #[2u8]).is_ok())
+        assert(kv::sync(&mut st).is_ok())
+
+        let mut after = opened(dir)
+        assert_eq(kv::len(&mut after), 3)
+        assert_eq(must_get(&mut after, "big").len(), 700_000, "a record wider than the window still reads")
+        assert_eq(must_get(&mut after, "after"), #[2u8])
+    }
+}

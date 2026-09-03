@@ -1,0 +1,407 @@
+use crate::engine
+use crate::codec
+use crate::kv
+
+// An index over one column: which rows hold each value.
+//
+// What the store keeps is the declaration that a column is indexed; the index
+// itself is built from the rows at every open, so it is never stale and never
+// in the log.
+
+/// One column's values, each naming the rows that hold it.
+///
+/// The rows holding a value are a chain through the rowid space rather than a
+/// list of their own: `head` names the first, and `next` and `prev` carry the
+/// rest. A column with few distinct values therefore costs a handful of map
+/// entries and two words a row, and one with many costs an entry each. Both
+/// directions are kept so a row leaves its chain without the chain being
+/// walked to find it.
+pub struct ColIndex {
+    pub table: String
+    /// The column's name as the table spells it.
+    pub col: String
+    /// Where the column sits in a row.
+    pub ci: i64
+    /// The first row holding each value.
+    pub head: Map<codec::Value, i64>
+    pub next: Vec<i64>
+    pub prev: Vec<i64>
+}
+
+pub (package) fn declaration_key(table: String, col: String) -> String { "index/" + table + "/" + col }
+
+// The table and column an `index/<table>/<col>` key names, or empty names when
+// the key is not one.
+pub (package) fn split_key(key: String) -> (String, String) {
+    let n = key.byte_len()
+    let start: i64 = 6
+    if n <= start { return ("", "") }
+    let mut i = start
+    while i < n {
+        if key.byte_at(i) == 47 {
+            if i == start || i + 1 >= n { return ("", "") }
+            return (key.substring(start, i), key.substring(i + 1, n))
+        }
+        i += 1
+    }
+    ("", "")
+}
+
+/// The index on `table`.`col`, or -1 when the column has none.
+pub fn of(eng: &mut engine::Engine, table: String, col: String) -> i64 {
+    let mut i: i64 = 0
+    while i < eng.indexes.len() {
+        if eng.indexes[i].table == table && eng.indexes[i].col == col { return i }
+        i += 1
+    }
+    -1
+}
+
+// Whether any column of `table` is indexed, which is what decides whether a
+// write has to keep one up to date.
+pub (package) fn covers(eng: &mut engine::Engine, table: String) -> bool {
+    let mut i: i64 = 0
+    while i < eng.indexes.len() {
+        if eng.indexes[i].table == table { return true }
+        i += 1
+    }
+    false
+}
+
+// Adds the index to the engine and fills it from the rows already there.
+pub (package) fn attach(eng: &mut engine::Engine, table: String, col: String, ci: i64) -> Result<(), String> {
+    eng.indexes.push(ColIndex { table: table, col: col, ci: ci, head: Map::new(), next: #[], prev: #[] })
+    build(eng, eng.indexes.len() - 1)
+}
+
+// Files every row of the index's table under the value its column holds. Only
+// the columns up to the indexed one are decoded, so a late column costs more to
+// index than an early one and neither costs the whole row.
+fn build(eng: &mut engine::Engine, ix: i64) -> Result<(), String> {
+    let table = eng.indexes[ix].table
+    let ci = eng.indexes[ix].ci
+    let tid = kv::rows::table_id(&mut eng.store, table)
+    let top = kv::rows::last_id(&mut eng.store, tid)
+    let width = ci + 1
+    let mut vals: Vec<codec::Value> = #[]
+    let mut rid: i64 = 1
+    while rid <= top {
+        // A row the table holds has to be readable for the index over it to
+        // describe the table; one that is not stops the index being built.
+        match kv::rows::read(&mut eng.store, tid, rid) {
+            kv::Read::Value(bytes) => {
+                if !codec::decode_row_into(bytes, width, &mut vals) {
+                    return Err("index " + table + "." + eng.indexes[ix].col + ": row " +
+                        rid.to_string() + " is malformed")
+                }
+                add(eng, ix, rid, vals[ci])
+            }
+            kv::Read::Absent => ()
+            kv::Read::Fault(e) => return Err(e)
+        }
+        rid += 1
+    }
+    Ok(())
+}
+
+// The value a row is filed under.
+//
+// Two values that compare equal have to share one key, or the index would
+// answer a question differently from the walk it replaces. A float's negative
+// zero compares equal to its positive one and encodes differently, so it is
+// filed as positive; every other pair that compares equal is identical.
+pub (package) fn key_of(v: codec::Value) -> codec::Value {
+    // Adding zero turns a negative zero into a positive one and leaves every
+    // other value exactly as it was, which is what makes the two share a key.
+    if v.tag == codec::TAG_F64 { return codec::v_f64(v.f + 0.0) }
+    if v.tag == codec::TAG_F32 { return codec::v_f32(v.f + 0.0) }
+    v
+}
+
+// Makes room for `rid` in the chain arrays.
+fn grow(eng: &mut engine::Engine, ix: i64, rid: i64) {
+    let want = rid + 1
+    while eng.indexes[ix].next.len() < want {
+        eng.indexes[ix].next.push(0)
+        eng.indexes[ix].prev.push(0)
+    }
+}
+
+// Files `rid` at the head of `v`'s chain.
+fn add(eng: &mut engine::Engine, ix: i64, rid: i64, raw: codec::Value) {
+    if rid < 1 { return }
+    let v = key_of(raw)
+    grow(eng, ix, rid)
+    let first = eng.indexes[ix].head.get(v).unwrap_or(0)
+    eng.indexes[ix].next[rid] = first
+    eng.indexes[ix].prev[rid] = 0
+    if first != 0 { eng.indexes[ix].prev[first] = rid }
+    let _ = eng.indexes[ix].head.insert(v, rid)
+}
+
+// Takes `rid` out of `v`'s chain. A row that was never filed under `v` has no
+// link to cut, which is what the head check establishes.
+fn take_out(eng: &mut engine::Engine, ix: i64, rid: i64, raw: codec::Value) {
+    if rid < 1 || rid >= eng.indexes[ix].next.len() { return }
+    let v = key_of(raw)
+    let behind = eng.indexes[ix].prev[rid]
+    let ahead = eng.indexes[ix].next[rid]
+    if behind == 0 {
+        if eng.indexes[ix].head.get(v).unwrap_or(0) != rid { return }
+        if ahead == 0 {
+            let _ = eng.indexes[ix].head.remove(v)
+        } else {
+            let _ = eng.indexes[ix].head.insert(v, ahead)
+        }
+    } else {
+        eng.indexes[ix].next[behind] = ahead
+    }
+    if ahead != 0 { eng.indexes[ix].prev[ahead] = behind }
+    eng.indexes[ix].next[rid] = 0
+    eng.indexes[ix].prev[rid] = 0
+}
+
+// Files a row that has just been written under every indexed column it has.
+pub (package) fn row_added(eng: &mut engine::Engine, table: String, rid: i64, vals: Vec<codec::Value>) {
+    let mut ix: i64 = 0
+    while ix < eng.indexes.len() {
+        if eng.indexes[ix].table == table {
+            let ci = eng.indexes[ix].ci
+            if ci < vals.len() { add(eng, ix, rid, vals[ci]) }
+        }
+        ix += 1
+    }
+}
+
+// Takes a row that is about to be replaced or removed out of every index.
+pub (package) fn row_removed(eng: &mut engine::Engine, table: String, rid: i64, vals: Vec<codec::Value>) {
+    let mut ix: i64 = 0
+    while ix < eng.indexes.len() {
+        if eng.indexes[ix].table == table {
+            let ci = eng.indexes[ix].ci
+            if ci < vals.len() { take_out(eng, ix, rid, vals[ci]) }
+        }
+        ix += 1
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::fs
+    use crate::engine
+
+    fn fresh(name: String) -> String {
+        let dir = "/tmp/terndb_engine_test/" + name
+        let _ = fs::remove_dir_all(dir)
+        let _ = fs::create_dir_all(dir)
+        dir
+    }
+
+    fn opened(dir: String) -> engine::Engine {
+        engine::open(dir, false).unwrap_or_else(|e| panic("open " + dir + ": " + e))
+    }
+
+    fn run(eng: &mut engine::Engine, src: String) -> i64 {
+        match engine::exec(eng, src) {
+            Ok((n, _)) => return n
+            Err(e) => {
+                assert(false, src + " -> " + e)
+                return -1
+            }
+        }
+    }
+
+    fn rows(eng: &mut engine::Engine, src: String) -> Vec<Vec<String>> {
+        match engine::exec(eng, src) {
+            Ok((_, res)) => {
+                let mut out: Vec<Vec<String>> = #[]
+                for row in res.rows {
+                    let mut cells: Vec<String> = #[]
+                    for v in row.vals { cells.push(codec::value_to_string(v)) }
+                    out.push(cells)
+                }
+                return out
+            }
+            Err(e) => {
+                assert(false, src + " -> " + e)
+                return #[]
+            }
+        }
+    }
+
+    // Runs `script` against two engines - one with the given indexes, one with
+    // none - and asserts they answer identically at every step and end holding
+    // the same table. An index that changed an answer shows up here.
+    fn same_with_and_without_indexes(name: String, setup: Vec<String>, indexes: Vec<String>, script: Vec<String>) {
+        let mut indexed = opened(fresh(name + "_ix"))
+        let mut plain = opened(fresh(name + "_plain"))
+        for src in setup {
+            assert(engine::exec(&mut indexed, src).is_ok(), src)
+            assert(engine::exec(&mut plain, src).is_ok(), src)
+        }
+        for src in indexes {
+            assert(engine::exec(&mut indexed, src).is_ok(), src)
+        }
+        for src in script {
+            let a = engine::exec(&mut indexed, src)
+            let b = engine::exec(&mut plain, src)
+            assert_eq(a.is_ok(), b.is_ok(), src)
+            match a {
+                Ok((n, mut ra)) => {
+                    let mut rb = b.unwrap_or((-1, super::empty_result()))
+                    assert_eq(n, rb.0, src)
+                    assert_eq(engine::render(&mut ra), engine::render(&mut rb.1), src)
+                }
+                Err(e) => {
+                    match b {
+                        Ok(_) => assert(false, "the indexed engine rejected: " + src)
+                        Err(want) => assert_eq(e, want, src)
+                    }
+                }
+            }
+        }
+        let mut fa = engine::exec(&mut indexed, "SELECT * FROM t ORDER BY rowid").unwrap_or((0, super::empty_result()))
+        let mut fb = engine::exec(&mut plain, "SELECT * FROM t ORDER BY rowid").unwrap_or((0, super::empty_result()))
+        assert_eq(engine::render(&mut fa.1), engine::render(&mut fb.1), "the two engines hold the same table")
+    }
+
+    #[test]
+    fn an_index_never_changes_an_answer() {
+        same_with_and_without_indexes("ix_answers"
+            #[
+                "CREATE TABLE t (v TEXT, n INT32, ok BOOL, at DATETIME, score FLOAT)"
+                "INSERT INTO t VALUES ('a', 1, true, '2023-01-01T00:00:00Z', 1.5), ('b', 2, false, '2023-01-02T00:00:00Z', 2.5)"
+                "INSERT INTO t VALUES ('c', 1, true, '2023-01-01T00:00:00Z', 1.5), ('a', 3, false, '2023-01-03T00:00:00Z', 3.5)"
+            ]
+            #[
+                "CREATE INDEX ON t (v)"
+                "CREATE INDEX ON t (n)"
+                "CREATE INDEX ON t (ok)"
+                "CREATE INDEX ON t (at)"
+                "CREATE INDEX ON t (score)"
+            ]
+            #[
+                // every indexed column, every type
+                "SELECT v, n FROM t WHERE v = 'a'"
+                "SELECT v FROM t WHERE n = 1"
+                "SELECT v FROM t WHERE ok = true"
+                "SELECT v FROM t WHERE ok = false"
+                "SELECT v FROM t WHERE at = '2023-01-01T00:00:00Z'"
+                "SELECT v FROM t WHERE score = 1.5"
+                // a value nothing holds, and one the column cannot hold
+                "SELECT v FROM t WHERE v = 'zz'"
+                "SELECT v FROM t WHERE n = 99999999999"
+                // an indexed equality beside another condition
+                "SELECT v FROM t WHERE v = 'a' AND n > 2"
+                "SELECT v FROM t WHERE n = 1 AND ok = true"
+                "SELECT COUNT(*) FROM t WHERE v = 'a'"
+                "SELECT v FROM t WHERE v = 'a' ORDER BY n DESC"
+                "SELECT v FROM t WHERE v = 'a' LIMIT 1"
+                // an indexed column beside a rowid, which names the row itself
+                "SELECT v FROM t WHERE rowid = 4 AND v = 'a'"
+                // writes, after which the index has to still agree
+                "UPDATE t SET v = 'z' WHERE v = 'a'"
+                "SELECT v FROM t WHERE v = 'a'"
+                "SELECT v, n FROM t WHERE v = 'z'"
+                "INSERT INTO t VALUES ('z', 9, true, '2023-01-09T00:00:00Z', 9.5)"
+                "SELECT n FROM t WHERE v = 'z' ORDER BY n"
+                "DELETE FROM t WHERE v = 'z' AND n = 1"
+                "SELECT n FROM t WHERE v = 'z' ORDER BY n"
+                "UPDATE t SET n = 1 WHERE v = 'b'"
+                "SELECT v FROM t WHERE n = 1 ORDER BY v"
+                "DELETE FROM t WHERE n = 1"
+                "SELECT v FROM t WHERE n = 1"
+                "SELECT COUNT(*) FROM t"
+        ])
+    }
+
+    #[test]
+    fn an_index_agrees_with_the_walk_on_values_that_compare_equal() {
+        // A float's negative zero compares equal to its positive one, so both
+        // rows answer `= 0.0` whether the column is indexed or not.
+        same_with_and_without_indexes("ix_neg_zero"
+            #[
+                "CREATE TABLE t (s FLOAT, f FLOAT, v TEXT)"
+                "INSERT INTO t VALUES (-0.0, -0.0, 'neg'), (0.0, 0.0, 'pos'), (1.5, 1.5, 'one')"
+            ]
+            #["CREATE INDEX ON t (s)", "CREATE INDEX ON t (f)"]
+            #[
+                "SELECT v FROM t WHERE s = 0.0 ORDER BY v"
+                "SELECT v FROM t WHERE s = -0.0 ORDER BY v"
+                "SELECT COUNT(*) FROM t WHERE s = 0.0"
+                "SELECT v FROM t WHERE f = -0.0 ORDER BY v"
+                "SELECT v FROM t WHERE s = 1.5"
+                // and a row that moves onto and off the shared key
+                "UPDATE t SET s = -0.0 WHERE v = 'one'"
+                "SELECT v FROM t WHERE s = 0.0 ORDER BY v"
+                "DELETE FROM t WHERE s = 0.0 AND v = 'neg'"
+                "SELECT v FROM t WHERE s = 0.0 ORDER BY v"
+        ])
+    }
+
+    #[test]
+    fn an_index_on_a_column_of_few_values_finds_every_row() {
+        let mut eng = opened(fresh("ix_lowcard"))
+        assert_eq(run(&mut eng, "CREATE TABLE t (n INT32, ok BOOL)"), 0)
+        let mut i: i64 = 0
+        while i < 200 {
+            assert_eq(run(&mut eng, "INSERT INTO t VALUES (" + i.to_string() + ", " + (if i % 2 == 0 { "true" } else { "false" }) + ")"), 1)
+            i += 1
+        }
+        assert_eq(run(&mut eng, "CREATE INDEX ON t (ok)"), 0)
+        assert_eq(engine::exec(&mut eng, "SELECT COUNT(*) FROM t WHERE ok = true").unwrap_or((-1, super::empty_result())).0, 100)
+        assert_eq(engine::exec(&mut eng, "SELECT COUNT(*) FROM t WHERE ok = false").unwrap_or((-1, super::empty_result())).0, 100)
+        // Deleting half of one chain leaves the other half reachable.
+        assert_eq(run(&mut eng, "DELETE FROM t WHERE ok = true AND n < 100"), 50)
+        assert_eq(engine::exec(&mut eng, "SELECT COUNT(*) FROM t WHERE ok = true").unwrap_or((-1, super::empty_result())).0, 50)
+        assert_eq(engine::exec(&mut eng, "SELECT COUNT(*) FROM t WHERE ok = false").unwrap_or((-1, super::empty_result())).0, 100)
+    }
+
+    #[test]
+    fn an_index_is_rebuilt_when_the_database_is_reopened() {
+        let dir = fresh("ix_reopen")
+        let mut eng = opened(dir)
+        assert_eq(run(&mut eng, "CREATE TABLE t (v TEXT, n INT32)"), 0)
+        assert_eq(run(&mut eng, "INSERT INTO t VALUES ('a', 1), ('b', 2), ('a', 3)"), 3)
+        assert_eq(run(&mut eng, "CREATE INDEX ON t (v)"), 0)
+        assert_eq(run(&mut eng, "INSERT INTO t VALUES ('a', 4)"), 1)
+        assert(engine::sync(&mut eng).is_ok())
+
+        let mut again = opened(dir)
+        assert_eq(again.indexes.len(), 1, "the declaration came back")
+        assert_eq(rows(&mut again, "SELECT n FROM t WHERE v = 'a' ORDER BY n"), #[#["1"], #["3"], #["4"]])
+        assert_eq(rows(&mut again, "SELECT n FROM t WHERE v = 'b'"), #[#["2"]])
+        // And it survives a merge, which rewrites every record.
+        assert_eq(run(&mut again, "COMPACT"), 0)
+        assert_eq(rows(&mut again, "SELECT n FROM t WHERE v = 'a' ORDER BY n"), #[#["1"], #["3"], #["4"]])
+        let mut third = opened(dir)
+        assert_eq(third.indexes.len(), 1, "the declaration survived the merge")
+        assert_eq(rows(&mut third, "SELECT n FROM t WHERE v = 'a' ORDER BY n"), #[#["1"], #["3"], #["4"]])
+    }
+
+    #[test]
+    fn create_index_names_a_column_the_table_has() {
+        let mut eng = opened(fresh("ix_errors"))
+        assert_eq(run(&mut eng, "CREATE TABLE t (v TEXT)"), 0)
+        assert(engine::exec(&mut eng, "CREATE INDEX ON nope (v)").is_err(), "the table must exist")
+        assert(engine::exec(&mut eng, "CREATE INDEX ON t (missing)").is_err(), "the column must exist")
+        assert_eq(run(&mut eng, "CREATE INDEX ON t (v)"), 0)
+        assert(engine::exec(&mut eng, "CREATE INDEX ON t (v)").is_err(), "one index per column")
+        // The column is named as the table spells it, however the statement did.
+        assert(engine::exec(&mut eng, "CREATE INDEX ON t (V)").is_err(), "case does not make a second index")
+        assert_eq(eng.indexes.len(), 1)
+    }
+
+    #[test]
+    fn a_read_only_store_refuses_to_create_an_index() {
+        let dir = fresh("ix_readonly")
+        let mut writer = opened(dir)
+        assert_eq(run(&mut writer, "CREATE TABLE t (v TEXT)"), 0)
+        assert(engine::sync(&mut writer).is_ok())
+        let mut reader = engine::open(dir, true).unwrap_or_else(|e| panic(e))
+        match engine::exec(&mut reader, "CREATE INDEX ON t (v)") {
+            Ok(_) => assert(false, "a read-only store declared an index")
+            Err(e) => assert_eq(e, "store is read-only")
+        }
+    }
+}

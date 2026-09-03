@@ -1,0 +1,89 @@
+use std::{env, http, process}
+use std::http::router
+
+// terndb's key-value layer behind a GET endpoint, with no SQL above it.
+//
+// It serves the same store the SQL servers serve, seeded once by the SQL
+// seeder, and reaches a row the way the storage layer addresses it: one keyed
+// get of row `id` in the `users` table, then the render every read pays. What
+// it leaves off is the statement layer - no parse, no plan, no prepared
+// statement - so the gap between this and `gos-sql` is that layer and nothing
+// else.
+//
+//   bench-kv serve <addr> <dir>
+
+// The store, the table it answers from, and the key fragments a row is rendered
+// under: one value, because a handler reaches everything it captures through
+// the closure's environment and an aggregate is one slot there.
+struct Users {
+    store: kv::Store
+    tid: i64
+    keys: Vec<String>
+}
+
+fn main() {
+    let args = env::args()
+    if args.len() < 3 {
+        eprintln("usage: bench-kv serve <addr> <dir>")
+        process::exit(2)
+    }
+    match serve_forever(args[1], args[2]) {
+        Ok(()) => ()
+        Err(e) => {
+            eprintln("{}", e)
+            process::exit(1)
+        }
+    }
+}
+
+fn serve_forever(addr: String, dir: String) -> Result<(), String> {
+    let mut st = kv::open(dir, true)?
+    let tid = kv::rows::open_table(&mut st, "users")
+    let keys = kv::len(&mut st)
+    let mut users = Users { store: st, tid: tid, keys: codec::json::keys(#["name", "email", "score", "active"]) }
+    println("bench-kv on {}, serving {} ({} keys)", addr, dir, keys)
+    let routes = router::Router::new()
+        .get("/health", |_req, _p| http::Response::text(200, "ok"))
+        .get("/user/{id}", |req, _p| answer(&mut users, req.path_int("id").unwrap_or(-1)))
+    match http::serve(addr, routes) {
+        Ok(()) => Ok(())
+        Err(e) => Err("serve: " + e.message())
+    }
+}
+
+fn answer(users: &mut Users, id: i64) -> http::Response {
+    if id < 1 { return not_found() }
+    // A row in a generation the store holds is rendered where it lies: no
+    // positional read, and no copy of the value out of the buffer first. The
+    // buffer is handed to the renderer straight off the store, because binding
+    // it to a local here would copy the whole file per request.
+    let start, end = kv::rows::span(&mut users.store, users.tid, id)
+    if end > start {
+        let body = codec::json::render_window(
+            users.store.resident_bytes, start, end, users.keys, id)
+        if body.len() == 0 {
+            return http::Response::json(500, "{\"error\":\"undecodable row\"}")
+        }
+        return http::Response::json(200, body)
+    }
+    let bytes = match kv::rows::read(&mut users.store, users.tid, id) {
+        kv::Read::Value(v) => v
+        kv::Read::Absent => return not_found()
+        kv::Read::Fault(e) => return unreadable(e)
+    }
+    // The row is rendered straight out of the bytes the read produced.
+    let body = codec::json::render(bytes, users.keys, id)
+    if body.len() == 0 {
+        return http::Response::json(500, "{\"error\":\"undecodable row\"}")
+    }
+    http::Response::json(200, body)
+}
+
+fn not_found() -> http::Response { http::Response::json(404, "{\"error\":\"not found\"}") }
+
+// A row the store holds and cannot produce is a fault of the store, not a row
+// the client asked for and does not exist.
+fn unreadable(why: String) -> http::Response {
+    eprintln("bench-kv: {}", why)
+    http::Response::json(500, "{\"error\":\"unreadable row\"}")
+}

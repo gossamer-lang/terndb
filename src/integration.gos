@@ -1,0 +1,368 @@
+use std::fs
+use std::sync
+use crate::engine
+use crate::kv
+use crate::codec
+
+// End-to-end coverage for terndb: the library as a caller reaches it, the
+// durability contract across reopens and compaction, and a store answered by
+// several read-only engines at once. The per-module suites check each layer in
+// isolation; these exercise the paths a caller actually takes.
+//
+// They live here rather than under tests/ because a file under tests/ makes
+// every src module visible twice over, and each module's own imports then
+// collide (GR0004 inside src/bench.gos).
+
+/// The statements the README-level example runs, in order.
+
+#[cfg(test)]
+mod tests {
+    fn demo_script() -> Vec<String> {
+        #[
+            "CREATE TABLE users (name TEXT, age INT32, active BOOL, at DATETIME, score FLOAT)"
+            "INSERT INTO users VALUES ('alice', 30, true, '2023-11-14T22:13:20Z', 1.5), ('bob', 40, false, '2023-12-01T10:00:00Z', 2.5), ('carol', 25, true, '2024-01-01T00:00:00Z', 3.5)"
+            "SELECT name, age FROM users WHERE age > 26 ORDER BY age DESC"
+            "SELECT COUNT(*) FROM users"
+            "UPDATE users SET score = 9.5 WHERE name = 'bob'"
+            "SELECT * FROM users WHERE name = 'bob'"
+            "DELETE FROM users WHERE age < 28"
+            "COMPACT"
+            "SELECT name, score FROM users ORDER BY name"
+        ]
+    }
+
+
+    fn fresh(name: String) -> String {
+        let dir = "/tmp/terndb_integration/" + name
+        let _ = fs::remove_dir_all(dir)
+        let _ = fs::create_dir_all(dir)
+        dir
+    }
+
+    fn opened(dir: String) -> engine::Engine {
+        engine::open(dir, false).unwrap_or_else(|e| panic("open " + dir + ": " + e))
+    }
+
+    // Drives the engine the way the CLI does: one transcript line per response.
+    fn transcript(eng: &mut engine::Engine, script: Vec<String>) -> Vec<String> {
+        let mut out: Vec<String> = #[]
+        for src in script {
+            match engine::exec(eng, src) {
+                Ok((n, mut res)) => {
+                    if res.cols.len() == 0 {
+                        out.push("OK " + n.to_string())
+                    } else {
+                        out.push(res.cols.join("|"))
+                        out.extend(engine::render(&mut res))
+                    }
+                }
+                Err(e) => out.push("ERR " + e)
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn the_demo_script_produces_the_documented_transcript() {
+        let mut eng = opened(fresh("demo"))
+        assert_eq(transcript(&mut eng, demo_script()), #[
+            "OK 0"
+            "OK 3"
+            "name|age"
+            "bob|40"
+            "alice|30"
+            "count"
+            "3"
+            "OK 1"
+            "name|age|active|at|score"
+            "bob|40|false|2023-12-01T10:00:00.000Z|9.5"
+            "OK 1"
+            "OK 0"
+            "name|score"
+            "alice|1.5"
+            "bob|9.5"
+        ])
+    }
+
+    #[test]
+    fn the_demo_state_survives_reopening_the_directory() {
+        let dir = fresh("demo_restart")
+        let mut eng = opened(dir)
+        let _ = transcript(&mut eng, demo_script())
+        assert(engine::sync(&mut eng).is_ok())
+
+        let mut again = opened(dir)
+        assert_eq(transcript(&mut again, #["SELECT name, score FROM users ORDER BY name"])
+            #["name|score", "alice|1.5", "bob|9.5"])
+        assert_eq(engine::table_names(&mut again), #["users"])
+    }
+
+    #[test]
+    fn every_column_type_survives_a_write_reopen_cycle() {
+        let dir = fresh("all_types")
+        let mut eng = opened(dir)
+        assert_eq(transcript(&mut eng, #[
+            "CREATE TABLE t (a INT8, b INT16, c INT32, d INT64, e FLOAT32, f FLOAT64, g TEXT, h BOOL, i DATETIME)"
+            "INSERT INTO t VALUES (-128, -32768, -2147483648, 1234567890123, 1.5, -2.25, 'héllo 🌍', true, '2023-11-14T22:13:20.123Z')"
+        ]), #["OK 0", "OK 1"])
+        assert(engine::sync(&mut eng).is_ok())
+
+        let want = #["a|b|c|d|e|f|g|h|i", "-128|-32768|-2147483648|1234567890123|1.5|-2.25|héllo 🌍|true|2023-11-14T22:13:20.123Z"]
+        assert_eq(transcript(&mut eng, #["SELECT * FROM t"]), want)
+        let mut again = opened(dir)
+        assert_eq(transcript(&mut again, #["SELECT * FROM t"]), want, "the encoding round-trips through the file")
+    }
+
+    #[test]
+    fn a_reopen_after_every_step_sees_the_same_database() {
+        let dir = fresh("step_by_step")
+        let script = demo_script()
+        let mut done: Vec<String> = #[]
+        for src in script {
+            done.push(src)
+            // Replay the whole prefix into a fresh directory, then reopen and
+            // confirm a restart at this point is indistinguishable.
+            let mut eng = opened(dir)
+            let _ = transcript(&mut eng, #[src])
+            assert(engine::sync(&mut eng).is_ok())
+            let mut reopened = opened(dir)
+            assert_eq(engine::table_names(&mut reopened), engine::table_names(&mut eng)
+                "the catalogue after " + done.len().to_string() + " statements")
+        }
+    }
+
+    #[test]
+    fn the_sql_layer_and_the_kv_layer_agree_on_what_is_stored() {
+        let dir = fresh("layers")
+        let mut eng = opened(dir)
+        assert_eq(transcript(&mut eng, #[
+            "CREATE TABLE t (v TEXT)"
+            "INSERT INTO t VALUES ('a'), ('b'), ('c')"
+            "DELETE FROM t WHERE v = 'b'"
+        ]), #["OK 0", "OK 3", "OK 1"])
+
+        let mut store = kv::open(dir, true).unwrap_or_else(|e| panic(e))
+        assert_eq(kv::scan::keys(&mut store, "t/r/"), #["t/r/1", "t/r/3"]
+            "a deleted row leaves no key behind")
+        assert_eq(kv::scan::keys(&mut store, "schema/"), #["schema/t"])
+    }
+
+    #[test]
+    fn compaction_shrinks_the_log_without_changing_the_answers() {
+        let dir = fresh("compaction_size")
+        let mut eng = opened(dir)
+        assert_eq(transcript(&mut eng, #["CREATE TABLE t (id INT32, v TEXT)"]), #["OK 0"])
+        let mut i: i64 = 0
+        while i < 100 {
+            assert_eq(transcript(&mut eng, #["INSERT INTO t VALUES (" + i.to_string() + ", 'value')"]), #["OK 1"])
+            i += 1
+        }
+        // Rewriting every row leaves one superseded record per row behind.
+        assert_eq(transcript(&mut eng, #["UPDATE t SET v = 'rewritten'"]), #["OK 100"])
+        assert(kv::compact::dead_ratio(&mut eng.store) > 0.4, "half the log is now superseded")
+        let before = transcript(&mut eng, #["SELECT COUNT(*) FROM t"])
+
+        assert_eq(transcript(&mut eng, #["COMPACT"]), #["OK 0"])
+        assert_eq(kv::compact::dead_ratio(&mut eng.store), 0.0)
+        assert_eq(transcript(&mut eng, #["SELECT COUNT(*) FROM t"]), before)
+        assert_eq(transcript(&mut eng, #["SELECT v FROM t ORDER BY id LIMIT 1"]), #["v", "rewritten"])
+
+        let mut again = opened(dir)
+        assert_eq(transcript(&mut again, #["SELECT COUNT(*) FROM t"]), before)
+    }
+
+    #[test]
+    fn a_truncated_log_tail_costs_only_the_unfinished_statement() {
+        let dir = fresh("truncated_tail")
+        let mut eng = opened(dir)
+        assert_eq(transcript(&mut eng, #[
+            "CREATE TABLE t (v TEXT)"
+            "INSERT INTO t VALUES ('first')"
+            "INSERT INTO t VALUES ('second')"
+        ]), #["OK 0", "OK 1", "OK 1"])
+        assert(engine::sync(&mut eng).is_ok())
+
+        // Clip the last few bytes, as a write interrupted by a crash would.
+        let path = kv::log::data_path(dir, eng.store.gen)
+        let whole = fs::read(path).unwrap_or(#[])
+        assert(whole.len() > 10)
+        assert(fs::write(path, whole.slice(0, whole.len() - 5).unwrap_or(#[])).is_ok())
+
+        let mut after = opened(dir)
+        assert_eq(transcript(&mut after, #["SELECT v FROM t ORDER BY v"]), #["v", "first"]
+            "the statements that committed are intact and the interrupted one is gone")
+        assert_eq(transcript(&mut after, #["INSERT INTO t VALUES ('third')", "SELECT COUNT(*) FROM t"])
+            #["OK 1", "count", "2"], "the log accepts statements again")
+    }
+
+    #[test]
+    fn a_statement_interrupted_part_way_leaves_no_trace_of_itself() {
+        let dir = fresh("atomic_statement")
+        let mut eng = opened(dir)
+        assert_eq(transcript(&mut eng, #[
+            "CREATE TABLE t (v TEXT)"
+            "INSERT INTO t VALUES ('kept')"
+        ]), #["OK 0", "OK 1"])
+        assert(engine::sync(&mut eng).is_ok())
+        let path = kv::log::data_path(dir, eng.store.gen)
+        let before = fs::read(path).unwrap_or(#[])
+
+        // A five-row statement, then a crash before its commit record lands.
+        assert_eq(transcript(&mut eng, #["INSERT INTO t VALUES ('a'), ('b'), ('c'), ('d'), ('e')"]), #["OK 5"])
+        assert(engine::sync(&mut eng).is_ok())
+        let after_insert = fs::read(path).unwrap_or(#[])
+        assert(after_insert.len() > before.len())
+        // Cut the commit record off the end of the batch.
+        assert(fs::write(path, after_insert.slice(0, after_insert.len() - 11).unwrap_or(#[])).is_ok())
+
+        let mut reopened = opened(dir)
+        assert_eq(transcript(&mut reopened, #["SELECT v FROM t"]), #["v", "kept"]
+            "not one row of the interrupted statement is visible")
+        assert_eq(transcript(&mut reopened, #["SELECT COUNT(*) FROM t"]), #["count", "1"])
+        assert_eq(transcript(&mut reopened, #["INSERT INTO t VALUES ('next')", "SELECT COUNT(*) FROM t"])
+            #["OK 1", "count", "2"], "the rolled-back bytes are reused")
+    }
+
+    #[test]
+    fn two_databases_in_two_directories_stay_separate() {
+        let a = fresh("sep_a")
+        let b = fresh("sep_b")
+        let mut ea = opened(a)
+        let mut eb = opened(b)
+        assert_eq(transcript(&mut ea, #["CREATE TABLE t (v TEXT)", "INSERT INTO t VALUES ('in a')"]), #["OK 0", "OK 1"])
+        assert_eq(transcript(&mut eb, #["CREATE TABLE t (v TEXT)", "INSERT INTO t VALUES ('in b')"]), #["OK 0", "OK 1"])
+        assert_eq(transcript(&mut ea, #["SELECT v FROM t"]), #["v", "in a"])
+        assert_eq(transcript(&mut eb, #["SELECT v FROM t"]), #["v", "in b"])
+    }
+
+    #[test]
+    fn a_reader_opened_after_a_writer_sees_the_synced_rows() {
+        let dir = fresh("reader_writer")
+        let mut writer = opened(dir)
+        assert_eq(transcript(&mut writer, #[
+            "CREATE TABLE t (v TEXT)"
+            "INSERT INTO t VALUES ('one'), ('two')"
+        ]), #["OK 0", "OK 2"])
+        assert(engine::sync(&mut writer).is_ok())
+
+        let mut reader = engine::open(dir, true).unwrap_or_else(|e| panic(e))
+        assert_eq(transcript(&mut reader, #["SELECT COUNT(*) FROM t"]), #["count", "2"])
+        assert(engine::exec(&mut reader, "INSERT INTO t VALUES ('three')").is_err())
+        assert_eq(transcript(&mut writer, #["INSERT INTO t VALUES ('three')"]), #["OK 1"]
+            "the writer is unaffected by the reader")
+    }
+
+    #[test]
+    fn several_read_only_engines_answer_the_same_store_at_once() {
+        // The shape a serving process takes: one writer's committed store, and
+        // a read-only engine per worker over it. An engine carries nested
+        // growable storage, which two goroutines cannot both own, so what makes
+        // this affordable is the row index - a reader's whole index is three
+        // words a row.
+        let dir = fresh("concurrent_readers")
+        let mut writer = opened(dir)
+        assert(engine::exec(&mut writer, "CREATE TABLE t (v TEXT)").is_ok())
+        let mut src = "INSERT INTO t VALUES"
+        let mut i: i64 = 1
+        while i < 41 {
+            if i > 1 { src = src + "," }
+            src = src + " ('v" + i.to_string() + "')"
+            i += 1
+        }
+        assert(engine::exec(&mut writer, src).is_ok())
+        assert(engine::sync(&mut writer).is_ok())
+
+        let readers: i64 = 4
+        // The readers answer down a channel rather than into a shared `Vec`:
+        // what several goroutines write to at once has to be something that
+        // carries between them.
+        let tx, rx = sync::channel_unbounded()
+        let read = cohort {
+            let mut k: i64 = 0
+            while k < readers {
+                let want = k * 10 + 1
+                spawn(|| {
+                    let mut eng = engine::open(dir, true).unwrap_or_else(|e| panic(e))
+                    let mut res = engine::query_args(&mut eng
+                        "SELECT v FROM t WHERE rowid = ?", #[codec::v_i64(want)])
+                            .unwrap_or_else(|e| panic(e))
+                    for line in engine::render(&mut res) { tx.send(line) }
+                    // A read-only engine refuses a statement that would write
+                    // before it reaches the catalogue.
+                    assert(engine::exec(&mut eng, "INSERT INTO t VALUES ('nope')").is_err())
+                }, reason: "reader")
+                k += 1
+            }
+        }
+        assert(read.is_ok(), "every reader finished cleanly")
+        tx.close()
+        let mut answers: Vec<String> = #[]
+        while let Some(line) = rx.recv() { answers.push(line) }
+        answers.sort()
+        assert_eq(answers, #["v1", "v11", "v21", "v31"], "each reader answered its own row")
+    }
+
+    #[test]
+    fn a_cached_plan_answers_the_same_rows_as_the_first_time() {
+        // A statement is answered inside a region that is released whole, and
+        // the plan prepared for its shape outlives it in the caller's cache.
+        // This drives one shape, a second, then the first again, so a plan that
+        // did not survive its region shows up as a wrong answer.
+        let dir = fresh("plan_reuse")
+        let mut writer = opened(dir)
+        assert(engine::exec(&mut writer, "CREATE TABLE t (v TEXT, n INT32)").is_ok())
+        assert(engine::exec(&mut writer, "INSERT INTO t VALUES ('one', 1), ('two', 2), ('three', 3)").is_ok())
+        assert(engine::sync(&mut writer).is_ok())
+
+        let mut eng = engine::open(dir, true).unwrap_or_else(|e| panic(e))
+        let mut cache = engine::cache::plans()
+        let mut lines: Vec<String> = #[]
+        let mut round: i64 = 0
+        while round < 3 {
+            for src in #[
+                "SELECT v FROM t WHERE rowid = 1"
+                "SELECT COUNT(*) FROM t"
+                "SELECT v FROM t WHERE rowid = 3"
+                "SELECT n FROM t WHERE v = 'two'"
+            ] {
+                match engine::cache::exec(&mut eng, &mut cache, src) {
+                    Ok((_, mut res)) => {
+                        for line in engine::render(&mut res) { lines.push(line) }
+                    }
+                    Err(e) => assert(false, src + ": " + e)
+                }
+            }
+            round += 1
+        }
+        let mut want: Vec<String> = #[]
+        let mut r: i64 = 0
+        while r < 3 {
+            want.extend(#["one", "3", "three", "2"])
+            r += 1
+        }
+        assert_eq(lines, want, "a reused plan answers what it answered the first time")
+        // The keyed read the same cache serves, over the same rows.
+        assert_eq(engine::cache::row_json(&mut eng, &mut cache, "t", 2).unwrap_or("")
+            "{\"id\":2,\"v\":\"two\",\"n\":2}")
+    }
+
+    #[test]
+    fn a_value_written_by_the_codec_is_the_value_the_sql_layer_reads_back() {
+        let dir = fresh("codec_bridge")
+        let mut eng = opened(dir)
+        assert_eq(transcript(&mut eng, #[
+            "CREATE TABLE t (n INT64, f FLOAT64, s TEXT)"
+            "INSERT INTO t VALUES (9223372036854775807, -2.25, 'edge')"
+            "INSERT INTO t VALUES (-9223372036854775807, 0.5, '')"
+        ]), #["OK 0", "OK 1", "OK 1"])
+        assert_eq(transcript(&mut eng, #["SELECT n, f, s FROM t ORDER BY n"]), #[
+            "n|f|s"
+            "-9223372036854775807|0.5|"
+            "9223372036854775807|-2.25|edge"
+        ])
+        // The same values, taken straight through the codec.
+        assert_eq(codec::value_to_string(codec::v_i64(9_223_372_036_854_775_807)), "9223372036854775807")
+        assert_eq(codec::value_to_string(codec::v_f64(-2.25)), "-2.25")
+    }
+
+}
