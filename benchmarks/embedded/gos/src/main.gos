@@ -69,16 +69,16 @@ fn report(target: String, run: Run) -> String {
 }
 
 fn run_sql(dir: String, rows: i64, seconds: i64) -> Result<Run, String> {
-    let mut eng = engine::open(dir, true)?
+    let mut eng = engine::open(dir, read_only: true)?
     // The statement is parsed and planned once, which is how an embedded caller
     // holding a hot query uses it.
     let mut plan = engine::plan::prepare(&mut eng, SELECT)?
-    let probe = engine::plan::read_json(&mut eng, &mut plan, 1)?
+    let probe = plan.read_json(&mut eng, 1)?
     if probe.byte_len() == 0 { return Err("row 1 is missing from " + dir) }
 
     let mut i = 0
     while i < BATCH * 8 {
-        let _ = engine::plan::read_json(&mut eng, &mut plan, id_at(i, rows))?
+        let _ = plan.read_json(&mut eng, id_at(i, rows))?
         i += 1
     }
 
@@ -89,7 +89,7 @@ fn run_sql(dir: String, rows: i64, seconds: i64) -> Result<Run, String> {
     loop {
         let mut k = 0
         while k < BATCH {
-            let body = engine::plan::read_json(&mut eng, &mut plan, id_at(queries + k, rows))?
+            let body = plan.read_json(&mut eng, id_at(queries + k, rows))?
             bytes += body.byte_len()
             k += 1
         }
@@ -100,7 +100,7 @@ fn run_sql(dir: String, rows: i64, seconds: i64) -> Result<Run, String> {
 }
 
 fn run_kv(dir: String, rows: i64, seconds: i64) -> Result<Run, String> {
-    let mut st = kv::open(dir, true)?
+    let mut st = kv::open(dir, read_only: true)?
     let tid = kv::rows::open_table(&mut st, "users")
     let keys = codec::json::keys(#["name", "email", "score", "active"])
     if matches(kv::rows::read(&mut st, tid, 1), kv::Read::Absent) {
@@ -132,7 +132,7 @@ fn run_kv(dir: String, rows: i64, seconds: i64) -> Result<Run, String> {
 /// One keyed read rendered as JSON; the byte count is what the caller received.
 ///
 /// A row in a generation the store holds is rendered where it lies, which is
-/// the same path `engine::plan::read_json` takes for a keyed `SELECT`: the two
+/// the same path `Prepared::read_json` takes for a keyed `SELECT`: the two
 /// benchmark targets differ by the statement layer and by nothing below it.
 /// The buffer is handed to the renderer straight off the store, because
 /// binding it to a local here would copy the whole file per read.

@@ -207,11 +207,11 @@ mod tests {
     }
 
     fn opened(dir: String) -> kv::Store {
-        kv::open(dir, false).unwrap_or_else(|e| panic("open " + dir + ": " + e))
+        kv::open(dir).unwrap_or_else(|e| panic("open " + dir + ": " + e))
     }
 
     fn must_get(st: &mut kv::Store, key: String) -> Vec<u8> {
-        match kv::get(st, key) {
+        match st.get(key) {
             kv::Read::Value(v) => return v
             kv::Read::Fault(e) => panic(e)
             kv::Read::Absent => {
@@ -225,17 +225,17 @@ mod tests {
     fn the_index_survives_a_restart() {
         let dir = fresh("restart")
         let mut st = opened(dir)
-        assert(kv::put(&mut st, "alpha", #[1u8, 2, 3]).is_ok())
-        assert(kv::put(&mut st, "beta", #[4u8]).is_ok())
-        assert(kv::put(&mut st, "alpha", #[9u8]).is_ok())
-        assert_eq(kv::delete(&mut st, "beta").unwrap_or(false), true)
-        assert(kv::sync(&mut st).is_ok())
+        assert(st.put("alpha", #[1u8, 2, 3]).is_ok())
+        assert(st.put("beta", #[4u8]).is_ok())
+        assert(st.put("alpha", #[9u8]).is_ok())
+        assert_eq(st.delete("beta").unwrap_or(false), true)
+        assert(st.sync().is_ok())
 
         let mut again = opened(dir)
         assert_eq(must_get(&mut again, "alpha"), #[9u8], "the newest value wins")
-        assert(matches(kv::get(&mut again, "beta"), kv::Read::Absent), "a tombstone survives the restart")
-        assert_eq(kv::len(&mut again), 1)
-        assert(kv::put(&mut again, "gamma", #[7u8]).is_ok(), "the reopened store still appends")
+        assert(matches(again.get("beta"), kv::Read::Absent), "a tombstone survives the restart")
+        assert_eq(again.len(), 1)
+        assert(again.put("gamma", #[7u8]).is_ok(), "the reopened store still appends")
         assert_eq(must_get(&mut again, "alpha"), #[9u8], "the append did not overwrite live data")
     }
 
@@ -247,10 +247,10 @@ mod tests {
         // newer records at the next open.
         let dir = fresh("sealed_newest")
         let mut st = opened(dir)
-        assert(kv::put(&mut st, "k", #[1u8]).is_ok())
+        assert(st.put("k", #[1u8]).is_ok())
         assert(kv::compact::run(&mut st).is_ok())
-        assert(kv::put(&mut st, "later", #[2u8]).is_ok())
-        assert(kv::sync(&mut st).is_ok())
+        assert(st.put("later", #[2u8]).is_ok())
+        assert(st.sync().is_ok())
 
         let gens = kv::log::data_generations(dir).unwrap_or(#[])
         assert_eq(gens.len(), 2, "a merged generation and the file writes went to")
@@ -262,8 +262,8 @@ mod tests {
         let mut after = opened(dir)
         assert(after.gen > sealed, "the active file is above every sealed generation")
         assert_eq(must_get(&mut after, "later"), #[2u8])
-        assert(kv::put(&mut after, "k", #[9u8]).is_ok(), "a key the sealed generation also holds")
-        assert(kv::sync(&mut after).is_ok())
+        assert(after.put("k", #[9u8]).is_ok(), "a key the sealed generation also holds")
+        assert(after.sync().is_ok())
 
         let mut again = opened(dir)
         assert_eq(must_get(&mut again, "k"), #[9u8], "the newer value outranks the sealed one")
@@ -279,12 +279,12 @@ mod tests {
         let mut st = opened(dir)
         let mut i: i64 = 0
         while i < 20 {
-            assert(kv::put(&mut st, "key/" + i.to_string(), #[7u8; 32]).is_ok())
+            assert(st.put("key/" + i.to_string(), #[7u8; 32]).is_ok())
             i += 1
         }
         assert(kv::compact::run(&mut st).is_ok())
-        assert(kv::sync(&mut st).is_ok())
-        assert_eq(kv::len(&mut st), 20)
+        assert(st.sync().is_ok())
+        assert_eq(st.len(), 20)
 
         let sealed = kv::log::data_generations(dir).unwrap_or(#[])[0]
         let hint = kv::log::hint_path(dir, sealed)
@@ -293,7 +293,7 @@ mod tests {
         assert(fs::write(hint, whole.slice(0, whole.len() / 2).unwrap_or(#[])).is_ok())
 
         let mut after = opened(dir)
-        assert_eq(kv::len(&mut after), 20, "every key is still there")
+        assert_eq(after.len(), 20, "every key is still there")
         assert_eq(must_get(&mut after, "key/0").len(), 32)
         assert_eq(must_get(&mut after, "key/19").len(), 32)
     }
@@ -302,8 +302,8 @@ mod tests {
     fn a_torn_tail_is_dropped_and_overwritten() {
         let dir = fresh("torn")
         let mut st = opened(dir)
-        assert(kv::put(&mut st, "good", #[1u8, 2, 3]).is_ok())
-        assert(kv::sync(&mut st).is_ok())
+        assert(st.put("good", #[1u8, 2, 3]).is_ok())
+        assert(st.sync().is_ok())
         let intact = st.cur_off
 
         // A half-written append leaves a record whose declared length runs past
@@ -316,9 +316,9 @@ mod tests {
 
         let mut after = opened(dir)
         assert_eq(must_get(&mut after, "good"), #[1u8, 2, 3])
-        assert(matches(kv::get(&mut after, "bad"), kv::Read::Absent))
+        assert(matches(after.get("bad"), kv::Read::Absent))
         assert_eq(after.cur_off, intact, "the next append starts where the intact log ended")
-        assert(kv::put(&mut after, "next", #[4u8]).is_ok())
+        assert(after.put("next", #[4u8]).is_ok())
         assert_eq(must_get(&mut after, "next"), #[4u8])
         assert_eq(must_get(&mut after, "good"), #[1u8, 2, 3])
     }
@@ -338,21 +338,21 @@ mod tests {
             let mut st = opened(dir)
             let mut i: i64 = 0
             while i < n {
-                assert(kv::put(&mut st, "key/" + i.to_string(), #[7u8; 256]).is_ok())
+                assert(st.put("key/" + i.to_string(), #[7u8; 256]).is_ok())
                 i += 1
             }
-            assert(kv::sync(&mut st).is_ok())
+            assert(st.sync().is_ok())
             // The first rebuild pays for the path being reached for the first
             // time, which belongs to neither size's cost.
             let mut warm = opened(dir)
-            assert_eq(kv::len(&mut warm), n, "every record is in the rebuilt index")
+            assert_eq(warm.len(), n, "every record is in the rebuilt index")
             let mut best: i64 = 0
             let mut round: i64 = 0
             while round < 3 {
                 let start = time::now_ms()
                 let mut reopened = opened(dir)
                 let elapsed = time::now_ms() - start
-                assert_eq(kv::len(&mut reopened), n, "every record is in the rebuilt index")
+                assert_eq(reopened.len(), n, "every record is in the rebuilt index")
                 if round == 0 || elapsed < best { best = elapsed }
                 round += 1
             }
@@ -374,14 +374,14 @@ mod tests {
         let n: i64 = 3_000
         let mut i: i64 = 0
         while i < n {
-            assert(kv::put(&mut st, "key/" + i.to_string(), #[9u8; 300]).is_ok())
+            assert(st.put("key/" + i.to_string(), #[9u8; 300]).is_ok())
             i += 1
         }
-        assert(kv::sync(&mut st).is_ok())
+        assert(st.sync().is_ok())
         assert(st.cur_off > 900_000, "the log is several windows long")
 
         let mut after = opened(dir)
-        assert_eq(kv::len(&mut after), n)
+        assert_eq(after.len(), n)
         assert_eq(must_get(&mut after, "key/0").len(), 300)
         assert_eq(must_get(&mut after, "key/" + (n - 1).to_string()).len(), 300)
         assert_eq(after.cur_off, st.cur_off, "the scan ends where the log does")
@@ -392,13 +392,13 @@ mod tests {
         let dir = fresh("block_oversize")
         let mut st = opened(dir)
         let big: Vec<u8> = #[3u8; 700_000]
-        assert(kv::put(&mut st, "small", #[1u8]).is_ok())
-        assert(kv::put(&mut st, "big", big).is_ok())
-        assert(kv::put(&mut st, "after", #[2u8]).is_ok())
-        assert(kv::sync(&mut st).is_ok())
+        assert(st.put("small", #[1u8]).is_ok())
+        assert(st.put("big", big).is_ok())
+        assert(st.put("after", #[2u8]).is_ok())
+        assert(st.sync().is_ok())
 
         let mut after = opened(dir)
-        assert_eq(kv::len(&mut after), 3)
+        assert_eq(after.len(), 3)
         assert_eq(must_get(&mut after, "big").len(), 700_000, "a record wider than the window still reads")
         assert_eq(must_get(&mut after, "after"), #[2u8])
     }

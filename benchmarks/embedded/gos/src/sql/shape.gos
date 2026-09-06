@@ -18,8 +18,8 @@ use super::lexer
 /// quote escapes, and the one place a `-` opens a negative literal - so a
 /// statement the lexer accepts normalises to one the lexer accepts.
 ///
-/// A `LIMIT` count stays where it is, because the grammar takes an integer
-/// there rather than a placeholder. Runs of whitespace collapse to one space,
+/// A `LIMIT` or `OFFSET` count stays where it is, because the grammar takes an
+/// integer there rather than a placeholder. Runs of whitespace collapse to one space,
 /// which two spellings of one statement then share. Anything the scan cannot
 /// make sense of is returned as it came with `args` emptied, so the parser
 /// reports it exactly as it would have.
@@ -30,7 +30,8 @@ pub fn normalize(src: String, args: &mut Vec<codec::Value>) -> String {
     // Whether a `-` here opens a negative literal, which is what the lexer asks
     // `value_may_follow` and answers from the token before it.
     let mut sign_ok = true
-    // Whether the word just emitted was LIMIT, whose count is not a placeholder.
+    // Whether the word just emitted was LIMIT or OFFSET, whose count is not a
+    // placeholder.
     let mut after_limit = false
     // Whitespace and comments are one separator however they are spelled, so
     // the space is written when the next token needs one rather than where it
@@ -60,7 +61,7 @@ pub fn normalize(src: String, args: &mut Vec<codec::Value>) -> String {
             out.push_str(word)
             i = end
             sign_ok = word_is(word, "BY")
-            after_limit = word_is(word, "LIMIT")
+            after_limit = word_is(word, "LIMIT") || word_is(word, "OFFSET")
             continue
         }
         if opens_number(src, i, n, sign_ok) {
@@ -137,7 +138,7 @@ fn take_quoted(src: String, i: i64, out: &mut String, args: &mut Vec<codec::Valu
                 continue
             }
             let raw = src.substring(start, j)
-            args.push(codec::v_text(if plain { raw } else { unquote(raw) }))
+            args.push(codec::Value::text(if plain { raw } else { unquote(raw) }))
             out.push_str("?")
             return j + 1
         }
@@ -156,7 +157,7 @@ fn word_end(src: String, i: i64) -> i64 {
 }
 
 // The numeric literal at `i`: into `args` with a `?` in its place, or copied
-// through when it is the count of a LIMIT, which the grammar takes as an
+// through when it is the count of a LIMIT or an OFFSET, which the grammar takes as an
 // integer rather than a placeholder. -1 for a number too wide to read.
 fn take_number(src: String, i: i64, keep: bool, out: &mut String, args: &mut Vec<codec::Value>) -> i64 {
     let n = src.byte_len()
@@ -183,12 +184,12 @@ fn take_number(src: String, i: i64, keep: bool, out: &mut String, args: &mut Vec
         // A number the shape cannot read is one the plan would be built around
         // wrongly, so the statement is handed to the parser as it was written.
         match text.to_f64() {
-            Some(v) => args.push(codec::v_f64(v))
+            Some(v) => args.push(codec::Value::float(v))
             None => return -1
         }
     } else {
         match text.to_i64() {
-            Some(v) => args.push(codec::v_i64(v))
+            Some(v) => args.push(codec::Value::int(v))
             None => return -1
         }
     }

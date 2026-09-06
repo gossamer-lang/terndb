@@ -148,8 +148,8 @@ mod tests {
     }
 
     fn run(eng: &mut engine::Engine, src: String) -> i64 {
-        match engine::exec(eng, src) {
-            Ok((n, _)) => return n
+        match eng.exec(src) {
+            Ok(res) => return res.count
             Err(e) => {
                 assert(false, src + " -> " + e)
                 return -1
@@ -158,12 +158,12 @@ mod tests {
     }
 
     fn rows(eng: &mut engine::Engine, src: String) -> Vec<Vec<String>> {
-        match engine::exec(eng, src) {
-            Ok((_, res)) => {
+        match eng.exec(src) {
+            Ok(res) => {
                 let mut out: Vec<Vec<String>> = #[]
                 for row in res.rows {
                     let mut cells: Vec<String> = #[]
-                    for v in row.vals { cells.push(codec::value_to_string(v)) }
+                    for v in row.vals { cells.push(v.to_string()) }
                     out.push(cells)
                 }
                 return out
@@ -230,11 +230,11 @@ mod tests {
         let mut eng = opened(fresh("rowid_types"))
         assert_eq(run(&mut eng, "CREATE TABLE t (v TEXT)"), 0)
         assert_eq(run(&mut eng, "INSERT INTO t VALUES ('a')"), 1)
-        match engine::exec(&mut eng, "SELECT * FROM t WHERE rowid = 'x'") {
+        match eng.exec("SELECT * FROM t WHERE rowid = 'x'") {
             Ok(_) => assert(false, "a text row id is not a row id")
             Err(e) => assert(e.contains("rowid"), "the error should name rowid, got: " + e)
         }
-        assert(engine::exec(&mut eng, "SELECT * FROM t WHERE rowid = 1.5").is_err())
+        assert(eng.exec("SELECT * FROM t WHERE rowid = 1.5").is_err())
     }
 
     #[test]
@@ -243,15 +243,15 @@ mod tests {
         // an answer to a question the table was never asked.
         let mut eng = opened(fresh("where_types"))
         users(&mut eng)
-        match engine::exec(&mut eng, "SELECT * FROM users WHERE age = 'thirty'") {
+        match eng.exec("SELECT * FROM users WHERE age = 'thirty'") {
             Ok(_) => assert(false, "text does not fit an INT32 column")
             Err(e) => assert(e.contains("'age'"), "the error should name the column, got: " + e)
         }
-        assert(engine::exec(&mut eng, "SELECT * FROM users WHERE age > 99999999999").is_err()
+        assert(eng.exec("SELECT * FROM users WHERE age > 99999999999").is_err()
             "a value outside the column's range")
-        assert(engine::exec(&mut eng, "SELECT * FROM users WHERE at = 'not a date'").is_err())
-        assert(engine::exec_args(&mut eng, "SELECT * FROM users WHERE age = ?"
-            #[codec::v_text("thirty")]).is_err(), "a bound value is narrowed the same way")
+        assert(eng.exec("SELECT * FROM users WHERE at = 'not a date'").is_err())
+        assert(eng.exec_args("SELECT * FROM users WHERE age = ?"
+            #[codec::Value::text("thirty")]).is_err(), "a bound value is narrowed the same way")
         // The comparisons a column can hold still answer.
         assert_eq(run(&mut eng, "SELECT * FROM users WHERE age = 30"), 1)
         assert_eq(run(&mut eng, "SELECT * FROM users WHERE score > 1"), 3, "an integer fits a float column")

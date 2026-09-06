@@ -41,38 +41,53 @@ pub struct Value {
     pub s: String
 }
 
-/// The NULL value.
-pub fn v_nil() -> Value { Value { tag: TAG_NIL, b: false, i: 0, f: 0.0, s: "" } }
+impl Value {
+    /// The NULL value.
+    pub fn nil() -> Value { Value { tag: TAG_NIL, b: false, i: 0, f: 0.0, s: "" } }
 
-/// A boolean value.
-pub fn v_bool(b: bool) -> Value { Value { tag: TAG_BOOL, b: b, i: 0, f: 0.0, s: "" } }
+    /// A boolean value.
+    pub fn bool(v: bool) -> Value { Value { tag: TAG_BOOL, b: v, i: 0, f: 0.0, s: "" } }
 
-/// An 8-bit signed integer value.
-pub fn v_i8(v: i64) -> Value { Value { tag: TAG_I8, b: false, i: v, f: 0.0, s: "" } }
+    /// A text value.
+    pub fn text(v: String) -> Value { Value { tag: TAG_TEXT, b: false, i: 0, f: 0.0, s: v } }
 
-/// A 16-bit signed integer value.
-pub fn v_i16(v: i64) -> Value { Value { tag: TAG_I16, b: false, i: v, f: 0.0, s: "" } }
+    /// A 64-bit signed integer value, which is what an integer literal is.
+    pub fn int(v: i64) -> Value { Value { tag: TAG_I64, b: false, i: v, f: 0.0, s: "" } }
 
-/// A 32-bit signed integer value.
-pub fn v_i32(v: i64) -> Value { Value { tag: TAG_I32, b: false, i: v, f: 0.0, s: "" } }
+    /// A 64-bit float value, which is what a decimal literal is.
+    pub fn float(v: f64) -> Value { Value { tag: TAG_F64, b: false, i: 0, f: v, s: "" } }
 
-/// A 64-bit signed integer value.
-pub fn v_i64(v: i64) -> Value { Value { tag: TAG_I64, b: false, i: v, f: 0.0, s: "" } }
+    /// A datetime value, as milliseconds since the Unix epoch in UTC.
+    pub fn datetime(ms: i64) -> Value { Value { tag: TAG_DT, b: false, i: ms, f: 0.0, s: "" } }
 
-/// A 32-bit float value, rounded to f32 precision on construction.
-pub fn v_f32(v: f64) -> Value { Value { tag: TAG_F32, b: false, i: 0, f: (v as f32) as f64, s: "" } }
+    /// An 8-bit signed integer value.
+    pub fn int8(v: i64) -> Value { Value { tag: TAG_I8, b: false, i: v, f: 0.0, s: "" } }
 
-/// A 64-bit float value.
-pub fn v_f64(v: f64) -> Value { Value { tag: TAG_F64, b: false, i: 0, f: v, s: "" } }
+    /// A 16-bit signed integer value.
+    pub fn int16(v: i64) -> Value { Value { tag: TAG_I16, b: false, i: v, f: 0.0, s: "" } }
 
-/// A text value.
-pub fn v_text(v: String) -> Value { Value { tag: TAG_TEXT, b: false, i: 0, f: 0.0, s: v } }
+    /// A 32-bit signed integer value.
+    pub fn int32(v: i64) -> Value { Value { tag: TAG_I32, b: false, i: v, f: 0.0, s: "" } }
 
-/// A datetime value, as milliseconds since the Unix epoch in UTC.
-pub fn v_dt(ms: i64) -> Value { Value { tag: TAG_DT, b: false, i: ms, f: 0.0, s: "" } }
+    /// A 32-bit float value, rounded to f32 precision on construction.
+    pub fn float32(v: f64) -> Value { Value { tag: TAG_F32, b: false, i: 0, f: (v as f32) as f64, s: "" } }
 
-/// The `n`th `?` placeholder of a prepared statement, counting from zero.
-pub fn v_param(n: i64) -> Value { Value { tag: TAG_PARAM, b: false, i: n, f: 0.0, s: "" } }
+    /// The `n`th `?` placeholder of a prepared statement, counting from zero.
+    pub fn param(n: i64) -> Value { Value { tag: TAG_PARAM, b: false, i: n, f: 0.0, s: "" } }
+}
+
+// A value renders the way the CLI prints it, so `{}` on a value, on a row of
+// them, or on anything holding one all answer the same text.
+impl Display for Value {
+    fn fmt(&self) -> String {
+        if self.tag == TAG_NIL { return "NULL" }
+        if self.tag == TAG_BOOL { return self.b.to_string() }
+        if self.tag == TAG_TEXT { return self.s }
+        if self.tag == TAG_F32 || self.tag == TAG_F64 { return self.f.to_string() }
+        if self.tag == TAG_DT { return datetime::render(self.i) }
+        self.i.to_string()
+    }
+}
 
 /// The inclusive value range a fixed-width integer tag can hold, or None for other tags.
 pub fn int_range(tag: u8) -> Option<(i64, i64)> {
@@ -116,16 +131,6 @@ pub fn type_name_for_tag(tag: u8) -> String {
         TAG_DT => "DATETIME"
         _ => "NULL"
     }
-}
-
-/// Renders a value the way the CLI prints it.
-pub fn value_to_string(v: Value) -> String {
-    if v.tag == TAG_NIL { return "NULL" }
-    if v.tag == TAG_BOOL { return v.b.to_string() }
-    if v.tag == TAG_TEXT { return v.s }
-    if v.tag == TAG_F32 || v.tag == TAG_F64 { return v.f.to_string() }
-    if v.tag == TAG_DT { return datetime::render(v.i) }
-    v.i.to_string()
 }
 
 /// Appends the encoding of `v` to `buf`.
@@ -190,7 +195,7 @@ fn decode_at(buf: Vec<u8>, pos: i64, next: &mut i64) -> Result<Value, String> {
     let p = pos + 1
     if tag == TAG_NIL {
         *next = p
-        return Ok(v_nil())
+        return Ok(Value::nil())
     }
     let width = payload_width(tag)
     if width > 0 {
@@ -207,26 +212,26 @@ fn decode_at(buf: Vec<u8>, pos: i64, next: &mut i64) -> Result<Value, String> {
 // A fixed-width payload, whose bytes the caller has already established are
 // there.
 fn decode_fixed(buf: Vec<u8>, p: i64, tag: u8) -> Result<Value, String> {
-    if tag == TAG_BOOL { return Ok(v_bool(buf[p] != 0u8)) }
-    if tag == TAG_I8 { return Ok(v_i8(buf[p] as i8 as i64)) }
+    if tag == TAG_BOOL { return Ok(Value::bool(buf[p] != 0u8)) }
+    if tag == TAG_I8 { return Ok(Value::int8(buf[p] as i8 as i64)) }
     if tag == TAG_I16 {
         match binary::get_u16_le_at(buf, p) {
-            Ok(x) => return Ok(v_i16(x as i16 as i64))
+            Ok(x) => return Ok(Value::int16(x as i16 as i64))
             Err(e) => return Err("decode: " + e.message())
         }
     }
     if tag == TAG_I32 {
         match binary::get_u32_le_at(buf, p) {
-            Ok(x) => return Ok(v_i32(x as i32 as i64))
+            Ok(x) => return Ok(Value::int32(x as i32 as i64))
             Err(e) => return Err("decode: " + e.message())
         }
     }
     match binary::get_u64_le_at(buf, p) {
         Ok(bits) => {
-            if tag == TAG_I64 { return Ok(v_i64(bits as i64)) }
-            if tag == TAG_DT { return Ok(v_dt(bits as i64)) }
-            if tag == TAG_F32 { return Ok(v_f32(f64::from_bits(bits))) }
-            Ok(v_f64(f64::from_bits(bits)))
+            if tag == TAG_I64 { return Ok(Value::int(bits as i64)) }
+            if tag == TAG_DT { return Ok(Value::datetime(bits as i64)) }
+            if tag == TAG_F32 { return Ok(Value::float32(f64::from_bits(bits))) }
+            Ok(Value::float(f64::from_bits(bits)))
         }
         Err(e) => Err("decode: " + e.message())
     }
@@ -245,7 +250,7 @@ fn decode_text(buf: Vec<u8>, p: i64, next: &mut i64) -> Result<Value, String> {
     }
     *next = start + n
     match String::from_utf8(bytes) {
-        Ok(text) => Ok(v_text(text))
+        Ok(text) => Ok(Value::text(text))
         Err(e) => Err("decode: text is not UTF-8: " + e.message())
     }
 }
@@ -310,63 +315,63 @@ mod tests {
             Ok(d) => return d
             Err(e) => {
                 assert(false, "decode failed: " + e)
-                return super::v_nil()
+                return super::Value::nil()
             }
         }
     }
 
     #[test]
     fn every_tag_survives_a_roundtrip() {
-        assert_eq(roundtrip(super::v_nil()).tag, super::TAG_NIL)
-        assert_eq(roundtrip(super::v_bool(true)).b, true)
-        assert_eq(roundtrip(super::v_bool(false)).b, false)
-        assert_eq(roundtrip(super::v_i8(-5)).i, -5)
-        assert_eq(roundtrip(super::v_i16(300)).i, 300)
-        assert_eq(roundtrip(super::v_i32(-70_000)).i, -70_000)
-        assert_eq(roundtrip(super::v_i64(1_234_567_890_123)).i, 1_234_567_890_123)
-        assert_eq(roundtrip(super::v_f64(-2.25)).f, -2.25)
-        assert_eq(roundtrip(super::v_text("hello")).s, "hello")
-        assert_eq(roundtrip(super::v_dt(1_700_000_000_123)).i, 1_700_000_000_123)
+        assert_eq(roundtrip(super::Value::nil()).tag, super::TAG_NIL)
+        assert_eq(roundtrip(super::Value::bool(true)).b, true)
+        assert_eq(roundtrip(super::Value::bool(false)).b, false)
+        assert_eq(roundtrip(super::Value::int8(-5)).i, -5)
+        assert_eq(roundtrip(super::Value::int16(300)).i, 300)
+        assert_eq(roundtrip(super::Value::int32(-70_000)).i, -70_000)
+        assert_eq(roundtrip(super::Value::int(1_234_567_890_123)).i, 1_234_567_890_123)
+        assert_eq(roundtrip(super::Value::float(-2.25)).f, -2.25)
+        assert_eq(roundtrip(super::Value::text("hello")).s, "hello")
+        assert_eq(roundtrip(super::Value::datetime(1_700_000_000_123)).i, 1_700_000_000_123)
     }
 
     #[test]
     fn integer_extremes_survive_a_roundtrip() {
-        assert_eq(roundtrip(super::v_i8(-128)).i, -128)
-        assert_eq(roundtrip(super::v_i8(127)).i, 127)
-        assert_eq(roundtrip(super::v_i16(-32_768)).i, -32_768)
-        assert_eq(roundtrip(super::v_i16(32_767)).i, 32_767)
-        assert_eq(roundtrip(super::v_i32(-2_147_483_648)).i, -2_147_483_648)
-        assert_eq(roundtrip(super::v_i32(2_147_483_647)).i, 2_147_483_647)
-        assert_eq(roundtrip(super::v_i64(9_223_372_036_854_775_807)).i, 9_223_372_036_854_775_807)
-        assert_eq(roundtrip(super::v_i64(-9_223_372_036_854_775_807 - 1)).i, -9_223_372_036_854_775_807 - 1)
+        assert_eq(roundtrip(super::Value::int8(-128)).i, -128)
+        assert_eq(roundtrip(super::Value::int8(127)).i, 127)
+        assert_eq(roundtrip(super::Value::int16(-32_768)).i, -32_768)
+        assert_eq(roundtrip(super::Value::int16(32_767)).i, 32_767)
+        assert_eq(roundtrip(super::Value::int32(-2_147_483_648)).i, -2_147_483_648)
+        assert_eq(roundtrip(super::Value::int32(2_147_483_647)).i, 2_147_483_647)
+        assert_eq(roundtrip(super::Value::int(9_223_372_036_854_775_807)).i, 9_223_372_036_854_775_807)
+        assert_eq(roundtrip(super::Value::int(-9_223_372_036_854_775_807 - 1)).i, -9_223_372_036_854_775_807 - 1)
     }
 
     #[test]
     fn f32_values_roundtrip_exactly() {
-        assert_eq(roundtrip(super::v_f32(1.5)).f, 1.5)
-        assert_eq(roundtrip(super::v_f32(-0.25)).f, -0.25)
-        // The f32 rounding a v_f32 applies is idempotent, so it survives storage.
-        let rounded = super::v_f32(0.1)
+        assert_eq(roundtrip(super::Value::float32(1.5)).f, 1.5)
+        assert_eq(roundtrip(super::Value::float32(-0.25)).f, -0.25)
+        // The f32 rounding a Value::float32 applies is idempotent, so it survives storage.
+        let rounded = super::Value::float32(0.1)
         assert_eq(roundtrip(rounded).f, rounded.f)
-        assert_eq(roundtrip(super::v_f64(0.1)).f, 0.1)
+        assert_eq(roundtrip(super::Value::float(0.1)).f, 0.1)
     }
 
     #[test]
     fn text_roundtrips_multibyte_utf8() {
         let s = "héllo wörld"
-        let v = super::v_text(s)
+        let v = super::Value::text(s)
         assert_eq(super::encoded_len(v), 5 + 13, "length prefix counts bytes, not characters")
         assert_eq(roundtrip(v).s, s)
-        assert_eq(roundtrip(super::v_text("")).s, "")
-        assert_eq(roundtrip(super::v_text("日本語 🌍")).s, "日本語 🌍")
+        assert_eq(roundtrip(super::Value::text("")).s, "")
+        assert_eq(roundtrip(super::Value::text("日本語 🌍")).s, "日本語 🌍")
     }
 
     #[test]
     fn values_decode_back_to_back_from_one_buffer() {
         let vals = #[
-            super::v_nil(), super::v_bool(true), super::v_i8(-5), super::v_i16(300)
-            super::v_i32(-70_000), super::v_i64(1_234_567_890_123), super::v_f32(1.5)
-            super::v_f64(-2.25), super::v_text("héllo wörld"), super::v_dt(1_700_000_000_123)
+            super::Value::nil(), super::Value::bool(true), super::Value::int8(-5), super::Value::int16(300)
+            super::Value::int32(-70_000), super::Value::int(1_234_567_890_123), super::Value::float32(1.5)
+            super::Value::float(-2.25), super::Value::text("héllo wörld"), super::Value::datetime(1_700_000_000_123)
         ]
         let mut packed: Vec<u8> = #[]
         for v in vals { super::encode_into(&mut packed, v) }
@@ -389,7 +394,7 @@ mod tests {
 
     #[test]
     fn decode_rejects_a_truncated_buffer() {
-        let full = super::encode(super::v_i64(1_234_567_890_123))
+        let full = super::encode(super::Value::int(1_234_567_890_123))
         let mut i: i64 = 1
         while i < full.len() {
             let short = full.slice(0, i).unwrap_or(#[])
@@ -433,12 +438,12 @@ mod tests {
 
     #[test]
     fn values_render_the_way_the_cli_prints_them() {
-        assert_eq(super::value_to_string(super::v_nil()), "NULL")
-        assert_eq(super::value_to_string(super::v_bool(true)), "true")
-        assert_eq(super::value_to_string(super::v_i32(-70_000)), "-70000")
-        assert_eq(super::value_to_string(super::v_f64(9.5)), "9.5")
-        assert_eq(super::value_to_string(super::v_text("hi")), "hi")
-        assert_eq(super::value_to_string(super::v_dt(0)), "1970-01-01T00:00:00.000Z")
+        assert_eq(super::Value::nil().to_string(), "NULL")
+        assert_eq(super::Value::bool(true).to_string(), "true")
+        assert_eq(super::Value::int32(-70_000).to_string(), "-70000")
+        assert_eq(super::Value::float(9.5).to_string(), "9.5")
+        assert_eq(super::Value::text("hi").to_string(), "hi")
+        assert_eq(super::Value::datetime(0).to_string(), "1970-01-01T00:00:00.000Z")
     }
 
     #[test]

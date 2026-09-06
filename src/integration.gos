@@ -47,13 +47,13 @@ mod tests {
     fn transcript(eng: &mut engine::Engine, script: Vec<String>) -> Vec<String> {
         let mut out: Vec<String> = #[]
         for src in script {
-            match engine::exec(eng, src) {
-                Ok((n, mut res)) => {
+            match eng.exec(src) {
+                Ok(mut res) => {
                     if res.cols.len() == 0 {
-                        out.push("OK " + n.to_string())
+                        out.push("OK " + res.count.to_string())
                     } else {
                         out.push(res.cols.join("|"))
-                        out.extend(engine::render(&mut res))
+                        out.extend(res.render())
                     }
                 }
                 Err(e) => out.push("ERR " + e)
@@ -89,12 +89,12 @@ mod tests {
         let dir = fresh("demo_restart")
         let mut eng = opened(dir)
         let _ = transcript(&mut eng, demo_script())
-        assert(engine::sync(&mut eng).is_ok())
+        assert(eng.sync().is_ok())
 
         let mut again = opened(dir)
         assert_eq(transcript(&mut again, #["SELECT name, score FROM users ORDER BY name"])
             #["name|score", "alice|1.5", "bob|9.5"])
-        assert_eq(engine::table_names(&mut again), #["users"])
+        assert_eq(again.table_names(), #["users"])
     }
 
     #[test]
@@ -105,7 +105,7 @@ mod tests {
             "CREATE TABLE t (a INT8, b INT16, c INT32, d INT64, e FLOAT32, f FLOAT64, g TEXT, h BOOL, i DATETIME)"
             "INSERT INTO t VALUES (-128, -32768, -2147483648, 1234567890123, 1.5, -2.25, 'héllo 🌍', true, '2023-11-14T22:13:20.123Z')"
         ]), #["OK 0", "OK 1"])
-        assert(engine::sync(&mut eng).is_ok())
+        assert(eng.sync().is_ok())
 
         let want = #["a|b|c|d|e|f|g|h|i", "-128|-32768|-2147483648|1234567890123|1.5|-2.25|héllo 🌍|true|2023-11-14T22:13:20.123Z"]
         assert_eq(transcript(&mut eng, #["SELECT * FROM t"]), want)
@@ -124,9 +124,9 @@ mod tests {
             // confirm a restart at this point is indistinguishable.
             let mut eng = opened(dir)
             let _ = transcript(&mut eng, #[src])
-            assert(engine::sync(&mut eng).is_ok())
+            assert(eng.sync().is_ok())
             let mut reopened = opened(dir)
-            assert_eq(engine::table_names(&mut reopened), engine::table_names(&mut eng)
+            assert_eq(reopened.table_names(), eng.table_names()
                 "the catalogue after " + done.len().to_string() + " statements")
         }
     }
@@ -180,7 +180,7 @@ mod tests {
             "INSERT INTO t VALUES ('first')"
             "INSERT INTO t VALUES ('second')"
         ]), #["OK 0", "OK 1", "OK 1"])
-        assert(engine::sync(&mut eng).is_ok())
+        assert(eng.sync().is_ok())
 
         // Clip the last few bytes, as a write interrupted by a crash would.
         let path = kv::log::data_path(dir, eng.store.gen)
@@ -203,13 +203,13 @@ mod tests {
             "CREATE TABLE t (v TEXT)"
             "INSERT INTO t VALUES ('kept')"
         ]), #["OK 0", "OK 1"])
-        assert(engine::sync(&mut eng).is_ok())
+        assert(eng.sync().is_ok())
         let path = kv::log::data_path(dir, eng.store.gen)
         let before = fs::read(path).unwrap_or(#[])
 
         // A five-row statement, then a crash before its commit record lands.
         assert_eq(transcript(&mut eng, #["INSERT INTO t VALUES ('a'), ('b'), ('c'), ('d'), ('e')"]), #["OK 5"])
-        assert(engine::sync(&mut eng).is_ok())
+        assert(eng.sync().is_ok())
         let after_insert = fs::read(path).unwrap_or(#[])
         assert(after_insert.len() > before.len())
         // Cut the commit record off the end of the batch.
@@ -243,11 +243,11 @@ mod tests {
             "CREATE TABLE t (v TEXT)"
             "INSERT INTO t VALUES ('one'), ('two')"
         ]), #["OK 0", "OK 2"])
-        assert(engine::sync(&mut writer).is_ok())
+        assert(writer.sync().is_ok())
 
         let mut reader = engine::open(dir, true).unwrap_or_else(|e| panic(e))
         assert_eq(transcript(&mut reader, #["SELECT COUNT(*) FROM t"]), #["count", "2"])
-        assert(engine::exec(&mut reader, "INSERT INTO t VALUES ('three')").is_err())
+        assert(reader.exec("INSERT INTO t VALUES ('three')").is_err())
         assert_eq(transcript(&mut writer, #["INSERT INTO t VALUES ('three')"]), #["OK 1"]
             "the writer is unaffected by the reader")
     }
@@ -261,7 +261,7 @@ mod tests {
         // words a row.
         let dir = fresh("concurrent_readers")
         let mut writer = opened(dir)
-        assert(engine::exec(&mut writer, "CREATE TABLE t (v TEXT)").is_ok())
+        assert(writer.exec("CREATE TABLE t (v TEXT)").is_ok())
         let mut src = "INSERT INTO t VALUES"
         let mut i: i64 = 1
         while i < 41 {
@@ -269,8 +269,8 @@ mod tests {
             src = src + " ('v" + i.to_string() + "')"
             i += 1
         }
-        assert(engine::exec(&mut writer, src).is_ok())
-        assert(engine::sync(&mut writer).is_ok())
+        assert(writer.exec(src).is_ok())
+        assert(writer.sync().is_ok())
 
         let readers: i64 = 4
         // The readers answer down a channel rather than into a shared `Vec`:
@@ -283,13 +283,12 @@ mod tests {
                 let want = k * 10 + 1
                 spawn(|| {
                     let mut eng = engine::open(dir, true).unwrap_or_else(|e| panic(e))
-                    let mut res = engine::query_args(&mut eng
-                        "SELECT v FROM t WHERE rowid = ?", #[codec::v_i64(want)])
-                            .unwrap_or_else(|e| panic(e))
-                    for line in engine::render(&mut res) { tx.send(line) }
+                    let mut res = eng.exec_args("SELECT v FROM t WHERE rowid = ?"
+                        #[codec::Value::int(want)]).unwrap_or_else(|e| panic(e))
+                    for line in res.render() { tx.send(line) }
                     // A read-only engine refuses a statement that would write
                     // before it reaches the catalogue.
-                    assert(engine::exec(&mut eng, "INSERT INTO t VALUES ('nope')").is_err())
+                    assert(eng.exec("INSERT INTO t VALUES ('nope')").is_err())
                 }, reason: "reader")
                 k += 1
             }
@@ -310,12 +309,12 @@ mod tests {
         // did not survive its region shows up as a wrong answer.
         let dir = fresh("plan_reuse")
         let mut writer = opened(dir)
-        assert(engine::exec(&mut writer, "CREATE TABLE t (v TEXT, n INT32)").is_ok())
-        assert(engine::exec(&mut writer, "INSERT INTO t VALUES ('one', 1), ('two', 2), ('three', 3)").is_ok())
-        assert(engine::sync(&mut writer).is_ok())
+        assert(writer.exec("CREATE TABLE t (v TEXT, n INT32)").is_ok())
+        assert(writer.exec("INSERT INTO t VALUES ('one', 1), ('two', 2), ('three', 3)").is_ok())
+        assert(writer.sync().is_ok())
 
         let mut eng = engine::open(dir, true).unwrap_or_else(|e| panic(e))
-        let mut cache = engine::cache::plans()
+        let mut cache = engine::cache::Plans::new()
         let mut lines: Vec<String> = #[]
         let mut round: i64 = 0
         while round < 3 {
@@ -325,9 +324,9 @@ mod tests {
                 "SELECT v FROM t WHERE rowid = 3"
                 "SELECT n FROM t WHERE v = 'two'"
             ] {
-                match engine::cache::exec(&mut eng, &mut cache, src) {
-                    Ok((_, mut res)) => {
-                        for line in engine::render(&mut res) { lines.push(line) }
+                match cache.exec(&mut eng, src) {
+                    Ok(mut res) => {
+                        for line in res.render() { lines.push(line) }
                     }
                     Err(e) => assert(false, src + ": " + e)
                 }
@@ -342,7 +341,7 @@ mod tests {
         }
         assert_eq(lines, want, "a reused plan answers what it answered the first time")
         // The keyed read the same cache serves, over the same rows.
-        assert_eq(engine::cache::row_json(&mut eng, &mut cache, "t", 2).unwrap_or("")
+        assert_eq(cache.row_json(&mut eng, "t", 2).unwrap_or("")
             "{\"id\":2,\"v\":\"two\",\"n\":2}")
     }
 
@@ -361,8 +360,8 @@ mod tests {
             "9223372036854775807|-2.25|edge"
         ])
         // The same values, taken straight through the codec.
-        assert_eq(codec::value_to_string(codec::v_i64(9_223_372_036_854_775_807)), "9223372036854775807")
-        assert_eq(codec::value_to_string(codec::v_f64(-2.25)), "-2.25")
+        assert_eq(codec::Value::int(9_223_372_036_854_775_807).to_string(), "9223372036854775807")
+        assert_eq(codec::Value::float(-2.25).to_string(), "-2.25")
     }
 
 }

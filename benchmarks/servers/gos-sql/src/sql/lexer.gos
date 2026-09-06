@@ -46,6 +46,13 @@ pub fn lex(src: String) -> Result<Vec<sql::Tok>, String> {
             i += 2
             continue
         }
+        // `<>` is SQL's other spelling of `!=`, and lexes as the one token the
+        // parser reads for either.
+        if c == '<' && i + 1 < n && src[i + 1] == '>' {
+            toks.push(sql::Tok { kind: sql::T_PUNCT, text: "<>" })
+            i += 2
+            continue
+        }
         if c == '?' {
             toks.push(sql::Tok { kind: sql::T_PARAM, text: "?" })
             i += 1

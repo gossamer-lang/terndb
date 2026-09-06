@@ -1,5 +1,7 @@
 use std::{env, fs, process}
-use terndb::{codec, engine, kv}
+use terndb::{codec, kv}
+use terndb::codec::Value
+use terndb::engine
 
 // Fetching a row by its identity, with no statement layer above it.
 //
@@ -36,7 +38,7 @@ fn main() {
 fn run(dir: String) -> Result<(), String> {
     seed(dir)?
 
-    let mut db = engine::open(dir, true)?
+    let mut db = engine::open(dir, read_only: true)?
 
     through_the_cache(&mut db)?
     through_a_prepared_statement(&mut db)?
@@ -49,27 +51,27 @@ fn run(dir: String) -> Result<(), String> {
 // table rows at all. Rows and plain keys share one log, one index and one
 // commit.
 fn seed(dir: String) -> Result<(), String> {
-    let mut db = engine::open(dir, false)?
-    engine::exec(&mut db, "CREATE TABLE users (name TEXT, email TEXT, score FLOAT, active BOOL)")?
-    engine::exec(&mut db, "INSERT INTO users VALUES ('ada', 'ada@example.com', 4.5, true), ('grace', 'grace@example.com', 2.5, true), ('alan', 'alan@example.com', 3.5, false), ('edsger', 'edsger@example.com', 1.5, true), ('doomed', 'doomed@example.com', 0.5, false)")?
-    engine::exec(&mut db, "DELETE FROM users WHERE name = 'doomed'")?
+    let mut db = engine::open(dir)?
+    db.exec("CREATE TABLE users (name TEXT, email TEXT, score FLOAT, active BOOL)")?
+    db.exec("INSERT INTO users VALUES ('ada', 'ada@example.com', 4.5, true), ('grace', 'grace@example.com', 2.5, true), ('alan', 'alan@example.com', 3.5, false), ('edsger', 'edsger@example.com', 1.5, true), ('doomed', 'doomed@example.com', 0.5, false)")?
+    db.exec("DELETE FROM users WHERE name = 'doomed'")?
 
-    kv::put(&mut db.store, "meta/schema-version", codec::encode(codec::v_text("1")))?
-    kv::put(&mut db.store, "meta/owner", codec::encode(codec::v_text("examples")))?
-    kv::put(&mut db.store, "meta/scratch", codec::encode(codec::v_i64(0)))?
-    kv::delete(&mut db.store, "meta/scratch")?
+    db.store.put("meta/schema-version", codec::encode(Value::text("1")))?
+    db.store.put("meta/owner", codec::encode(Value::text("examples")))?
+    db.store.put("meta/scratch", codec::encode(Value::int(0)))?
+    db.store.delete("meta/scratch")?
 
-    engine::sync(&mut db)
+    db.sync()
 }
 
 // The cache resolves the table once and reads every later row straight from the
 // store: no parse, no plan, no result set built around the answer.
 fn through_the_cache(db: &mut engine::Engine) -> Result<(), String> {
-    heading("through the plan cache: engine::cache::row_json")
+    heading("through the plan cache: cache.row_json")
 
-    let mut cache = engine::cache::plans()
+    let mut cache = engine::cache::Plans::new()
     for id in #[1, 3, 5] {
-        let row = engine::cache::row_json(db, &mut cache, "users", id)?
+        let row = cache.row_json(db, "users", id)?
         // A rendered row always begins with `{`, so the empty answer names the
         // absent row and nothing else.
         if row.len() == 0 {
@@ -84,25 +86,25 @@ fn through_the_cache(db: &mut engine::Engine) -> Result<(), String> {
 // A `SELECT ... WHERE rowid = ?` is recognised as a keyed read and takes the
 // same path, with the projection the statement asks for.
 fn through_a_prepared_statement(db: &mut engine::Engine) -> Result<(), String> {
-    heading("through a prepared statement: engine::plan::read_json, read_row, read_bytes")
+    heading("through a prepared statement: plan.read_json, read_row, read_bytes")
 
     let mut whole = engine::plan::prepare(db, "SELECT * FROM users WHERE rowid = ?")?
-    println("  read_json(2): {}", engine::plan::read_json(db, &mut whole, 2)?)
+    println("  read_json(2): {}", whole.read_json(db, 2)?)
 
     // The typed values instead, into a buffer the caller owns and reuses.
     let mut vals: Vec<codec::Value> = #[]
-    if engine::plan::read_row(db, &mut whole, 3, &mut vals)? {
+    if whole.read_row(db, 3, &mut vals)? {
         let mut parts: Vec<String> = #[]
-        for v in vals { parts.push(codec::value_to_string(v)) }
+        for v in vals { parts.push(v.to_string()) }
         println("  read_row(3): {}", parts.join("|"))
     }
-    println("  read_row(9) found a row: {}", engine::plan::read_row(db, &mut whole, 9, &mut vals)?)
+    println("  read_row(9) found a row: {}", whole.read_row(db, 9, &mut vals)?)
 
     // The encoded record, for a caller that renders it itself. The three arms
     // are distinct: a store that cannot produce a record it holds has not
     // answered "not there".
     for id in #[4, 5] {
-        match engine::plan::read_bytes(db, &mut whole, id) {
+        match whole.read_bytes(db, id) {
             kv::Read::Value(bytes) => println("  read_bytes({}): {} encoded byte(s)", id, bytes.len())
             kv::Read::Absent => println("  read_bytes({}): absent", id)
             kv::Read::Fault(why) => println("  read_bytes({}): fault: {}", id, why)
@@ -111,12 +113,12 @@ fn through_a_prepared_statement(db: &mut engine::Engine) -> Result<(), String> {
 
     // A projection naming its columns reads the same row and renders those.
     let mut some = engine::plan::prepare(db, "SELECT name, score FROM users WHERE rowid = ?")?
-    println("  a projection: {}", engine::plan::read_json(db, &mut some, 1)?)
+    println("  a projection: {}", some.read_json(db, 1)?)
 
     // A statement a single read cannot answer is refused rather than quietly
     // turning into a walk.
     let mut walk = engine::plan::prepare(db, "SELECT name FROM users WHERE score > ?")?
-    match engine::plan::read_json(db, &mut walk, 1) {
+    match walk.read_json(db, 1) {
         Ok(_) => println("  a walk was answered as a keyed read, which it should not be")
         Err(e) => println("  a statement needing a walk: {}", e)
     }
@@ -140,7 +142,7 @@ fn straight_at_the_store(db: &mut engine::Engine) -> Result<(), String> {
             kv::Read::Value(bytes) => {
                 let vals = codec::decode_row(bytes, 4)?
                 let mut parts: Vec<String> = #[]
-                for v in vals { parts.push(codec::value_to_string(v)) }
+                for v in vals { parts.push(v.to_string()) }
                 println("  row {}: {}", rid, parts.join("|"))
             }
             kv::Read::Absent => println("  row {}: absent", rid)
@@ -153,16 +155,16 @@ fn straight_at_the_store(db: &mut engine::Engine) -> Result<(), String> {
 // `kv` is also a key-value store in its own right, for data that is not a table
 // row. These keys were written beside the rows, in the same log.
 fn plain_keys(db: &mut engine::Engine) -> Result<(), String> {
-    heading("plain keys: kv::get, kv::contains, kv::scan")
+    heading("plain keys: store.get, store.contains, kv::scan")
 
     for key in kv::scan::keys(&mut db.store, "meta/") {
-        match kv::get(&mut db.store, key) {
-            kv::Read::Value(bytes) => println("  {} = {}", key, codec::value_to_string(codec::decode(bytes, 0)?))
+        match db.store.get(key) {
+            kv::Read::Value(bytes) => println("  {} = {}", key, codec::decode(bytes, 0)?.to_string())
             kv::Read::Absent => println("  {}: absent", key)
             kv::Read::Fault(why) => println("  {}: fault: {}", key, why)
         }
     }
-    println("  meta/scratch, deleted before the sync: {}", kv::contains(&mut db.store, "meta/scratch"))
+    println("  meta/scratch, deleted before the sync: {}", db.store.contains("meta/scratch"))
     println("  row keys under users/r/: {}", kv::scan::keys(&mut db.store, "users/r/").join(", "))
     Ok(())
 }

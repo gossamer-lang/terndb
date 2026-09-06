@@ -54,7 +54,7 @@ pub (package) fn table(eng: &mut engine::Engine, def: &mut engine::TableDef, fil
         first = filter.id_eq
         past = filter.id_eq + 1
     }
-    let mut wanted = codec::v_nil()
+    let mut wanted = codec::Value::nil()
     let chain = indexed_chain(eng, def, filter, &mut wanted)
     let mut f = filter
     let mut rows: Vec<engine::Row> = #[]
@@ -185,8 +185,8 @@ mod tests {
     }
 
     fn run(eng: &mut engine::Engine, src: String) -> i64 {
-        match engine::exec(eng, src) {
-            Ok((n, _)) => return n
+        match eng.exec(src) {
+            Ok(res) => return res.count
             Err(e) => {
                 assert(false, src + " -> " + e)
                 return -1
@@ -195,12 +195,12 @@ mod tests {
     }
 
     fn rows(eng: &mut engine::Engine, src: String) -> Vec<Vec<String>> {
-        match engine::exec(eng, src) {
-            Ok((_, res)) => {
+        match eng.exec(src) {
+            Ok(res) => {
                 let mut out: Vec<Vec<String>> = #[]
                 for row in res.rows {
                     let mut cells: Vec<String> = #[]
-                    for v in row.vals { cells.push(codec::value_to_string(v)) }
+                    for v in row.vals { cells.push(v.to_string()) }
                     out.push(cells)
                 }
                 return out

@@ -365,7 +365,7 @@ pub fn write(st: &mut kv::Store, tid: i64, rid: i64, val: Vec<u8>) -> Result<(),
     if tid < 0 || tid >= st.tables.len() { return Err("put_row: no such table") }
     if rid < 1 { return Err("put_row: rowid must be positive") }
     let key = st.tables[tid].prefix + rid.to_string()
-    kv::put(st, key, val)
+    st.put(key, val)
 }
 
 /// Removes row `rid` of table `tid`, reporting whether it was there.
@@ -373,7 +373,7 @@ pub fn remove(st: &mut kv::Store, tid: i64, rid: i64) -> Result<bool, String> {
     if tid < 0 || tid >= st.tables.len() { return Err("delete_row: no such table") }
     if rid < 1 { return Ok(false) }
     let key = st.tables[tid].prefix + rid.to_string()
-    kv::delete(st, key)
+    st.delete(key)
 }
 #[cfg(test)]
 mod tests {
@@ -387,7 +387,7 @@ mod tests {
     }
 
     fn opened(dir: String) -> kv::Store {
-        kv::open(dir, false).unwrap_or_else(|e| panic("open " + dir + ": " + e))
+        kv::open(dir).unwrap_or_else(|e| panic("open " + dir + ": " + e))
     }
 
     // The bytes a read answered, with an absence or a fault failing the test.
@@ -406,7 +406,7 @@ mod tests {
     }
 
     fn must_get(st: &mut kv::Store, key: String) -> Vec<u8> {
-        match kv::get(st, key) {
+        match st.get(key) {
             kv::Read::Value(v) => return v
             kv::Read::Fault(e) => panic(e)
             kv::Read::Absent => {
@@ -427,12 +427,12 @@ mod tests {
         assert_eq(kv::rows::count(&mut st, tid), 2)
         assert_eq(kv::rows::last_id(&mut st, tid), 3)
         assert_eq(must_get(&mut st, "users/r/3"), "c".as_bytes(), "the string key still reaches the row")
-        assert_eq(kv::len(&mut st), 2, "len counts rows and plain keys together")
-        assert(kv::contains(&mut st, "users/r/1"), "a dense row answers contains")
-        assert(!kv::contains(&mut st, "users/r/2"))
+        assert_eq(st.len(), 2, "len counts rows and plain keys together")
+        assert(st.contains("users/r/1"), "a dense row answers contains")
+        assert(!st.contains("users/r/2"))
         assert_eq(kv::scan::count_prefix(&mut st, "users/r/"), 2)
         assert_eq(kv::scan::keys(&mut st, "users/r/"), #["users/r/1", "users/r/3"])
-        assert(kv::delete(&mut st, "users/r/1").unwrap_or(false), "a row deletes through its string key")
+        assert(st.delete("users/r/1").unwrap_or(false), "a row deletes through its string key")
         assert_eq(kv::rows::count(&mut st, tid), 1)
         assert(matches(kv::rows::read(&mut st, tid, 1), kv::Read::Absent))
     }
@@ -448,14 +448,14 @@ mod tests {
             i += 1
         }
         assert(kv::rows::remove(&mut st, tid, 250).unwrap_or(false))
-        assert(kv::sync(&mut st).is_ok())
+        assert(st.sync().is_ok())
         let mut re = kv::open(dir, true).unwrap_or_else(|e| panic(e))
         let rt = super::table_id(&mut re, "t")
         assert(rt >= 0, "the reopened store found the table by its row keys")
         assert_eq(kv::rows::count(&mut re, rt), 499)
         assert(matches(kv::rows::read(&mut re, rt, 250), kv::Read::Absent))
         assert_eq(value(kv::rows::read(&mut re, rt, 500)), "v500".as_bytes())
-        assert_eq(kv::len(&mut re), 499)
+        assert_eq(re.len(), 499)
         assert(kv::compact::run(&mut st).is_ok())
         let mut re2 = kv::open(dir, true).unwrap_or_else(|e| panic(e))
         let rt2 = super::table_id(&mut re2, "t")
@@ -469,18 +469,18 @@ mod tests {
         let mut st = opened(fresh("dense_decline"))
         // A leading zero is not the canonical spelling of a rowid, and a rowid
         // far past the table's top names a space the hash index answers better.
-        assert(kv::put(&mut st, "t/r/007", #[7u8]).is_ok())
-        assert(kv::put(&mut st, "t/r/99999999", #[9u8]).is_ok())
-        assert(kv::put(&mut st, "t/r/1", #[1u8]).is_ok())
+        assert(st.put("t/r/007", #[7u8]).is_ok())
+        assert(st.put("t/r/99999999", #[9u8]).is_ok())
+        assert(st.put("t/r/1", #[1u8]).is_ok())
         assert_eq(must_get(&mut st, "t/r/007"), #[7u8])
         assert_eq(must_get(&mut st, "t/r/99999999"), #[9u8])
         assert_eq(must_get(&mut st, "t/r/1"), #[1u8])
-        assert_eq(kv::len(&mut st), 3)
+        assert_eq(st.len(), 3)
         assert_eq(kv::scan::keys(&mut st, "t/r/"), #["t/r/007", "t/r/1", "t/r/99999999"])
         assert(kv::compact::run(&mut st).is_ok())
         assert_eq(must_get(&mut st, "t/r/007"), #[7u8], "compaction keeps a declined key")
         assert_eq(must_get(&mut st, "t/r/1"), #[1u8])
-        assert_eq(kv::len(&mut st), 3)
+        assert_eq(st.len(), 3)
     }
 
     #[test]
@@ -539,7 +539,7 @@ mod tests {
         assert(kv::rows::write(&mut st, tid, 1, "zzzzzzzz".as_bytes()).is_ok())
         assert(kv::rows::write(&mut st, tid, 2, "wwwwwwww".as_bytes()).is_ok())
         assert(kv::compact::run(&mut st).is_ok())
-        assert(kv::sync(&mut st).is_ok())
+        assert(st.sync().is_ok())
 
         let sealed = kv::log::data_generations(dir).unwrap_or(#[])[0]
         assert(flip_byte(kv::log::data_path(dir, sealed), "zzzzzzzz"), "the value is in the sealed file")
@@ -551,7 +551,7 @@ mod tests {
             kv::Read::Value(_) => assert(false, "a corrupted row must not read as a row")
             kv::Read::Absent => assert(false, "a corrupted row is not an absent one")
         }
-        match kv::get(&mut after, "t/r/1") {
+        match after.get("t/r/1") {
             kv::Read::Fault(e) => assert(e.contains("checksum mismatch"), "got: " + e)
             kv::Read::Value(_) => assert(false, "the keyed path reports it too")
             kv::Read::Absent => assert(false, "the keyed path does not call it absent")

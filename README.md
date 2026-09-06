@@ -1,4 +1,4 @@
-# terndb 0.1.0
+# terndb 0.2.0
 
 [![CI](https://github.com/danpozmanter/terndb/actions/workflows/ci.yml/badge.svg)](https://github.com/danpozmanter/terndb/actions/workflows/ci.yml)
 
@@ -7,22 +7,24 @@ Gossamer. Append-only log, in-memory index, and it runs inside the process that
 uses it: there is no server, no socket and no wire protocol.
 
 ```sql
-CREATE TABLE users (name TEXT, email TEXT, score FLOAT, active BOOL)
-CREATE INDEX ON users (name)
+CREATE TABLE IF NOT EXISTS users (name TEXT, email TEXT, score FLOAT, active BOOL)
+CREATE INDEX IF NOT EXISTS ON users (name)
 INSERT INTO users VALUES ('ada', 'ada@example.com', 1.5, true)
 SELECT name, score FROM users WHERE name = 'ada'
 ```
+
+Requires Gossamer 0.58.13 or later.
 
 ## Usage
 
 ### Embedded
 
 ```gossamer
-let mut db = engine::open("data", false)?
-engine::exec_args(&mut db, "INSERT INTO users VALUES (?, ?, ?, ?)",
-    #[codec::v_text(name), codec::v_text(email), codec::v_f64(score), codec::v_bool(true)])?
+let mut db = engine::open("data")?
+db.exec_args("INSERT INTO users VALUES (?, ?, ?, ?)"
+    #[Value::text(name), Value::text(email), Value::float(score), Value::bool(true)])?
 let mut plan = engine::plan::prepare(&mut db, "SELECT * FROM users WHERE rowid = ?")?
-let row = engine::plan::read_json(&mut db, &mut plan, 1)?
+let row = plan.read_json(&mut db, 1)?
 ```
 
 ### From a terminal
@@ -52,11 +54,15 @@ is how a row already identified is fetched.
 
 ## Grammar
 
-`CREATE TABLE` · `CREATE INDEX` · `INSERT` · `SELECT` (`*`, columns, `COUNT(*)`,
-`WHERE`, `ORDER BY`, `LIMIT`) · `UPDATE` · `DELETE` · `COMPACT`
+`CREATE TABLE` · `CREATE INDEX` · `DROP TABLE` · `DROP INDEX` · `INSERT` ·
+`SELECT` (`*`, columns, `COUNT(*)`, `WHERE`, `ORDER BY`, `LIMIT`, `OFFSET`) ·
+`UPDATE` · `DELETE` · `COMPACT`
 
-One table per statement. `WHERE` is an `AND` of `=` `!=` `<` `>` `<=` `>=`.
-A `?` stands anywhere a value does, filled from the arguments a caller bound.
+One table per statement. `CREATE` takes `IF NOT EXISTS` and `DROP` takes
+`IF EXISTS`, so a program may declare its schema at every open. An `INSERT` may
+name the columns it supplies, leaving the rest `NULL`. `WHERE` is an `AND` of
+`=` `!=` (or `<>`) `<` `>` `<=` `>=`. A `?` stands anywhere a value does, filled
+from the arguments a caller bound.
 Types: `TEXT` `BOOL` `INT8`..`INT64` `FLOAT32` `FLOAT64` `DATETIME`.
 No joins, no `OR`, no subqueries, no multi-statement transactions.
 

@@ -1,5 +1,6 @@
 use std::{env, fs, process}
-use terndb::{codec, engine}
+use terndb::codec::Value
+use terndb::engine
 
 // Create, read, update and delete, through the statement layer.
 //
@@ -31,58 +32,71 @@ fn main() {
 }
 
 fn run(dir: String) -> Result<(), String> {
-    let mut db = engine::open(dir, false)?
+    let mut db = engine::open(dir)?
 
-    // CREATE. An index is declared in the store and rebuilt from the rows at
-    // every open, so a WHERE on `name` is a lookup rather than a walk.
-    step(&mut db, "CREATE TABLE users (name TEXT, email TEXT, score FLOAT, active BOOL)")?
-    step(&mut db, "CREATE INDEX ON users (name)")?
+    // CREATE. The guard answers for a table already there, so a program may
+    // declare its schema at every open. An index is declared in the store and
+    // rebuilt from the rows at every open, so a WHERE on `name` is a lookup
+    // rather than a walk.
+    step(&mut db, "CREATE TABLE IF NOT EXISTS users (name TEXT, email TEXT, score FLOAT, active BOOL)")?
+    step(&mut db, "CREATE INDEX IF NOT EXISTS ON users (name)")?
 
     // INSERT, written out. Rowids are assigned in insertion order.
     step(&mut db, "INSERT INTO users VALUES ('ada', 'ada@example.com', 1.5, true)")?
     step(&mut db, "INSERT INTO users VALUES ('grace', 'grace@example.com', 2.5, true), ('alan', 'alan@example.com', 3.5, false)")?
 
+    // INSERT naming its columns: those are supplied, the rest are NULL.
+    step(&mut db, "INSERT INTO users (name, email) VALUES ('edsger', 'edsger@example.com')")?
+
     // INSERT, with the values supplied rather than written. A `?` stands where
     // a value does, and what fills it never reaches the parser, so a name
     // carrying SQL is a name.
     let name = "bobby'); DROP TABLE users; --"
-    let written, _ = engine::exec_args(&mut db, "INSERT INTO users VALUES (?, ?, ?, ?)", #[
-        codec::v_text(name)
-        codec::v_text("bobby@example.com")
-        codec::v_f64(0.5)
-        codec::v_bool(false)
+    let written = db.exec_args("INSERT INTO users VALUES (?, ?, ?, ?)", #[
+        Value::text(name)
+        Value::text("bobby@example.com")
+        Value::float(0.5)
+        Value::bool(false)
     ])?
     println("INSERT INTO users VALUES (?, ?, ?, ?)")
-    println("  OK {}", written)
+    println("  OK {}", written.count)
 
-    // READ.
+    // READ. OFFSET skips the rows before the limit, which is how a page after
+    // the first is asked for.
     step(&mut db, "SELECT * FROM users")?
     step(&mut db, "SELECT name, score FROM users WHERE active = true ORDER BY score DESC")?
+    step(&mut db, "SELECT name FROM users ORDER BY name LIMIT 2 OFFSET 1")?
     step(&mut db, "SELECT COUNT(*) FROM users")?
 
     // UPDATE, both spellings. The count is the rows the statement touched.
     step(&mut db, "UPDATE users SET score = 9.5 WHERE name = 'ada'")?
-    let updated, _ = engine::exec_args(&mut db, "UPDATE users SET active = ? WHERE name = ?"
-        #[codec::v_bool(true), codec::v_text(name)])?
+    let updated = db.exec_args("UPDATE users SET active = ? WHERE name = ?"
+        #[Value::bool(true), Value::text(name)])?
     println("UPDATE users SET active = ? WHERE name = ?")
-    println("  OK {}", updated)
+    println("  OK {}", updated.count)
 
     // DELETE.
     step(&mut db, "DELETE FROM users WHERE score < 1.0")?
     step(&mut db, "SELECT name, score, active FROM users ORDER BY name")?
+
+    // DROP takes a table with its rows and its index declarations, in one
+    // commit. The index alone goes the same way, leaving the rows.
+    step(&mut db, "CREATE TABLE scratch (v TEXT)")?
+    step(&mut db, "DROP TABLE scratch")?
+    step(&mut db, "DROP INDEX ON users (name)")?
 
     // COMPACT drops what the rewrites superseded. A commit whose log is half
     // dead already merges the generations that are mostly dead, so this is for
     // reclaiming space on demand rather than for keeping the store healthy.
     step(&mut db, "COMPACT")?
 
-    engine::sync(&mut db)?
+    db.sync()?
 
     // A second engine over the same directory, as a restart would open it.
     println("")
     println("-- reopened --")
-    let mut again = engine::open(dir, false)?
-    println("tables: {}", engine::table_names(&mut again).join(", "))
+    let mut again = engine::open(dir)?
+    println("tables: {}", again.table_names().join(", "))
     step(&mut again, "SELECT name, score FROM users ORDER BY name")?
     Ok(())
 }
@@ -92,13 +106,13 @@ fn run(dir: String) -> Result<(), String> {
 // that does.
 fn step(db: &mut engine::Engine, src: String) -> Result<(), String> {
     println("{}", src)
-    let n, mut res = engine::exec(db, src)?
+    let res = db.exec(src)?
     if res.cols.len() == 0 {
-        println("  OK {}", n)
+        println("  OK {}", res.count)
         return Ok(())
     }
     println("  {}", res.cols.join("|"))
-    for line in engine::render(&mut res) { println("  {}", line) }
+    for line in res.render() { println("  {}", line) }
     Ok(())
 }
 

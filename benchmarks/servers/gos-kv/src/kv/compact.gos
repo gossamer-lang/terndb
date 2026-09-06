@@ -238,7 +238,7 @@ fn move_live(st: &mut kv::Store, merging: Vec<i64>, mf: fs::File, hf: fs::File, 
         // A record the merge cannot read is one it would drop on the floor: the
         // generations it came from are removed once the merge is done, so a
         // record that fails its checksum stops the merge instead.
-        let v = match kv::get(st, k) {
+        let v = match st.get(k) {
             kv::Read::Value(v) => v
             kv::Read::Absent => continue
             kv::Read::Fault(e) => return Err("compact: " + e)
@@ -341,11 +341,11 @@ mod tests {
     }
 
     fn opened(dir: String) -> kv::Store {
-        kv::open(dir, false).unwrap_or_else(|e| panic("open " + dir + ": " + e))
+        kv::open(dir).unwrap_or_else(|e| panic("open " + dir + ": " + e))
     }
 
     fn must_get(st: &mut kv::Store, key: String) -> Vec<u8> {
-        match kv::get(st, key) {
+        match st.get(key) {
             kv::Read::Value(v) => return v
             kv::Read::Fault(e) => panic(e)
             kv::Read::Absent => {
@@ -361,7 +361,7 @@ mod tests {
         let payload: Vec<u8> = #[7u8; 8192]
         let mut i: i64 = 0
         while i < rounds * 8 {
-            assert(kv::put(st, "k/" + (i % 8).to_string(), payload).is_ok())
+            assert(st.put("k/" + (i % 8).to_string(), payload).is_ok())
             i += 1
         }
     }
@@ -370,38 +370,38 @@ mod tests {
     fn compaction_keeps_live_data_and_drops_the_rest() {
         let dir = fresh("compact")
         let mut st = opened(dir)
-        assert(kv::put(&mut st, "keep", #[1u8]).is_ok())
-        assert(kv::put(&mut st, "keep", #[2u8]).is_ok())
-        assert(kv::put(&mut st, "drop", #[3u8]).is_ok())
-        assert_eq(kv::delete(&mut st, "drop").unwrap_or(false), true)
+        assert(st.put("keep", #[1u8]).is_ok())
+        assert(st.put("keep", #[2u8]).is_ok())
+        assert(st.put("drop", #[3u8]).is_ok())
+        assert_eq(st.delete("drop").unwrap_or(false), true)
         assert(st.dead_bytes > 0)
 
         if let Err(e) = kv::compact::run(&mut st) { assert(false, "compact: " + e) }
         assert_eq(must_get(&mut st, "keep"), #[2u8])
-        assert(matches(kv::get(&mut st, "drop"), kv::Read::Absent))
-        assert_eq(kv::len(&mut st), 1)
+        assert(matches(st.get("drop"), kv::Read::Absent))
+        assert_eq(st.len(), 1)
         assert_eq(st.dead_bytes, 0, "compaction reclaims every retired byte")
 
         let mut after = opened(dir)
         assert_eq(must_get(&mut after, "keep"), #[2u8], "the merged generation reloads from its hint")
-        assert(matches(kv::get(&mut after, "drop"), kv::Read::Absent))
-        assert_eq(kv::len(&mut after), 1)
+        assert(matches(after.get("drop"), kv::Read::Absent))
+        assert_eq(after.len(), 1)
     }
 
     #[test]
     fn writes_after_a_compaction_survive_a_restart() {
         let dir = fresh("compact_then_write")
         let mut st = opened(dir)
-        assert(kv::put(&mut st, "old", #[1u8]).is_ok())
+        assert(st.put("old", #[1u8]).is_ok())
         if let Err(e) = kv::compact::run(&mut st) { assert(false, "compact: " + e) }
-        assert(kv::put(&mut st, "new", #[2u8]).is_ok())
-        assert(kv::put(&mut st, "old", #[3u8]).is_ok())
-        assert(kv::sync(&mut st).is_ok())
+        assert(st.put("new", #[2u8]).is_ok())
+        assert(st.put("old", #[3u8]).is_ok())
+        assert(st.sync().is_ok())
 
         let mut after = opened(dir)
         assert_eq(must_get(&mut after, "new"), #[2u8], "a post-compaction append is not lost to a stale hint")
         assert_eq(must_get(&mut after, "old"), #[3u8], "the newer value outranks the merged one")
-        assert_eq(kv::len(&mut after), 2)
+        assert_eq(after.len(), 2)
     }
 
     #[test]
@@ -412,16 +412,16 @@ mod tests {
         while round < 4 {
             let mut i: i64 = 0
             while i < 10 {
-                assert(kv::put(&mut st, "k" + i.to_string(), #[round as u8, i as u8]).is_ok())
+                assert(st.put("k" + i.to_string(), #[round as u8, i as u8]).is_ok())
                 i += 1
             }
-            assert_eq(kv::delete(&mut st, "k" + round.to_string()).unwrap_or(false), true)
+            assert_eq(st.delete("k" + round.to_string()).unwrap_or(false), true)
             if let Err(e) = kv::compact::run(&mut st) { assert(false, "compact round " + round.to_string() + ": " + e) }
-            assert_eq(kv::len(&mut st), 9, "round " + round.to_string())
+            assert_eq(st.len(), 9, "round " + round.to_string())
             round += 1
         }
         let mut after = opened(dir)
-        assert_eq(kv::len(&mut after), 9)
+        assert_eq(after.len(), 9)
         assert_eq(must_get(&mut after, "k5"), #[3u8, 5u8])
     }
 
@@ -429,7 +429,7 @@ mod tests {
     fn compaction_leaves_only_the_merged_and_active_generations() {
         let dir = fresh("compact_files")
         let mut st = opened(dir)
-        assert(kv::put(&mut st, "k", #[1u8]).is_ok())
+        assert(st.put("k", #[1u8]).is_ok())
         if let Err(e) = kv::compact::run(&mut st) { assert(false, e) }
         let mut data_files: i64 = 0
         for e in fs::read_dir(dir).unwrap_or(#[]) {
@@ -442,9 +442,9 @@ mod tests {
     fn dead_ratio_tracks_the_superseded_share() {
         let mut st = opened(fresh("ratio"))
         assert_eq(super::dead_ratio(&mut st), 0.0, "an empty store has nothing dead")
-        assert(kv::put(&mut st, "k", #[0u8; 100]).is_ok())
+        assert(st.put("k", #[0u8; 100]).is_ok())
         assert_eq(super::dead_ratio(&mut st), 0.0)
-        assert(kv::put(&mut st, "k", #[0u8; 100]).is_ok())
+        assert(st.put("k", #[0u8; 100]).is_ok())
         assert(super::dead_ratio(&mut st) > 0.4, "one of two equal records is now dead")
         assert(super::dead_ratio(&mut st) < 0.6)
         if let Err(e) = kv::compact::run(&mut st) { assert(false, e) }
@@ -458,16 +458,16 @@ mod tests {
         churn(&mut st, 20)
         // A generation past the first is one a merge opened.
         assert(st.gen > 1, "the log merged itself, gen is " + st.gen.to_string())
-        assert_eq(kv::len(&mut st), 8)
+        assert_eq(st.len(), 8)
         let mut j: i64 = 0
         while j < 8 {
             assert_eq(must_get(&mut st, "k/" + j.to_string()).len(), 8192, "key " + j.to_string())
             j += 1
         }
         // Every merged record is still there after a restart.
-        assert(kv::sync(&mut st).is_ok())
+        assert(st.sync().is_ok())
         let mut after = opened(dir)
-        assert_eq(kv::len(&mut after), 8)
+        assert_eq(after.len(), 8)
         assert_eq(must_get(&mut after, "k/3").len(), 8192)
     }
 
@@ -479,7 +479,7 @@ mod tests {
         // A cold set, sealed into a generation of its own and never touched again.
         let mut i: i64 = 0
         while i < 160 {
-            assert(kv::put(&mut st, "cold/" + i.to_string(), payload).is_ok())
+            assert(st.put("cold/" + i.to_string(), payload).is_ok())
             i += 1
         }
         assert(kv::compact::run(&mut st).is_ok())
@@ -489,7 +489,7 @@ mod tests {
         // A hot set churned until the store merges itself.
         let mut h: i64 = 0
         while h < 400 {
-            assert(kv::put(&mut st, "hot/" + (h % 4).to_string(), payload).is_ok())
+            assert(st.put("hot/" + (h % 4).to_string(), payload).is_ok())
             h += 1
         }
         assert(st.gen > cold_gen + 1, "the store merged itself again")
@@ -497,13 +497,13 @@ mod tests {
             "a generation with nothing dead in it is left where it is")
 
         // And every record is still readable, from both sets.
-        assert_eq(kv::len(&mut st), 164)
+        assert_eq(st.len(), 164)
         assert_eq(must_get(&mut st, "cold/0").len(), 8192)
         assert_eq(must_get(&mut st, "cold/159").len(), 8192)
         assert_eq(must_get(&mut st, "hot/3").len(), 8192)
-        assert(kv::sync(&mut st).is_ok())
+        assert(st.sync().is_ok())
         let mut after = opened(dir)
-        assert_eq(kv::len(&mut after), 164)
+        assert_eq(after.len(), 164)
         assert_eq(must_get(&mut after, "cold/80").len(), 8192)
         assert_eq(must_get(&mut after, "hot/1").len(), 8192)
     }
@@ -516,16 +516,16 @@ mod tests {
         let payload: Vec<u8> = #[7u8; 4096]
         let mut i: i64 = 0
         while i < 40 {
-            assert(kv::put(&mut st, "cold/" + i.to_string(), payload).is_ok())
+            assert(st.put("cold/" + i.to_string(), payload).is_ok())
             i += 1
         }
         assert(kv::compact::run(&mut st).is_ok())
         let cold_gen = st.gen - 1
-        assert(kv::put(&mut st, "hot", payload).is_ok())
+        assert(st.put("hot", payload).is_ok())
         // COMPACT means the whole store, so the clean generation goes too.
         assert(kv::compact::run(&mut st).is_ok())
         assert(!fs::is_file(kv::log::data_path(dir, cold_gen)), "an explicit merge leaves nothing behind")
-        assert_eq(kv::len(&mut st), 41)
+        assert_eq(st.len(), 41)
         assert_eq(must_get(&mut st, "cold/7").len(), 4096)
         assert_eq(super::dead_ratio(&mut st), 0.0)
     }
@@ -538,10 +538,10 @@ mod tests {
         churn(&mut st, 20)
         assert_eq(st.gen, 1, "nothing merged the log")
         assert(super::dead_ratio(&mut st) > 0.5)
-        assert_eq(kv::len(&mut st), 8)
+        assert_eq(st.len(), 8)
         assert(kv::compact::run(&mut st).is_ok())
         assert_eq(super::dead_ratio(&mut st), 0.0)
-        assert_eq(kv::len(&mut st), 8)
+        assert_eq(st.len(), 8)
         assert_eq(must_get(&mut st, "k/5").len(), 8192)
     }
 
@@ -550,11 +550,11 @@ mod tests {
         let mut st = opened(fresh("small_no_compact"))
         let mut i: i64 = 0
         while i < 40 {
-            assert(kv::put(&mut st, "k", #[1u8, 2u8, 3u8]).is_ok())
+            assert(st.put("k", #[1u8, 2u8, 3u8]).is_ok())
             i += 1
         }
         assert_eq(st.gen, 1, "a store this small is left alone")
         assert(super::dead_ratio(&mut st) > 0.9)
-        assert_eq(kv::len(&mut st), 1)
+        assert_eq(st.len(), 1)
     }
 }

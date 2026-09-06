@@ -226,11 +226,11 @@ mod tests {
     #[test]
     fn a_row_renders_as_json_without_materialising_values() {
         let mut buf: Vec<u8> = #[]
-        codec::encode_into(&mut buf, codec::v_text("user-1"))
-        codec::encode_into(&mut buf, codec::v_text("u\"q\\b"))
-        codec::encode_into(&mut buf, codec::v_f64(1.5))
-        codec::encode_into(&mut buf, codec::v_bool(true))
-        codec::encode_into(&mut buf, codec::v_nil())
+        codec::encode_into(&mut buf, codec::Value::text("user-1"))
+        codec::encode_into(&mut buf, codec::Value::text("u\"q\\b"))
+        codec::encode_into(&mut buf, codec::Value::float(1.5))
+        codec::encode_into(&mut buf, codec::Value::bool(true))
+        codec::encode_into(&mut buf, codec::Value::nil())
         assert_eq(super::render(buf, super::keys(#["name", "email", "score", "active", "note"]), 7)
             "{\"id\":7,\"name\":\"user-1\",\"email\":\"u\\\"q\\\\b\",\"score\":1.5,\"active\":true,\"note\":null}")
         assert_eq(super::render(buf.slice(0, 5).unwrap_or(#[]), super::keys(#["name"]), 1), "", "a truncated row is refused")
@@ -243,37 +243,37 @@ mod tests {
         // whole, which is what this pins.
         let raw = "é\"🌍\\x\u{1}y\tz"
         let mut buf: Vec<u8> = #[]
-        codec::encode_into(&mut buf, codec::v_text(raw))
+        codec::encode_into(&mut buf, codec::Value::text(raw))
         assert_eq(super::render(buf, super::keys(#["t"]), 3)
             "{\"id\":3,\"t\":\"é\\\"🌍\\\\x\\u0001y\\tz\"}")
         // A text column with nothing to escape, and an empty one.
         let mut plain: Vec<u8> = #[]
-        codec::encode_into(&mut plain, codec::v_text("héllo 🌍"))
-        codec::encode_into(&mut plain, codec::v_text(""))
+        codec::encode_into(&mut plain, codec::Value::text("héllo 🌍"))
+        codec::encode_into(&mut plain, codec::Value::text(""))
         assert_eq(super::render(plain, super::keys(#["a", "b"]), 1)
             "{\"id\":1,\"a\":\"héllo 🌍\",\"b\":\"\"}")
         // A row whose text length runs past the buffer is refused rather than
         // rendered short.
         let mut cut: Vec<u8> = #[]
-        codec::encode_into(&mut cut, codec::v_text("abcdefgh"))
+        codec::encode_into(&mut cut, codec::Value::text("abcdefgh"))
         assert_eq(super::render(cut.slice(0, 8).unwrap_or(#[]), super::keys(#["a"]), 1), "")
     }
 
     #[test]
     fn every_rendered_column_matches_the_value_it_encodes() {
-        let vals = #[codec::v_i8(-8), codec::v_i16(-300), codec::v_i32(70_000), codec::v_i64(-9_007_199_254_740_993)
-            codec::v_f32(0.5), codec::v_dt(1_699_999_999_000), codec::v_bool(false), codec::v_text("héllo 🌍")]
+        let vals = #[codec::Value::int8(-8), codec::Value::int16(-300), codec::Value::int32(70_000), codec::Value::int(-9_007_199_254_740_993)
+            codec::Value::float32(0.5), codec::Value::datetime(1_699_999_999_000), codec::Value::bool(false), codec::Value::text("héllo 🌍")]
         let mut buf: Vec<u8> = #[]
         for v in vals { codec::encode_into(&mut buf, v) }
         let mut names: Vec<String> = #[]
         for i in 0..vals.len() { names.push("c" + i.to_string()) }
         let out = super::render(buf, super::keys(names), 1)
-        // Every column renders what `value_to_string` renders, quoted where
+        // Every column renders what Display renders, quoted where
         // JSON asks for a string.
         let mut want = "{\"id\":1"
         for i in 0..vals.len() {
             let v = vals[i]
-            let cell = codec::value_to_string(v)
+            let cell = v.to_string()
             let quoted = v.tag == codec::TAG_TEXT || v.tag == codec::TAG_DT
             want = want + ",\"" + names[i] + "\":" + (if quoted { "\"" + cell + "\"" } else { cell })
         }
@@ -283,8 +283,8 @@ mod tests {
 
     #[test]
     fn a_value_renders_the_same_alone_as_it_does_in_a_row() {
-        let vals = #[codec::v_nil(), codec::v_bool(true), codec::v_i32(5), codec::v_f64(2.5)
-            codec::v_text("a\"b"), codec::v_dt(0)]
+        let vals = #[codec::Value::nil(), codec::Value::bool(true), codec::Value::int32(5), codec::Value::float(2.5)
+            codec::Value::text("a\"b"), codec::Value::datetime(0)]
         for v in vals {
             let mut buf: Vec<u8> = #[]
             codec::encode_into(&mut buf, v)

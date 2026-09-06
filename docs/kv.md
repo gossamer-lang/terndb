@@ -12,14 +12,16 @@ of, which is what a request handler usually has.
 
 ## One table, read repeatedly
 
-`engine::cache::plans()` holds a cache; `cache::row_json` resolves the table
-once and reads every later row straight from the store.
+`Plans::new()` holds a cache; `cache.row_json` resolves the table once and reads
+every later row straight from the store.
 
 ```gossamer
-let mut db = engine::open("/var/lib/users", true)?
-let mut cache = engine::cache::plans()
+use terndb::engine::cache::Plans
 
-let row = engine::cache::row_json(&mut db, &mut cache, "users", 1)?
+let mut db = engine::open("/var/lib/users", read_only: true)?
+let mut cache = Plans::new()
+
+let row = cache.row_json(&mut db, "users", 1)?
 // {"id":1,"name":"ada","email":"ada@example.com","score":9.5,"active":true}
 
 if row.len() == 0 { /* no such row */ }
@@ -36,23 +38,23 @@ path, with the projection the statement asks for:
 ```gossamer
 let mut plan = engine::plan::prepare(&mut db, "SELECT * FROM users WHERE rowid = ?")?
 
-let json = engine::plan::read_json(&mut db, &mut plan, 1)?
+let json = plan.read_json(&mut db, 1)?
 ```
 
-`plan::read_json` renders; `plan::read_row` hands back the typed values instead, into a
+`read_json` renders; `read_row` hands back the typed values instead, into a
 buffer the caller owns and reuses:
 
 ```gossamer
 let mut vals: Vec<codec::Value> = #[]
-if engine::plan::read_row(&mut db, &mut plan, 1, &mut vals)? {
-    println("{}", codec::value_to_string(vals[0]))   // ada
+if plan.read_row(&mut db, 1, &mut vals)? {
+    println("{}", vals[0])   // ada
 }
 ```
 
-`engine::plan::read_bytes(&mut db, &mut plan, id)` answers the encoded record for a
-caller that renders it itself, as a `kv::Read`. All three take a statement a
-single read can answer, and nothing else: `plan::read_row` and `plan::read_json` reject
-one that would need a walk rather than quietly turning into a scan.
+`plan.read_bytes(&mut db, id)` answers the encoded record for a caller that
+renders it itself, as a `kv::Read`. All three take a statement a single read can
+answer, and nothing else: `read_row` and `read_json` reject one that would need a
+walk rather than quietly turning into a scan.
 
 ### Straight at the store
 
@@ -74,13 +76,13 @@ kv::rows::last_id(&mut db.store, tid)    // the highest id ever assigned
 A read answers `Absent` for a row the store does not hold, and `Fault` for one it
 holds and cannot produce: a record that fails its checksum, or a generation file
 that will not open, is reported rather than answered as an absence. The same
-distinction runs through the layers above - `engine::cache::row_json` and a
-`SELECT` report it too, so a damaged row never reads as a row that was never
+distinction runs through the layers above - `cache.row_json` and a `SELECT`
+report it too, so a damaged row never reads as a row that was never
 written.
 
 `kv` is also a key-value store in its own right, for data that is not a table
-row: `kv::put`, `kv::get`, `kv::delete`, `kv::contains`, and `kv::scan::pairs` /
-`kv::scan::keys` over a key prefix. Rows and plain keys share one log, one index
+row: `db.store.put`, `.get`, `.delete`, `.contains`, `.len`, and
+`kv::scan::pairs` / `kv::scan::keys` over a key prefix. Rows and plain keys share one log, one index
 and one commit, so a batch between `kv::batch::begin` and `kv::batch::commit`
 covers both.
 

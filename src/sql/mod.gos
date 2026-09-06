@@ -2,10 +2,12 @@ use crate::codec
 
 // terndb SQL: a hand-written lexer and recursive-descent parser for the subset
 //
-//   CREATE TABLE t (col TYPE, ...)
-//   CREATE INDEX ON t (col)
-//   INSERT INTO t VALUES (v, ...), (...)
-//   SELECT cols | * | COUNT(*) FROM t [WHERE c OP v AND ...] [ORDER BY col [ASC|DESC]] [LIMIT n]
+//   CREATE TABLE [IF NOT EXISTS] t (col TYPE, ...)
+//   CREATE INDEX [IF NOT EXISTS] ON t (col)
+//   DROP TABLE [IF EXISTS] t
+//   DROP INDEX [IF EXISTS] ON t (col)
+//   INSERT INTO t [(col, ...)] VALUES (v, ...), (...)
+//   SELECT cols | * | COUNT(*) FROM t [WHERE c OP v AND ...] [ORDER BY col [ASC|DESC]] [LIMIT n [OFFSET m]]
 //   UPDATE t SET col = v, ... [WHERE ...]
 //   DELETE FROM t [WHERE ...]
 //   COMPACT
@@ -59,13 +61,18 @@ pub struct Query {
     pub has_order: bool
     /// The row limit, or -1 for none.
     pub limit: i64
+    /// Rows to skip before the limit is counted, 0 for none.
+    pub offset: i64
 }
 
 /// A parsed statement.
 pub enum Stmt {
-    Create { name: String, cols: Vec<(String, u8)> }
-    CreateIndex { table: String, col: String }
-    Insert { table: String, rows: Vec<Vec<codec::Value>> }
+    Create { name: String, cols: Vec<(String, u8)>, if_not_exists: bool }
+    CreateIndex { table: String, col: String, if_not_exists: bool }
+    Drop { table: String, if_exists: bool }
+    DropIndex { table: String, col: String, if_exists: bool }
+    /// The columns named before VALUES, empty when the rows are positional.
+    Insert { table: String, cols: Vec<String>, rows: Vec<Vec<codec::Value>> }
     Select(Query)
     Update { table: String, sets: Vec<(String, codec::Value)>, conds: Vec<Cond> }
     Delete { table: String, conds: Vec<Cond> }
@@ -88,7 +95,7 @@ pub fn op_text(op: u8) -> String {
 pub fn op_code(text: String) -> Option<u8> {
     match text {
         "=" => Some(OP_EQ)
-        "!=" => Some(OP_NE)
+        "!=" | "<>" => Some(OP_NE)
         "<" => Some(OP_LT)
         ">" => Some(OP_GT)
         "<=" => Some(OP_LE)

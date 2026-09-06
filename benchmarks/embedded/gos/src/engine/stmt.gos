@@ -7,42 +7,113 @@ use super::scan
 // One statement carried out against the store, from the `Stmt` the parser
 // produced.
 
-pub (package) fn create(eng: &mut engine::Engine, name: String, cols: Vec<(String, u8)>) -> Result<(i64, engine::QueryResult), String> {
+pub (package) fn create(eng: &mut engine::Engine, name: String, cols: Vec<(String, u8)>, if_not_exists: bool) -> Result<engine::QueryResult, String> {
     engine::read_only_refuses(eng)?
-    if eng.tables.contains(name) { return Err("table already exists: " + name) }
+    if eng.tables.contains(name) {
+        if if_not_exists { return Ok(engine::empty_result()) }
+        return Err("table already exists: " + name)
+    }
     let mut def = engine::TableDef { name: name, cols: #[], tags: #[] }
     for (col, tag) in cols {
         def.cols.push(col)
         def.tags.push(tag)
     }
-    kv::put(&mut eng.store, engine::schema_key(name), schema::encode(def))?
+    eng.store.put(engine::schema_key(name), schema::encode(def))?
     eng.tables.insert(name, def)
     // The row index is opened with the table, so every later statement resolves
     // it by lookup: a read that opened one would be writing to a store its
     // fellow readers are reading.
     let _ = kv::rows::open_table(&mut eng.store, name)
     eng.next_rowid.insert(name, 1)
-    Ok((0, engine::empty_result()))
+    Ok(engine::empty_result())
 }
 
-pub (package) fn create_index(eng: &mut engine::Engine, table: String, col: String) -> Result<(i64, engine::QueryResult), String> {
+pub (package) fn create_index(eng: &mut engine::Engine, table: String, col: String, if_not_exists: bool) -> Result<engine::QueryResult, String> {
     engine::read_only_refuses(eng)?
     let mut def = engine::get_def(eng, table)?
     let ci = schema::col_index(&mut def, col)?
     let name = def.cols[ci]
     if index::of(eng, table, name) >= 0 {
+        if if_not_exists { return Ok(engine::empty_result()) }
         return Err("create index: " + table + "." + name + " is already indexed")
     }
     // The declaration is what the store keeps; the index is built from the rows
     // here and again at every open, so it is never stale and never in the log.
-    kv::put(&mut eng.store, index::declaration_key(table, name), #[])?
+    eng.store.put(index::declaration_key(table, name), #[])?
     index::attach(eng, table, name, ci)?
-    Ok((0, engine::empty_result()))
+    Ok(engine::empty_result())
 }
 
-pub (package) fn insert(eng: &mut engine::Engine, table: String, rows: Vec<Vec<codec::Value>>) -> Result<(i64, engine::QueryResult), String> {
+/// Removes a table: its rows, its index declarations and its schema entry.
+///
+/// The rows and the declarations go in one batch with the schema key, so a
+/// table is either whole or gone; nothing on disk names a table the catalogue
+/// does not hold.
+pub (package) fn drop_table(eng: &mut engine::Engine, table: String, if_exists: bool) -> Result<engine::QueryResult, String> {
+    engine::read_only_refuses(eng)?
+    if !eng.tables.contains(table) {
+        if if_exists { return Ok(engine::empty_result()) }
+        return Err("no such table: " + table)
+    }
+    let def = engine::get_def(eng, table)?
+    let tid = kv::rows::table_id(&mut eng.store, table)
+    let mut ids: Vec<i64> = #[]
+    if tid >= 0 {
+        let top = kv::rows::last_id(&mut eng.store, tid)
+        let mut rid: i64 = 1
+        while rid <= top {
+            if kv::rows::holds(&mut eng.store, tid, rid) { ids.push(rid) }
+            rid += 1
+        }
+    }
+    let mut declarations: Vec<String> = #[]
+    for col in def.cols {
+        let key = index::declaration_key(table, col)
+        if eng.store.contains(key) { declarations.push(key) }
+    }
+    kv::batch::begin(&mut eng.store)?
+    for rid in ids {
+        if let Err(e) = kv::rows::remove(&mut eng.store, tid, rid) {
+            return Err(kv::batch::undo(&mut eng.store, e))
+        }
+    }
+    for key in declarations {
+        if let Err(e) = eng.store.delete(key) {
+            return Err(kv::batch::undo(&mut eng.store, e))
+        }
+    }
+    if let Err(e) = eng.store.delete(engine::schema_key(table)) {
+        return Err(kv::batch::undo(&mut eng.store, e))
+    }
+    kv::batch::commit(&mut eng.store)?
+    index::detach_table(eng, table)
+    eng.tables.remove(table)
+    eng.next_rowid.remove(table)
+    engine::affected(ids.len())
+}
+
+/// Removes an index declaration, leaving the rows it filed as they are.
+pub (package) fn drop_index(eng: &mut engine::Engine, table: String, col: String, if_exists: bool) -> Result<engine::QueryResult, String> {
     engine::read_only_refuses(eng)?
     let mut def = engine::get_def(eng, table)?
+    let ci = schema::col_index(&mut def, col)?
+    let name = def.cols[ci]
+    if index::of(eng, table, name) < 0 {
+        if if_exists { return Ok(engine::empty_result()) }
+        return Err("drop index: " + table + "." + name + " is not indexed")
+    }
+    eng.store.delete(index::declaration_key(table, name))?
+    index::detach(eng, table, name)
+    Ok(engine::empty_result())
+}
+
+pub (package) fn insert(eng: &mut engine::Engine, table: String, cols: Vec<String>, rows: Vec<Vec<codec::Value>>) -> Result<engine::QueryResult, String> {
+    engine::read_only_refuses(eng)?
+    let mut def = engine::get_def(eng, table)?
+    // A statement naming its columns supplies those and leaves the rest NULL;
+    // the positional form supplies every column in declaration order.
+    let mut picks: Vec<i64> = #[]
+    for c in cols { picks.push(schema::col_index(&mut def, c)?) }
     // Every row is narrowed before any is written, so a rejected statement
     // leaves the table exactly as it found it.
     let mut encoded: Vec<Vec<u8>> = #[]
@@ -51,13 +122,21 @@ pub (package) fn insert(eng: &mut engine::Engine, table: String, rows: Vec<Vec<c
     let indexed = index::covers(eng, table)
     let mut narrowed: Vec<Vec<codec::Value>> = #[]
     for invals in rows {
-        if invals.len() != def.cols.len() {
-            return Err("insert: table " + table + " has " + def.cols.len().to_string() +
-                " columns, got " + invals.len().to_string() + " values")
+        let wanted = if picks.len() > 0 { picks.len() } else { def.cols.len() }
+        if invals.len() != wanted {
+            return Err("insert: " + table + " takes " + wanted.to_string() +
+                " value(s) here, got " + invals.len().to_string())
         }
         let mut vals: Vec<codec::Value> = #[]
-        for c in 0..invals.len() {
-            vals.push(schema::coerce(invals[c], def.tags[c], def.cols[c])?)
+        if picks.len() > 0 {
+            for c in 0..def.cols.len() { vals.push(codec::Value::nil()) }
+            for c in 0..picks.len() {
+                vals[picks[c]] = schema::coerce(invals[c], def.tags[picks[c]], def.cols[picks[c]])?
+            }
+        } else {
+            for c in 0..invals.len() {
+                vals.push(schema::coerce(invals[c], def.tags[c], def.cols[c])?)
+            }
         }
         encoded.push(schema::encode_row(vals))
         if indexed { narrowed.push(vals) }
@@ -80,25 +159,25 @@ pub (package) fn insert(eng: &mut engine::Engine, table: String, rows: Vec<Vec<c
     for r in 0..narrowed.len() {
         index::row_added(eng, table, first_rid + r, narrowed[r])
     }
-    Ok((encoded.len(), engine::empty_result()))
+    engine::affected(encoded.len())
 }
 
-pub (package) fn select(eng: &mut engine::Engine, q: sql::Query) -> Result<(i64, engine::QueryResult), String> {
+pub (package) fn select(eng: &mut engine::Engine, q: sql::Query) -> Result<engine::QueryResult, String> {
     let mut def = engine::get_def(eng, q.table)?
     let filter = filter::compile(&mut def, q.conds)?
     let want = if q.count_only { scan::Want::Count } else { scan::Want::Values }
     // A statement that names one row by its id is answered by the one read
     // that holds it, the way a prepared `WHERE rowid = ?` is: the walk exists
     // to find rows the key does not already name.
-    if names_one_row(filter, q.has_order, q.limit) {
+    if names_one_row(filter, q.has_order, q.limit) && q.offset == 0 {
         return by_id(eng, &mut def, q.cols, q.count_only, filter.id_vals[0])
     }
     // An ORDER BY has to see every match before it can say which ones survive
     // the limit; without one, the walk stops as soon as the limit is filled.
-    let cap = if q.has_order { -1 } else { q.limit }
+    let cap = if q.has_order || q.limit < 0 { -1 } else { q.limit + q.offset }
     let matched, mut kept = scan::table(eng, &mut def, filter, want, cap)?
     if q.count_only {
-        return engine::counted(if q.limit >= 0 && matched > q.limit { q.limit } else { matched })
+        return engine::counted(engine::window_count(matched, q.offset, q.limit))
     }
     if q.has_order {
         let oi = schema::col_index(&mut def, q.order_col)?
@@ -107,9 +186,8 @@ pub (package) fn select(eng: &mut engine::Engine, q: sql::Query) -> Result<(i64,
         } else {
             kept.sort_by(|a, b| schema::cmp_vals(b.vals[oi], a.vals[oi]))
         }
-        if q.limit >= 0 && kept.len() > q.limit { kept.truncate(q.limit) }
     }
-    project(&mut def, q.cols, kept)
+    project(&mut def, q.cols, engine::window(kept, q.offset, q.limit))
 }
 
 // Whether the statement names one row by its id and nothing else, which one
@@ -120,7 +198,7 @@ fn names_one_row(filter: filter::Filter, has_order: bool, limit: i64) -> bool {
 }
 
 // The one row `rid` names, projected the way the statement asked for it.
-fn by_id(eng: &mut engine::Engine, def: &mut engine::TableDef, cols: Vec<String>, count_only: bool, rid: i64) -> Result<(i64, engine::QueryResult), String> {
+fn by_id(eng: &mut engine::Engine, def: &mut engine::TableDef, cols: Vec<String>, count_only: bool, rid: i64) -> Result<engine::QueryResult, String> {
     let tid = kv::rows::table_id(&mut eng.store, def.name)
     if count_only {
         return engine::counted(if kv::rows::holds(&mut eng.store, tid, rid) { 1 } else { 0 })
@@ -141,7 +219,7 @@ fn by_id(eng: &mut engine::Engine, def: &mut engine::TableDef, cols: Vec<String>
 /// The columns a SELECT answers, given the rows its plan produced: the rows as
 /// they stand when the projection names every column in order, and the picked
 /// columns in the order they were written otherwise.
-fn project(def: &mut engine::TableDef, cols: Vec<String>, kept: Vec<engine::Row>) -> Result<(i64, engine::QueryResult), String> {
+fn project(def: &mut engine::TableDef, cols: Vec<String>, kept: Vec<engine::Row>) -> Result<engine::QueryResult, String> {
     let mut out_cols: Vec<String> = #[]
     let mut picks: Vec<i64> = #[]
     if cols.len() == 0 {
@@ -161,7 +239,7 @@ fn project(def: &mut engine::TableDef, cols: Vec<String>, kept: Vec<engine::Row>
         for i in 0..picks.len() {
             if picks[i] != i { identity = false; break }
         }
-        if identity { return Ok((kept.len(), engine::QueryResult { cols: out_cols, rows: kept })) }
+        if identity { return Ok(engine::QueryResult { cols: out_cols, rows: kept, count: kept.len() }) }
     }
     let mut projected: Vec<engine::Row> = #[]
     for row in kept {
@@ -169,10 +247,10 @@ fn project(def: &mut engine::TableDef, cols: Vec<String>, kept: Vec<engine::Row>
         for i in picks { vals.push(row.vals[i]) }
         projected.push(engine::Row { rowid: row.rowid, vals: vals })
     }
-    Ok((projected.len(), engine::QueryResult { cols: out_cols, rows: projected }))
+    Ok(engine::QueryResult { cols: out_cols, rows: projected, count: projected.len() })
 }
 
-pub (package) fn update(eng: &mut engine::Engine, table: String, sets: Vec<(String, codec::Value)>, conds: Vec<sql::Cond>) -> Result<(i64, engine::QueryResult), String> {
+pub (package) fn update(eng: &mut engine::Engine, table: String, sets: Vec<(String, codec::Value)>, conds: Vec<sql::Cond>) -> Result<engine::QueryResult, String> {
     engine::read_only_refuses(eng)?
     let mut def = engine::get_def(eng, table)?
     let filter = filter::compile(&mut def, conds)?
@@ -209,10 +287,10 @@ pub (package) fn update(eng: &mut engine::Engine, table: String, sets: Vec<(Stri
         index::row_removed(eng, table, writes[w].0, before[w])
         index::row_added(eng, table, writes[w].0, after[w])
     }
-    Ok((writes.len(), engine::empty_result()))
+    engine::affected(writes.len())
 }
 
-pub (package) fn delete(eng: &mut engine::Engine, table: String, conds: Vec<sql::Cond>) -> Result<(i64, engine::QueryResult), String> {
+pub (package) fn delete(eng: &mut engine::Engine, table: String, conds: Vec<sql::Cond>) -> Result<engine::QueryResult, String> {
     engine::read_only_refuses(eng)?
     let mut def = engine::get_def(eng, table)?
     let filter = filter::compile(&mut def, conds)?
@@ -238,7 +316,7 @@ pub (package) fn delete(eng: &mut engine::Engine, table: String, conds: Vec<sql:
     for d in 0..gone.len() {
         index::row_removed(eng, table, ids[d], gone[d])
     }
-    Ok((ids.len(), engine::empty_result()))
+    engine::affected(ids.len())
 }
 
 #[cfg(test)]
@@ -258,8 +336,8 @@ mod tests {
     }
 
     fn run(eng: &mut engine::Engine, src: String) -> i64 {
-        match engine::exec(eng, src) {
-            Ok((n, _)) => return n
+        match eng.exec(src) {
+            Ok(res) => return res.count
             Err(e) => {
                 assert(false, src + " -> " + e)
                 return -1
@@ -268,12 +346,12 @@ mod tests {
     }
 
     fn rows(eng: &mut engine::Engine, src: String) -> Vec<Vec<String>> {
-        match engine::exec(eng, src) {
-            Ok((_, res)) => {
+        match eng.exec(src) {
+            Ok(res) => {
                 let mut out: Vec<Vec<String>> = #[]
                 for row in res.rows {
                     let mut cells: Vec<String> = #[]
-                    for v in row.vals { cells.push(codec::value_to_string(v)) }
+                    for v in row.vals { cells.push(v.to_string()) }
                     out.push(cells)
                 }
                 return out
@@ -308,7 +386,7 @@ mod tests {
         let got = rows(&mut eng, "SELECT age, name FROM users WHERE name = 'bob'")
         assert_eq(got, #[#["40", "bob"]], "columns come back in the order asked for")
         assert_eq(rows(&mut eng, "SELECT name FROM users WHERE name = 'bob'"), #[#["bob"]])
-        assert(engine::exec(&mut eng, "SELECT nope FROM users").is_err(), "an unknown column is an error")
+        assert(eng.exec("SELECT nope FROM users").is_err(), "an unknown column is an error")
     }
 
     #[test]
@@ -402,7 +480,7 @@ mod tests {
         let mut eng = opened(fresh("atomic_insert"))
         assert_eq(run(&mut eng, "CREATE TABLE t (a INT8)"), 0)
         assert_eq(run(&mut eng, "INSERT INTO t VALUES (1)"), 1)
-        assert(engine::exec(&mut eng, "INSERT INTO t VALUES (2), (999)").is_err(), "999 does not fit an INT8")
+        assert(eng.exec("INSERT INTO t VALUES (2), (999)").is_err(), "999 does not fit an INT8")
         assert_eq(run(&mut eng, "SELECT * FROM t"), 1, "neither row of the rejected statement was written")
     }
 
@@ -410,8 +488,8 @@ mod tests {
     fn insert_checks_the_value_count() {
         let mut eng = opened(fresh("arity"))
         assert_eq(run(&mut eng, "CREATE TABLE t (a INT32, b TEXT)"), 0)
-        assert(engine::exec(&mut eng, "INSERT INTO t VALUES (1)").is_err())
-        assert(engine::exec(&mut eng, "INSERT INTO t VALUES (1, 'x', 2)").is_err())
+        assert(eng.exec("INSERT INTO t VALUES (1)").is_err())
+        assert(eng.exec("INSERT INTO t VALUES (1, 'x', 2)").is_err())
         assert_eq(run(&mut eng, "INSERT INTO t VALUES (1, 'x')"), 1)
     }
 
@@ -425,7 +503,7 @@ mod tests {
         assert_eq(run(&mut eng, "CREATE TABLE t (v TEXT, n INT32)"), 0)
         assert_eq(run(&mut eng, "INSERT INTO t VALUES ('zzzzzzzz', 1), ('wwwwwwww', 2)"), 2)
         assert_eq(run(&mut eng, "COMPACT"), 0)
-        assert(engine::sync(&mut eng).is_ok())
+        assert(eng.sync().is_ok())
 
         let sealed = kv::log::data_generations(dir).unwrap_or(#[])[0]
         let path = kv::log::data_path(dir, sealed)
@@ -454,17 +532,17 @@ mod tests {
         assert(fs::write(path, bytes).is_ok())
 
         let mut after = opened(dir)
-        match engine::exec(&mut after, "SELECT v FROM t") {
+        match after.exec("SELECT v FROM t") {
             Ok(_) => assert(false, "a walk over a row it cannot read must report it")
             Err(e) => assert(e.contains("checksum mismatch"), "got: " + e)
         }
-        match engine::exec(&mut after, "SELECT v FROM t WHERE rowid = 1") {
+        match after.exec("SELECT v FROM t WHERE rowid = 1") {
             Ok(_) => assert(false, "so must the keyed read")
             Err(e) => assert(e.contains("checksum mismatch"), "got: " + e)
         }
         assert_eq(rows(&mut after, "SELECT v FROM t WHERE rowid = 2"), #[#["wwwwwwww"]]
             "the row beside it still answers")
-        assert(engine::exec(&mut after, "CREATE INDEX ON t (v)").is_err()
+        assert(after.exec("CREATE INDEX ON t (v)").is_err()
             "and an index over the table is not built around what it cannot read")
     }
 }

@@ -47,7 +47,7 @@ fn exec(args: Vec<String>, out: Fn(String), err: Fn(String)) -> i64 {
         if !run(&mut eng, args[i], out, err) { failed = true }
         i += 1
     }
-    if let Err(e) = engine::sync(&mut eng) { return fail(err, e) }
+    if let Err(e) = eng.sync() { return fail(err, e) }
     if failed { EXIT_FAILED } else { 0 }
 }
 
@@ -70,7 +70,7 @@ fn shell(args: Vec<String>, out: Fn(String), err: Fn(String)) -> i64 {
         if is_quit(src) { break }
         let _ = run(&mut eng, src, out, err)
     }
-    if let Err(e) = engine::sync(&mut eng) { return fail(err, e) }
+    if let Err(e) = eng.sync() { return fail(err, e) }
     0
 }
 
@@ -118,19 +118,19 @@ fn is_quit(src: String) -> bool {
 // What the open read past in the log. A store that recovered to its last good
 // commit still answers, and this is what says so before it does.
 fn report_faults(eng: &mut engine::Engine, err: Fn(String)) {
-    for fault in engine::faults(eng) { err("terndb: " + fault) }
+    for fault in eng.faults() { err("terndb: " + fault) }
 }
 
 // A statement prints its rows, or its count when it returns none; a rejected
 // one goes to stderr so a pipeline reading stdout sees only results.
 fn run(eng: &mut engine::Engine, src: String, out: Fn(String), err: Fn(String)) -> bool {
-    match engine::exec(eng, src) {
-        Ok((n, mut res)) => {
+    match eng.exec(src) {
+        Ok(mut res) => {
             if res.cols.len() == 0 {
-                out("OK " + n.to_string())
+                out("OK " + res.count.to_string())
             } else {
                 out(res.cols.join("|"))
-                for line in engine::render(&mut res) { out(line) }
+                for line in res.render() { out(line) }
             }
             true
         }
@@ -149,11 +149,12 @@ fn fail(err: Fn(String), msg: String) -> i64 {
 }
 
 fn usage(out: Fn(String)) -> i64 {
-    out("terndb 0.1.0 - a small structured key-value store with a light SQL front")
+    out("terndb 0.2.0 - a small structured key-value store with a light SQL front")
     out("")
     out("  terndb exec <dir> <sql>...   run statements and print the rows")
-    out("                               CREATE TABLE / CREATE INDEX / INSERT /")
-    out("                               SELECT / UPDATE / DELETE / COMPACT")
+    out("                               CREATE TABLE / CREATE INDEX / DROP TABLE /")
+    out("                               DROP INDEX / INSERT / SELECT / UPDATE /")
+    out("                               DELETE / COMPACT")
     out("  terndb shell <dir>           read statements from stdin")
     out("  terndb bench <dir> [n] [sz]  queries a second and peak memory, against")
     out("                               fs::read of the same bytes as a baseline")
@@ -209,7 +210,7 @@ mod tests {
             let what = "terndb " + args.join(" ")
             assert_eq(code, cli::EXIT_USAGE, what)
             assert_eq(err.len(), 0, what)
-            assert(out.len() > 0 && out[0].starts_with("terndb 0.1.0"), what)
+            assert(out.len() > 0 && out[0].starts_with("terndb 0.2.0"), what)
             for cmd in #["exec", "shell", "bench"] {
                 assert(out.join("\n").contains("terndb " + cmd), what + ": names " + cmd)
             }
@@ -263,8 +264,8 @@ mod tests {
         assert_eq(out5, #["count", "3"], "a, b and c are all there")
 
         let mut check = engine::open(dir, false).unwrap_or_else(|e| panic("open " + dir + ": " + e))
-        match engine::exec(&mut check, "SELECT COUNT(*) FROM t") {
-            Ok((_, mut res)) => assert_eq(engine::render(&mut res), #["3"], "and they survived the close")
+        match check.exec("SELECT COUNT(*) FROM t") {
+            Ok(mut res) => assert_eq(res.render(), #["3"], "and they survived the close")
             Err(e) => assert(false, e)
         }
     }

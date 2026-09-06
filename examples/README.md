@@ -42,16 +42,16 @@ is, and the text it carries never reaches the parser.
 The same rows read four ways, so the difference between them is where the parse
 and the plan happen and nothing else:
 
-- `engine::query` / `engine::exec` parse and plan the statement each time. This
-  is what the CLI does, and what a program running a statement once should do.
-- `engine::query_args` fills a statement's `?` placeholders from values the
-  caller supplies, in the order they were written.
+- `db.exec` parses and plans the statement each time. This is what the CLI
+  does, and what a program running a statement once should do.
+- `db.exec_args` fills a statement's `?` placeholders from values the caller
+  supplies, in the order they were written.
 - `engine::plan::prepare` settles the whole plan once - the table, the
   projection, the order, the limit, every comparison resolved to a column index
-  - and `engine::plan::run` does the reading and nothing else.
-- `engine::cache::plans` holds a per-caller cache, and `engine::cache::exec`
-  normalises a statement to its shape, so three statements differing only in a
-  literal share one plan.
+  - and `plan.run` does the reading and nothing else.
+- `Plans::new` holds a per-caller cache, and `cache.exec` normalises a
+  statement to its shape, so three statements differing only in a literal share
+  one plan.
 
 It also shows what each layer refuses: a `run` whose argument count does not
 match the plan's arity, and a `prepare` of a statement that is not a `SELECT`.
@@ -62,8 +62,8 @@ A row written by SQL lives under `<table>/r/<rowid>` in the storage layer, and
 that key is reachable without a statement over it. The example reads the same
 rows at three levels:
 
-- `engine::cache::row_json` resolves the table once and renders every later row
-  straight from the store.
+- `cache.row_json` resolves the table once and renders every later row straight
+  from the store.
 - `engine::plan::prepare` on a `SELECT ... WHERE rowid = ?` is recognised as a
   keyed read: `read_json` renders, `read_row` fills a buffer the caller owns
   with typed values, and `read_bytes` hands back the encoded record. A statement

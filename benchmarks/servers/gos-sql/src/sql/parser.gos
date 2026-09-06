@@ -24,24 +24,27 @@ pub fn parse(src: String) -> Result<sql::Stmt, String> {
 fn parse_stmt(p: &mut Parser) -> Result<sql::Stmt, String> {
     let kw = take_word(p)?.to_uppercase()
     if kw == "CREATE" { return parse_create(p) }
+    if kw == "DROP" { return parse_drop(p) }
     if kw == "INSERT" { return parse_insert(p) }
     if kw == "SELECT" { return parse_select(p) }
     if kw == "UPDATE" { return parse_update(p) }
     if kw == "DELETE" { return parse_delete(p) }
     if kw == "COMPACT" { return Ok(sql::Stmt::Compact) }
-    Err("parse: expected CREATE, INSERT, SELECT, UPDATE, DELETE or COMPACT, got '" + kw + "'")
+    Err("parse: expected CREATE, DROP, INSERT, SELECT, UPDATE, DELETE or COMPACT, got '" + kw + "'")
 }
 
 fn parse_create(p: &mut Parser) -> Result<sql::Stmt, String> {
     if take_word_opt(p, "INDEX") {
+        let guarded = take_if_not_exists(p)?
         expect_word(p, "ON")?
         let table = take_word(p)?
         expect_punct(p, "(")?
         let col = take_word(p)?
         expect_punct(p, ")")?
-        return Ok(sql::Stmt::CreateIndex { table: table, col: col })
+        return Ok(sql::Stmt::CreateIndex { table: table, col: col, if_not_exists: guarded })
     }
     expect_word(p, "TABLE")?
+    let guarded = take_if_not_exists(p)?
     let name = take_word(p)?
     expect_punct(p, "(")?
     let mut cols: Vec<(String, u8)> = #[]
@@ -58,12 +61,61 @@ fn parse_create(p: &mut Parser) -> Result<sql::Stmt, String> {
         break
     }
     expect_punct(p, ")")?
-    Ok(sql::Stmt::Create { name: name, cols: cols })
+    Ok(sql::Stmt::Create { name: name, cols: cols, if_not_exists: guarded })
+}
+
+fn parse_drop(p: &mut Parser) -> Result<sql::Stmt, String> {
+    if take_word_opt(p, "INDEX") {
+        let guarded = take_if_exists(p)?
+        expect_word(p, "ON")?
+        let table = take_word(p)?
+        expect_punct(p, "(")?
+        let col = take_word(p)?
+        expect_punct(p, ")")?
+        return Ok(sql::Stmt::DropIndex { table: table, col: col, if_exists: guarded })
+    }
+    expect_word(p, "TABLE")?
+    let guarded = take_if_exists(p)?
+    let table = take_word(p)?
+    Ok(sql::Stmt::Drop { table: table, if_exists: guarded })
+}
+
+// The optional IF NOT EXISTS a CREATE carries, which makes running it twice
+// the same statement as running it once.
+fn take_if_not_exists(p: &mut Parser) -> Result<bool, String> {
+    if !take_word_opt(p, "IF") { return Ok(false) }
+    expect_word(p, "NOT")?
+    expect_word(p, "EXISTS")?
+    Ok(true)
+}
+
+// The optional IF EXISTS a DROP carries.
+fn take_if_exists(p: &mut Parser) -> Result<bool, String> {
+    if !take_word_opt(p, "IF") { return Ok(false) }
+    expect_word(p, "EXISTS")?
+    Ok(true)
 }
 
 fn parse_insert(p: &mut Parser) -> Result<sql::Stmt, String> {
     expect_word(p, "INTO")?
     let table = take_word(p)?
+    // The columns a row supplies, when the statement names them; every other
+    // column of the table takes NULL.
+    let mut cols: Vec<String> = #[]
+    if take_punct(p, "(") {
+        loop {
+            let cn = take_word(p)?
+            for existing in cols {
+                if existing.to_lowercase() == cn.to_lowercase() {
+                    return Err("insert: column '" + cn + "' is named twice")
+                }
+            }
+            cols.push(cn)
+            if take_punct(p, ",") { continue }
+            break
+        }
+        expect_punct(p, ")")?
+    }
     expect_word(p, "VALUES")?
     let mut rows: Vec<Vec<codec::Value>> = #[]
     loop {
@@ -79,7 +131,7 @@ fn parse_insert(p: &mut Parser) -> Result<sql::Stmt, String> {
         if take_punct(p, ",") { continue }
         break
     }
-    Ok(sql::Stmt::Insert { table: table, rows: rows })
+    Ok(sql::Stmt::Insert { table: table, cols: cols, rows: rows })
 }
 
 fn parse_select(p: &mut Parser) -> Result<sql::Stmt, String> {
@@ -115,13 +167,19 @@ fn parse_select(p: &mut Parser) -> Result<sql::Stmt, String> {
         has_order = true
     }
     let mut limit: i64 = -1
+    let mut offset: i64 = 0
     if take_word_opt(p, "LIMIT") {
         limit = take_int(p)?
         if limit < 0 { return Err("select: LIMIT must not be negative") }
     }
+    if take_word_opt(p, "OFFSET") {
+        offset = take_int(p)?
+        if offset < 0 { return Err("select: OFFSET must not be negative") }
+    }
     Ok(sql::Stmt::Select(sql::Query {
         table: table, cols: cols, count_only: count_only, conds: conds
-        order_col: order_col, order_asc: order_asc, has_order: has_order, limit: limit
+        order_col: order_col, order_asc: order_asc, has_order: has_order
+        limit: limit, offset: offset
     }))
 }
 
@@ -174,23 +232,23 @@ fn parse_value(p: &mut Parser) -> Result<codec::Value, String> {
         p.pos += 1
         let n = p.params
         p.params += 1
-        return Ok(codec::v_param(n))
+        return Ok(codec::Value::param(n))
     }
     if t.kind == sql::T_STR {
         p.pos += 1
-        return Ok(codec::v_text(t.text))
+        return Ok(codec::Value::text(t.text))
     }
     if t.kind == sql::T_INT {
         p.pos += 1
         match t.text.to_i64() {
-            Some(v) => return Ok(codec::v_i64(v))
+            Some(v) => return Ok(codec::Value::int(v))
             None => return Err("parse: '" + t.text + "' does not fit a 64-bit integer")
         }
     }
     if t.kind == sql::T_FLOAT {
         p.pos += 1
         match t.text.to_f64() {
-            Some(v) => return Ok(codec::v_f64(v))
+            Some(v) => return Ok(codec::Value::float(v))
             None => return Err("parse: '" + t.text + "' is not a number")
         }
     }
@@ -198,9 +256,9 @@ fn parse_value(p: &mut Parser) -> Result<codec::Value, String> {
         let up = t.text.to_uppercase()
         if up == "TRUE" || up == "FALSE" || up == "NULL" {
             p.pos += 1
-            if up == "TRUE" { return Ok(codec::v_bool(true)) }
-            if up == "FALSE" { return Ok(codec::v_bool(false)) }
-            return Ok(codec::v_nil())
+            if up == "TRUE" { return Ok(codec::Value::bool(true)) }
+            if up == "FALSE" { return Ok(codec::Value::bool(false)) }
+            return Ok(codec::Value::nil())
         }
         return Err("parse: expected a value, got the word '" + t.text + "'")
     }
@@ -470,12 +528,126 @@ mod tests {
             "SELECT * FROM t WHERE a", "SELECT * FROM t WHERE a = "
             "SELECT * FROM t LIMIT x", "SELECT * FROM t LIMIT -1"
             "SELECT * FROM t ORDER a", "INSERT INTO t VALUES 1"
-            "UPDATE t a = 1", "DELETE t", "DROP TABLE t"
+            "UPDATE t a = 1", "DELETE t", "DROP t", "DROP TABLE", "DROP INDEX ON t"
+            "CREATE TABLE IF EXISTS t (a INT)", "DROP TABLE IF NOT EXISTS t"
+            "SELECT * FROM t OFFSET -1", "INSERT INTO t (a, a) VALUES (1, 2)"
             "SELECT * FROM t JOIN u ON t.a = u.a"
             "SELECT * FROM t WHERE a = 1 OR b = 2"
             "SELECT * FROM t GARBAGE"
         ]
         for src in bad { assert(super::parse(src).is_err(), "must reject: " + src) }
+    }
+
+    #[test]
+    fn create_takes_an_if_not_exists_guard() {
+        match super::parse("CREATE TABLE IF NOT EXISTS t (a INT32)") {
+            Ok(sql::Stmt::Create { name, if_not_exists, .. }) => {
+                assert_eq(name, "t")
+                assert_eq(if_not_exists, true)
+            }
+            Ok(_) => assert(false, "expected a CREATE statement")
+            Err(e) => assert(false, e)
+        }
+        match super::parse("CREATE TABLE t (a INT32)") {
+            Ok(sql::Stmt::Create { if_not_exists, .. }) => assert_eq(if_not_exists, false)
+            Ok(_) => assert(false, "expected a CREATE statement")
+            Err(e) => assert(false, e)
+        }
+        match super::parse("create index if not exists on t (a)") {
+            Ok(sql::Stmt::CreateIndex { table, col, if_not_exists }) => {
+                assert_eq(table + "." + col, "t.a")
+                assert_eq(if_not_exists, true)
+            }
+            Ok(_) => assert(false, "expected a CREATE INDEX statement")
+            Err(e) => assert(false, e)
+        }
+    }
+
+    #[test]
+    fn drop_parses_tables_and_indexes() {
+        match super::parse("DROP TABLE users") {
+            Ok(sql::Stmt::Drop { table, if_exists }) => {
+                assert_eq(table, "users")
+                assert_eq(if_exists, false)
+            }
+            Ok(_) => assert(false, "expected a DROP statement")
+            Err(e) => assert(false, e)
+        }
+        match super::parse("drop table if exists users") {
+            Ok(sql::Stmt::Drop { table, if_exists }) => {
+                assert_eq(table, "users")
+                assert_eq(if_exists, true)
+            }
+            Ok(_) => assert(false, "expected a DROP statement")
+            Err(e) => assert(false, e)
+        }
+        match super::parse("DROP INDEX IF EXISTS ON users (name)") {
+            Ok(sql::Stmt::DropIndex { table, col, if_exists }) => {
+                assert_eq(table + "." + col, "users.name")
+                assert_eq(if_exists, true)
+            }
+            Ok(_) => assert(false, "expected a DROP INDEX statement")
+            Err(e) => assert(false, e)
+        }
+    }
+
+    #[test]
+    fn insert_names_the_columns_it_supplies() {
+        match super::parse("INSERT INTO t (b, a) VALUES ('x', 1)") {
+            Ok(sql::Stmt::Insert { table, cols, rows }) => {
+                assert_eq(table, "t")
+                assert_eq(cols, #["b", "a"])
+                assert_eq(rows[0][0].s, "x")
+                assert_eq(rows[0][1].i, 1)
+            }
+            Ok(_) => assert(false, "expected an INSERT statement")
+            Err(e) => assert(false, e)
+        }
+        match super::parse("INSERT INTO t VALUES (1)") {
+            Ok(sql::Stmt::Insert { cols, .. }) => assert_eq(cols.len(), 0, "a positional row names no column")
+            Ok(_) => assert(false, "expected an INSERT statement")
+            Err(e) => assert(false, e)
+        }
+    }
+
+    #[test]
+    fn limit_takes_an_offset_beside_it() {
+        match super::parse("SELECT * FROM t LIMIT 5 OFFSET 10") {
+            Ok(sql::Stmt::Select(s)) => {
+                assert_eq(s.limit, 5)
+                assert_eq(s.offset, 10)
+            }
+            Ok(_) => assert(false, "expected a SELECT statement")
+            Err(e) => assert(false, e)
+        }
+        match super::parse("SELECT * FROM t OFFSET 3") {
+            Ok(sql::Stmt::Select(s)) => {
+                assert_eq(s.limit, -1, "an OFFSET alone leaves the limit unbounded")
+                assert_eq(s.offset, 3)
+            }
+            Ok(_) => assert(false, "expected a SELECT statement")
+            Err(e) => assert(false, e)
+        }
+        match super::parse("SELECT * FROM t") {
+            Ok(sql::Stmt::Select(s)) => assert_eq(s.offset, 0)
+            Ok(_) => assert(false, "expected a SELECT statement")
+            Err(e) => assert(false, e)
+        }
+    }
+
+    #[test]
+    fn angle_brackets_are_the_other_spelling_of_not_equal() {
+        match super::parse("SELECT * FROM t WHERE a <> 1") {
+            Ok(sql::Stmt::Select(s)) => assert_eq(s.conds[0].op, sql::OP_NE)
+            Ok(_) => assert(false, "expected a SELECT statement")
+            Err(e) => assert(false, e)
+        }
+        // The two spellings differ only in their text, so `<` still lexes alone.
+        match super::parse("SELECT * FROM t WHERE a < 1") {
+            Ok(sql::Stmt::Select(s)) => assert_eq(s.conds[0].op, sql::OP_LT)
+            Ok(_) => assert(false, "expected a SELECT statement")
+            Err(e) => assert(false, e)
+        }
     }
 
     #[test]

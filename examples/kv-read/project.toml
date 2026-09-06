@@ -1,7 +1,7 @@
 [project]
 id = "terndb.db/example-kv-read"
-version = "0.1.0"
-gossamer-version = "^v0.58.9"
+version = "0.2.0"
+gossamer-version = "^v0.58.13"
 
 [dependencies]
 "terndb.db/terndb" = { path = "../.." }

@@ -68,12 +68,12 @@ pub (package) fn decode(buf: Vec<u8>) -> Result<engine::TableDef, String> {
 // the parser only ever produces i64, f64, text, bool and nil, so this is where
 // each one is narrowed to the column's declared width.
 pub (package) fn coerce(val: codec::Value, tag: u8, col: String) -> Result<codec::Value, String> {
-    if val.tag == codec::TAG_NIL { return Ok(codec::v_nil()) }
+    if val.tag == codec::TAG_NIL { return Ok(codec::Value::nil()) }
     if tag == codec::TAG_TEXT && val.tag == codec::TAG_TEXT { return Ok(val) }
     if tag == codec::TAG_BOOL && val.tag == codec::TAG_BOOL { return Ok(val) }
     if tag == codec::TAG_DT {
-        if val.tag == codec::TAG_TEXT { return Ok(codec::v_dt(codec::datetime::parse(val.s)?)) }
-        if val.tag == codec::TAG_I64 { return Ok(codec::v_dt(val.i)) }
+        if val.tag == codec::TAG_TEXT { return Ok(codec::Value::datetime(codec::datetime::parse(val.s)?)) }
+        if val.tag == codec::TAG_I64 { return Ok(codec::Value::datetime(val.i)) }
     }
     if val.tag == codec::TAG_I64 {
         match codec::int_range(tag) {
@@ -87,11 +87,11 @@ pub (package) fn coerce(val: codec::Value, tag: u8, col: String) -> Result<codec
         }
         // An integer literal is a valid float; widening it loses nothing a
         // float column was going to keep anyway.
-        if tag == codec::TAG_F32 { return Ok(codec::v_f32(val.i as f64)) }
-        if tag == codec::TAG_F64 { return Ok(codec::v_f64(val.i as f64)) }
+        if tag == codec::TAG_F32 { return Ok(codec::Value::float32(val.i as f64)) }
+        if tag == codec::TAG_F64 { return Ok(codec::Value::float(val.i as f64)) }
     }
     if val.tag == codec::TAG_F64 {
-        if tag == codec::TAG_F32 { return Ok(codec::v_f32(val.f)) }
+        if tag == codec::TAG_F32 { return Ok(codec::Value::float32(val.f)) }
         if tag == codec::TAG_F64 { return Ok(val) }
     }
     Err("column '" + col + "' is " + codec::type_name_for_tag(tag) +
@@ -165,8 +165,8 @@ mod tests {
     }
 
     fn run(eng: &mut engine::Engine, src: String) -> i64 {
-        match engine::exec(eng, src) {
-            Ok((n, _)) => return n
+        match eng.exec(src) {
+            Ok(res) => return res.count
             Err(e) => {
                 assert(false, src + " -> " + e)
                 return -1
@@ -175,12 +175,12 @@ mod tests {
     }
 
     fn rows(eng: &mut engine::Engine, src: String) -> Vec<Vec<String>> {
-        match engine::exec(eng, src) {
-            Ok((_, res)) => {
+        match eng.exec(src) {
+            Ok(res) => {
                 let mut out: Vec<Vec<String>> = #[]
                 for row in res.rows {
                     let mut cells: Vec<String> = #[]
-                    for v in row.vals { cells.push(codec::value_to_string(v)) }
+                    for v in row.vals { cells.push(v.to_string()) }
                     out.push(cells)
                 }
                 return out
@@ -209,15 +209,15 @@ mod tests {
 
     #[test]
     fn cmp_vals_orders_across_the_numeric_kinds() {
-        assert_eq(super::cmp_vals(codec::v_i32(1), codec::v_i32(2)), -1)
-        assert_eq(super::cmp_vals(codec::v_i32(2), codec::v_i32(2)), 0)
-        assert_eq(super::cmp_vals(codec::v_i32(3), codec::v_i32(2)), 1)
-        assert_eq(super::cmp_vals(codec::v_i64(1), codec::v_f64(1.5)), -1, "an int compares against a float by value")
-        assert_eq(super::cmp_vals(codec::v_f64(2.0), codec::v_i64(2)), 0)
-        assert_eq(super::cmp_vals(codec::v_nil(), codec::v_i64(-99)), -1, "NULL sorts before every value")
-        assert_eq(super::cmp_vals(codec::v_nil(), codec::v_nil()), 0)
-        assert_eq(super::cmp_vals(codec::v_text("a"), codec::v_text("b")), -1)
-        assert_eq(super::cmp_vals(codec::v_bool(false), codec::v_bool(true)), -1)
+        assert_eq(super::cmp_vals(codec::Value::int32(1), codec::Value::int32(2)), -1)
+        assert_eq(super::cmp_vals(codec::Value::int32(2), codec::Value::int32(2)), 0)
+        assert_eq(super::cmp_vals(codec::Value::int32(3), codec::Value::int32(2)), 1)
+        assert_eq(super::cmp_vals(codec::Value::int(1), codec::Value::float(1.5)), -1, "an int compares against a float by value")
+        assert_eq(super::cmp_vals(codec::Value::float(2.0), codec::Value::int(2)), 0)
+        assert_eq(super::cmp_vals(codec::Value::nil(), codec::Value::int(-99)), -1, "NULL sorts before every value")
+        assert_eq(super::cmp_vals(codec::Value::nil(), codec::Value::nil()), 0)
+        assert_eq(super::cmp_vals(codec::Value::text("a"), codec::Value::text("b")), -1)
+        assert_eq(super::cmp_vals(codec::Value::bool(false), codec::Value::bool(true)), -1)
     }
 
     #[test]
@@ -227,24 +227,24 @@ mod tests {
         assert_eq(run(&mut eng, "INSERT INTO t VALUES (-128, -32768, -2147483648, -9000000000, 1, 2)"), 1)
         assert_eq(rows(&mut eng, "SELECT * FROM t"), #[#["-128", "-32768", "-2147483648", "-9000000000", "1", "2"]]
             "an integer literal widens into a float column")
-        assert(engine::exec(&mut eng, "INSERT INTO t VALUES (128, 0, 0, 0, 0, 0)").is_err(), "128 overflows INT8")
-        assert(engine::exec(&mut eng, "INSERT INTO t VALUES (0, 32768, 0, 0, 0, 0)").is_err(), "32768 overflows INT16")
-        assert(engine::exec(&mut eng, "INSERT INTO t VALUES (0, 0, 2147483648, 0, 0, 0)").is_err(), "2147483648 overflows INT32")
-        assert(engine::exec(&mut eng, "INSERT INTO t VALUES ('x', 0, 0, 0, 0, 0)").is_err(), "text does not fit an integer")
+        assert(eng.exec("INSERT INTO t VALUES (128, 0, 0, 0, 0, 0)").is_err(), "128 overflows INT8")
+        assert(eng.exec("INSERT INTO t VALUES (0, 32768, 0, 0, 0, 0)").is_err(), "32768 overflows INT16")
+        assert(eng.exec("INSERT INTO t VALUES (0, 0, 2147483648, 0, 0, 0)").is_err(), "2147483648 overflows INT32")
+        assert(eng.exec("INSERT INTO t VALUES ('x', 0, 0, 0, 0, 0)").is_err(), "text does not fit an integer")
     }
 
     #[test]
     fn a_type_error_names_the_column_and_the_type() {
         let mut eng = opened(fresh("type_errors"))
         assert_eq(run(&mut eng, "CREATE TABLE t (age INT32, at DATETIME)"), 0)
-        match engine::exec(&mut eng, "INSERT INTO t VALUES ('old', '2023-01-01T00:00:00Z')") {
+        match eng.exec("INSERT INTO t VALUES ('old', '2023-01-01T00:00:00Z')") {
             Ok(_) => assert(false, "text is not an INT32")
             Err(e) => {
                 assert(e.contains("age"), "the error names the column, got: " + e)
                 assert(e.contains("INT32"), "the error names the type, got: " + e)
             }
         }
-        assert(engine::exec(&mut eng, "INSERT INTO t VALUES (1, 'not a date')").is_err())
+        assert(eng.exec("INSERT INTO t VALUES (1, 'not a date')").is_err())
     }
 
     #[test]

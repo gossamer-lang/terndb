@@ -102,19 +102,19 @@ fn payload(i: i64, size: i64) -> Vec<u8> {
 /// payload for the fs::read baseline to read.
 pub fn prepare(dir: String, n: i64, size: i64) -> Result<(), String> {
     let _ = fs::remove_dir_all(dir)
-    let mut st = kv::open(dir, false)?
+    let mut st = kv::open(dir)?
     mark_owned(dir)?
     // One batch for the load: a per-key commit would measure fsync, not the store.
     kv::batch::begin(&mut st)?
     let mut i: i64 = 0
     while i < n {
-        if let Err(e) = kv::put(&mut st, key_of(i), payload(i, size)) {
+        if let Err(e) = st.put(key_of(i), payload(i, size)) {
             return Err(kv::batch::undo(&mut st, e))
         }
         i += 1
     }
     kv::batch::commit(&mut st)?
-    kv::sync(&mut st)?
+    st.sync()?
     match fs::write(dir + "/baseline.bin", payload(0, size)) {
         Ok(_) => Ok(())
         Err(e) => Err("bench: baseline: " + e.message())
@@ -126,7 +126,7 @@ pub fn prepare(dir: String, n: i64, size: i64) -> Result<(), String> {
 /// The keys are built before the clock starts: the baseline does no string work,
 /// so building one inside the loop would charge the store for it.
 pub fn time_get(dir: String, n: i64) -> Result<Timing, String> {
-    let mut st = kv::open(dir, true)?
+    let mut st = kv::open(dir, read_only: true)?
     let mut keys: Vec<String> = #[]
     let mut k: i64 = 0
     while k < n {
@@ -137,7 +137,7 @@ pub fn time_get(dir: String, n: i64) -> Result<Timing, String> {
     let mut hits: i64 = 0
     let mut i: i64 = 0
     while i < n {
-        match kv::get(&mut st, keys[i]) {
+        match st.get(keys[i]) {
             kv::Read::Value(v) => hits += v.len()
             kv::Read::Absent => return Err("bench: missing key " + keys[i])
             kv::Read::Fault(e) => return Err("bench: " + e)
@@ -172,7 +172,7 @@ pub fn prepare_sql(dir: String, rows: i64) -> Result<engine::Engine, String> {
     let _ = fs::remove_dir_all(dir)
     let mut eng = engine::open(dir, false)?
     mark_owned(dir)?
-    let _ = engine::exec(&mut eng, "CREATE TABLE bench (id INT32, name TEXT, score FLOAT64, active BOOL)")?
+    let _ = eng.exec("CREATE TABLE bench (id INT32, name TEXT, score FLOAT64, active BOOL)")?
     // Rows go in a few hundred at a time: one statement is one transaction, and
     // a row-at-a-time load would measure the commit rather than the insert.
     let mut i: i64 = 0
@@ -185,9 +185,9 @@ pub fn prepare_sql(dir: String, rows: i64) -> Result<engine::Engine, String> {
             c += 1
             i += 1
         }
-        let _ = engine::exec(&mut eng, stmt)?
+        let _ = eng.exec(stmt)?
     }
-    engine::sync(&mut eng)?
+    eng.sync()?
     Ok(eng)
 }
 
@@ -196,7 +196,7 @@ pub fn time_stmt(eng: &mut engine::Engine, label: String, src: String, reps: i64
     let start = time::now_ms()
     let mut i: i64 = 0
     while i < reps {
-        let _ = engine::exec(eng, src)?
+        let _ = eng.exec(src)?
         i += 1
     }
     Ok(Timing { label: label, ops: reps, total_ms: time::now_ms() - start })
@@ -268,9 +268,9 @@ mod tests {
         let dir = "/tmp/terndb_bench_test/prepared"
         assert(super::prepare(dir, 50, 128).is_ok())
         let mut st = kv::open(dir, true).unwrap_or_else(|e| panic(e))
-        assert_eq(kv::len(&mut st), 50)
+        assert_eq(st.len(), 50)
         for i in 0..50 {
-            match kv::get(&mut st, super::key_of(i)) {
+            match st.get(super::key_of(i)) {
                 kv::Read::Value(v) => assert_eq(v.len(), 128, "key " + i.to_string())
                 kv::Read::Absent => assert(false, "missing key " + i.to_string())
                 kv::Read::Fault(e) => assert(false, e)
@@ -287,15 +287,15 @@ mod tests {
         assert(super::claim(dir).is_ok(), "an absent directory is free")
 
         // Somebody's store: refused, and still there afterwards.
-        let mut st = kv::open(dir, false).unwrap_or_else(|e| panic(e))
-        assert(kv::put(&mut st, "keep/me", #[1u8, 2u8, 3u8]).is_ok())
-        assert(kv::sync(&mut st).is_ok())
+        let mut st = kv::open(dir).unwrap_or_else(|e| panic(e))
+        assert(st.put("keep/me", #[1u8, 2u8, 3u8]).is_ok())
+        assert(st.sync().is_ok())
         match super::claim(dir) {
             Ok(()) => assert(false, "a directory holding a store must be refused")
             Err(e) => assert(e.contains("empty or new directory"), "got: " + e)
         }
         let mut still = kv::open(dir, true).unwrap_or_else(|e| panic(e))
-        assert(!matches(kv::get(&mut still, "keep/me"), kv::Read::Absent), "the refusal left the store intact")
+        assert(!matches(still.get("keep/me"), kv::Read::Absent), "the refusal left the store intact")
 
         // A directory the benchmark filled is its own to clear again.
         let scratch = "/tmp/terndb_bench_test/claimed_scratch"

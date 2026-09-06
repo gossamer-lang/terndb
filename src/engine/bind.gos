@@ -21,14 +21,14 @@ pub (package) fn stmt(s: sql::Stmt, args: Vec<codec::Value>) -> Result<sql::Stmt
     // Placeholders are numbered from zero in the order the parser met them, so
     // the highest of them plus one is the count: every index is in range here.
     match s {
-        sql::Stmt::Insert { table, rows } => {
+        sql::Stmt::Insert { table, cols, rows } => {
             let mut bound: Vec<Vec<codec::Value>> = #[]
             for row in rows {
                 let mut vals: Vec<codec::Value> = #[]
                 for v in row { vals.push(filled(v, args)) }
                 bound.push(vals)
             }
-            Ok(sql::Stmt::Insert { table: table, rows: bound })
+            Ok(sql::Stmt::Insert { table: table, cols: cols, rows: bound })
         }
         sql::Stmt::Update { table, sets, conds } => {
             let mut bound: Vec<(String, codec::Value)> = #[]
@@ -113,8 +113,8 @@ mod tests {
     }
 
     fn run(eng: &mut engine::Engine, src: String, args: Vec<codec::Value>) -> i64 {
-        match engine::exec_args(eng, src, args) {
-            Ok((n, _)) => return n
+        match eng.exec_args(src, args) {
+            Ok(res) => return res.count
             Err(e) => {
                 assert(false, src + " -> " + e)
                 return -1
@@ -123,12 +123,12 @@ mod tests {
     }
 
     fn rows(eng: &mut engine::Engine, src: String, args: Vec<codec::Value>) -> Vec<Vec<String>> {
-        match engine::exec_args(eng, src, args) {
-            Ok((_, res)) => {
+        match eng.exec_args(src, args) {
+            Ok(res) => {
                 let mut out: Vec<Vec<String>> = #[]
                 for row in res.rows {
                     let mut cells: Vec<String> = #[]
-                    for v in row.vals { cells.push(codec::value_to_string(v)) }
+                    for v in row.vals { cells.push(v.to_string()) }
                     out.push(cells)
                 }
                 return out
@@ -152,9 +152,9 @@ mod tests {
         // back as the name it is.
         let hostile = "ada'); DELETE FROM users; --"
         assert_eq(run(&mut eng, "INSERT INTO users VALUES (?, ?, ?, ?, ?)"
-            #[codec::v_text(hostile), codec::v_i64(30), codec::v_bool(true)
-                codec::v_text("2023-11-14T22:13:20Z"), codec::v_f64(1.5)]), 1)
-        assert_eq(rows(&mut eng, "SELECT name FROM users WHERE name = ?", #[codec::v_text(hostile)])
+            #[codec::Value::text(hostile), codec::Value::int(30), codec::Value::bool(true)
+                codec::Value::text("2023-11-14T22:13:20Z"), codec::Value::float(1.5)]), 1)
+        assert_eq(rows(&mut eng, "SELECT name FROM users WHERE name = ?", #[codec::Value::text(hostile)])
             #[#[hostile]])
         assert_eq(rows(&mut eng, "SELECT COUNT(*) FROM users", #[]), #[#["1"]])
     }
@@ -164,19 +164,19 @@ mod tests {
         let mut eng = opened(fresh("bind_statements"))
         users(&mut eng)
         assert_eq(run(&mut eng, "INSERT INTO users VALUES (?, ?, ?, ?, ?), (?, ?, ?, ?, ?)"
-            #[codec::v_text("alice"), codec::v_i64(30), codec::v_bool(true)
-                codec::v_text("2023-11-14T22:13:20Z"), codec::v_f64(1.5)
-                codec::v_text("bob"), codec::v_i64(40), codec::v_bool(false)
-                codec::v_text("2023-12-01T10:00:00Z"), codec::v_f64(2.5)]), 2)
+            #[codec::Value::text("alice"), codec::Value::int(30), codec::Value::bool(true)
+                codec::Value::text("2023-11-14T22:13:20Z"), codec::Value::float(1.5)
+                codec::Value::text("bob"), codec::Value::int(40), codec::Value::bool(false)
+                codec::Value::text("2023-12-01T10:00:00Z"), codec::Value::float(2.5)]), 2)
         assert_eq(rows(&mut eng, "SELECT name FROM users WHERE age > ? AND active = ?"
-            #[codec::v_i64(20), codec::v_bool(true)]), #[#["alice"]])
-        assert_eq(rows(&mut eng, "SELECT name FROM users WHERE rowid = ?", #[codec::v_i64(2)])
+            #[codec::Value::int(20), codec::Value::bool(true)]), #[#["alice"]])
+        assert_eq(rows(&mut eng, "SELECT name FROM users WHERE rowid = ?", #[codec::Value::int(2)])
             #[#["bob"]])
         assert_eq(run(&mut eng, "UPDATE users SET score = ? WHERE name = ?"
-            #[codec::v_f64(9.5), codec::v_text("bob")]), 1)
-        assert_eq(rows(&mut eng, "SELECT score FROM users WHERE name = ?", #[codec::v_text("bob")])
+            #[codec::Value::float(9.5), codec::Value::text("bob")]), 1)
+        assert_eq(rows(&mut eng, "SELECT score FROM users WHERE name = ?", #[codec::Value::text("bob")])
             #[#["9.5"]])
-        assert_eq(run(&mut eng, "DELETE FROM users WHERE score = ?", #[codec::v_f64(9.5)]), 1)
+        assert_eq(run(&mut eng, "DELETE FROM users WHERE score = ?", #[codec::Value::float(9.5)]), 1)
         assert_eq(rows(&mut eng, "SELECT COUNT(*) FROM users", #[]), #[#["1"]])
     }
 
@@ -186,14 +186,14 @@ mod tests {
         users(&mut eng)
         // A datetime column takes the text spelling, bound or written.
         assert_eq(run(&mut eng, "INSERT INTO users VALUES (?, ?, ?, ?, ?)"
-            #[codec::v_text("alice"), codec::v_i64(30), codec::v_bool(true)
-                codec::v_text("2023-11-14T22:13:20Z"), codec::v_f64(1.5)]), 1)
+            #[codec::Value::text("alice"), codec::Value::int(30), codec::Value::bool(true)
+                codec::Value::text("2023-11-14T22:13:20Z"), codec::Value::float(1.5)]), 1)
         assert_eq(rows(&mut eng, "SELECT name FROM users WHERE at = ?"
-            #[codec::v_text("2023-11-14T22:13:20Z")]), #[#["alice"]])
+            #[codec::Value::text("2023-11-14T22:13:20Z")]), #[#["alice"]])
         // An INT32 column takes a whole number in its range and nothing else.
-        assert(engine::exec_args(&mut eng, "UPDATE users SET age = ?", #[codec::v_i64(1 << 40)]).is_err()
+        assert(eng.exec_args("UPDATE users SET age = ?", #[codec::Value::int(1 << 40)]).is_err()
             "out of the column's range")
-        assert(engine::exec_args(&mut eng, "UPDATE users SET age = ?", #[codec::v_text("thirty")]).is_err()
+        assert(eng.exec_args("UPDATE users SET age = ?", #[codec::Value::text("thirty")]).is_err()
             "text does not fit a whole number")
     }
 
@@ -201,13 +201,13 @@ mod tests {
     fn a_statement_is_refused_unless_its_placeholders_are_all_bound() {
         let mut eng = opened(fresh("bind_arity"))
         users(&mut eng)
-        assert(engine::exec(&mut eng, "SELECT * FROM users WHERE name = ?").is_err()
+        assert(eng.exec("SELECT * FROM users WHERE name = ?").is_err()
             "no argument for the placeholder")
-        assert(engine::exec_args(&mut eng, "SELECT * FROM users WHERE name = ? AND age = ?"
-            #[codec::v_text("alice")]).is_err(), "one argument short")
-        assert(engine::exec_args(&mut eng, "SELECT * FROM users", #[codec::v_i64(1)]).is_err()
+        assert(eng.exec_args("SELECT * FROM users WHERE name = ? AND age = ?"
+            #[codec::Value::text("alice")]).is_err(), "one argument short")
+        assert(eng.exec_args("SELECT * FROM users", #[codec::Value::int(1)]).is_err()
             "one argument too many")
-        assert(engine::exec_args(&mut eng, "INSERT INTO users VALUES (?, ?, ?, ?, ?)", #[]).is_err()
+        assert(eng.exec_args("INSERT INTO users VALUES (?, ?, ?, ?, ?)", #[]).is_err()
             "an unbound INSERT writes nothing")
         assert_eq(rows(&mut eng, "SELECT COUNT(*) FROM users", #[]), #[#["0"]])
     }

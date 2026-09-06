@@ -42,147 +42,151 @@ pub struct KvTable {
 /// bulk load with the flush turned off spends 3.7 of its 7.9 us there.
 pub struct InsertPlan {
     pub table: String
+    /// The columns the statement named, empty when its rows are positional.
+    pub cols: Vec<String>
     pub rows: Vec<Vec<codec::Value>>
     pub arity: i64
 }
 
-/// An empty plan cache.
-pub fn plans() -> Plans {
-    Plans {
-        by_shape: Map::new()
-        plans: #[]
-        by_insert: Map::new()
-        inserts: #[]
-        by_kv: Map::new()
-        kv_tables: #[]
-    }
-}
-
-/// Runs `src`, reusing the plan prepared for statements of its shape.
-///
-/// A SELECT is normalised to its shape, planned once, and then run with the
-/// literals it carried as arguments; every other statement goes to [`exec`],
-/// which plans it as part of doing it. Parsing and planning is the larger part
-/// of what a keyed read costs, and a store answering one shape of request pays
-/// it once rather than once a request.
-pub fn exec(eng: &mut engine::Engine, cache: &mut Plans, src: String) -> Result<(i64, engine::QueryResult), String> {
-    if opens_with(src, "insert") { return run_insert(eng, cache, src) }
-    if !opens_with(src, "select") { return engine::exec(eng, src) }
-    let mut args: Vec<codec::Value> = #[]
-    let shape = sql::shape::normalize(src, &mut args)
-    let idx = match cache.by_shape.get(shape) {
-        Some(k) => k
-        None => {
-            let plan = plan::prepare(eng, shape)?
-            cache.plans.push(plan)
-            let k = cache.plans.len() - 1
-            cache.by_shape.insert(shape, k)
-            k
+impl Plans {
+    /// An empty plan cache.
+    pub fn new() -> Plans {
+        Plans {
+            by_shape: Map::new()
+            plans: #[]
+            by_insert: Map::new()
+            inserts: #[]
+            by_kv: Map::new()
+            kv_tables: #[]
         }
     }
-    run_at(eng, cache, idx, args)
-}
 
-/// One row read by its identity, with no statement layer above it: the storage
-/// address of `<table>/r/<id>` and the render every read pays.
-///
-/// This is the path the key-value front end serves. It answers the same JSON
-/// the identity projection of a `SELECT * ... WHERE rowid = ?` answers, without
-/// a parse, a plan, or a filter to evaluate. An empty answer is a row the store
-/// does not hold.
-pub fn row_json(eng: &mut engine::Engine, cache: &mut Plans, table: String, id: i64) -> Result<String, String> {
-    if id < 1 { return Ok("") }
-    let idx = match cache.by_kv.get(table) {
-        Some(k) => k
-        None => {
-            let def = engine::get_def(eng, table)?
-            let tid = kv::rows::open_table(&mut eng.store, table)
-            cache.kv_tables.push(KvTable { tid: tid, keys: codec::json::keys(def.cols) })
-            let k = cache.kv_tables.len() - 1
-            cache.by_kv.insert(table, k)
-            k
+    /// Runs `src`, reusing the plan prepared for statements of its shape.
+    ///
+    /// A SELECT is normalised to its shape, planned once, and then run with the
+    /// literals it carried as arguments; every other statement goes to [`exec`],
+    /// which plans it as part of doing it. Parsing and planning is the larger part
+    /// of what a keyed read costs, and a store answering one shape of request pays
+    /// it once rather than once a request.
+    pub fn exec(&mut self, eng: &mut engine::Engine, src: String) -> Result<engine::QueryResult, String> {
+        if opens_with(src, "insert") { return self.run_insert(eng, src) }
+        if !opens_with(src, "select") { return eng.exec(src) }
+        let mut args: Vec<codec::Value> = #[]
+        let shape = sql::shape::normalize(src, &mut args)
+        let idx = match self.by_shape.get(shape) {
+            Some(k) => k
+            None => {
+                let plan = plan::prepare(eng, shape)?
+                self.plans.push(plan)
+                let k = self.plans.len() - 1
+                self.by_shape.insert(shape, k)
+                k
+            }
         }
+        self.run_at(eng, idx, args)
     }
-    // A row in a generation the store holds is rendered where it lies, which is
-    // the path a keyed `SELECT` takes as well: the two front ends differ by the
-    // statement layer and by nothing below it. The buffer is handed to the
-    // renderer straight off the store, because binding it to a local here would
-    // copy the whole file per read.
-    let start, end = kv::rows::span(&mut eng.store, cache.kv_tables[idx].tid, id)
-    if end > start {
-        let body = codec::json::render_window(
-            eng.store.resident_bytes, start, end, cache.kv_tables[idx].keys, id)
+
+    /// One row read by its identity, with no statement layer above it: the storage
+    /// address of `<table>/r/<id>` and the render every read pays.
+    ///
+    /// This is the path the key-value front end serves. It answers the same JSON
+    /// the identity projection of a `SELECT * ... WHERE rowid = ?` answers, without
+    /// a parse, a plan, or a filter to evaluate. An empty answer is a row the store
+    /// does not hold.
+    pub fn row_json(&mut self, eng: &mut engine::Engine, table: String, id: i64) -> Result<String, String> {
+        if id < 1 { return Ok("") }
+        let idx = match self.by_kv.get(table) {
+            Some(k) => k
+            None => {
+                let def = engine::get_def(eng, table)?
+                let tid = kv::rows::open_table(&mut eng.store, table)
+                self.kv_tables.push(KvTable { tid: tid, keys: codec::json::keys(def.cols) })
+                let k = self.kv_tables.len() - 1
+                self.by_kv.insert(table, k)
+                k
+            }
+        }
+        // A row in a generation the store holds is rendered where it lies, which is
+        // the path a keyed `SELECT` takes as well: the two front ends differ by the
+        // statement layer and by nothing below it. The buffer is handed to the
+        // renderer straight off the store, because binding it to a local here would
+        // copy the whole file per read.
+        let start, end = kv::rows::span(&mut eng.store, self.kv_tables[idx].tid, id)
+        if end > start {
+            let body = codec::json::render_window(
+                eng.store.resident_bytes, start, end, self.kv_tables[idx].keys, id)
+            if body.len() == 0 {
+                return Err("row " + id.to_string() + " of " + table + " is malformed")
+            }
+            return Ok(body)
+        }
+        let bytes = match kv::rows::read(&mut eng.store, self.kv_tables[idx].tid, id) {
+            kv::Read::Value(b) => b
+            kv::Read::Absent => return Ok("")
+            kv::Read::Fault(e) => return Err(e)
+        }
+        let body = codec::json::render(bytes, self.kv_tables[idx].keys, id)
         if body.len() == 0 {
             return Err("row " + id.to_string() + " of " + table + " is malformed")
         }
-        return Ok(body)
+        Ok(body)
     }
-    let bytes = match kv::rows::read(&mut eng.store, cache.kv_tables[idx].tid, id) {
-        kv::Read::Value(b) => b
-        kv::Read::Absent => return Ok("")
-        kv::Read::Fault(e) => return Err(e)
-    }
-    let body = codec::json::render(bytes, cache.kv_tables[idx].keys, id)
-    if body.len() == 0 {
-        return Err("row " + id.to_string() + " of " + table + " is malformed")
-    }
-    Ok(body)
-}
 
-// Runs the cached plan at `idx`. The plan is reached through the cache rather
-// than lifted out of it: a `plan::Prepared` carries growable storage, so taking one
-// out by value would copy every field it has.
-fn run_at(eng: &mut engine::Engine, cache: &mut Plans, idx: i64, args: Vec<codec::Value>) -> Result<(i64, engine::QueryResult), String> {
-    plan::run(eng, &mut cache.plans[idx], args)
-}
+    // Runs the cached plan at `idx`. The plan is reached through the cache rather
+    // than lifted out of it: a `plan::Prepared` carries growable storage, so taking one
+    // out by value would copy every field it has.
+    fn run_at(&mut self, eng: &mut engine::Engine, idx: i64, args: Vec<codec::Value>) -> Result<engine::QueryResult, String> {
+        self.plans[idx].run(eng, args)
+    }
 
-// Runs an INSERT of a shape the cache has already parsed, filling its
-// placeholders from the literals the statement carried.
-fn run_insert(eng: &mut engine::Engine, cache: &mut Plans, src: String) -> Result<(i64, engine::QueryResult), String> {
-    engine::read_only_refuses(eng)?
-    let mut args: Vec<codec::Value> = #[]
-    let shape = sql::shape::normalize(src, &mut args)
-    let idx = match cache.by_insert.get(shape) {
-        Some(k) => k
-        None => {
-            let plan = compile_insert(shape)?
-            cache.inserts.push(plan)
-            let k = cache.inserts.len() - 1
-            cache.by_insert.insert(shape, k)
-            k
+    // Runs an INSERT of a shape the cache has already parsed, filling its
+    // placeholders from the literals the statement carried.
+    fn run_insert(&mut self, eng: &mut engine::Engine, src: String) -> Result<engine::QueryResult, String> {
+        engine::read_only_refuses(eng)?
+        let mut args: Vec<codec::Value> = #[]
+        let shape = sql::shape::normalize(src, &mut args)
+        let idx = match self.by_insert.get(shape) {
+            Some(k) => k
+            None => {
+                let plan = compile_insert(shape)?
+                self.inserts.push(plan)
+                let k = self.inserts.len() - 1
+                self.by_insert.insert(shape, k)
+                k
+            }
         }
-    }
-    if args.len() != cache.inserts[idx].arity {
-        return Err("statement takes " + cache.inserts[idx].arity.to_string() +
-            " argument(s), got " + args.len().to_string())
-    }
-    // The rows are built from the template rather than copied out of it: the
-    // template is what the parse produced, and this is what the parse would
-    // have produced again.
-    let mut rows: Vec<Vec<codec::Value>> = #[]
-    for r in 0..cache.inserts[idx].rows.len() {
-        let mut row: Vec<codec::Value> = #[]
-        for v in cache.inserts[idx].rows[r] {
-            if v.tag == codec::TAG_PARAM { row.push(args[v.i]) } else { row.push(v) }
+        if args.len() != self.inserts[idx].arity {
+            return Err("statement takes " + self.inserts[idx].arity.to_string() +
+                " argument(s), got " + args.len().to_string())
         }
-        rows.push(row)
+        // The rows are built from the template rather than copied out of it: the
+        // template is what the parse produced, and this is what the parse would
+        // have produced again.
+        let mut rows: Vec<Vec<codec::Value>> = #[]
+        for r in 0..self.inserts[idx].rows.len() {
+            let mut row: Vec<codec::Value> = #[]
+            for v in self.inserts[idx].rows[r] {
+                if v.tag == codec::TAG_PARAM { row.push(args[v.i]) } else { row.push(v) }
+            }
+            rows.push(row)
+        }
+        let table = self.inserts[idx].table
+        stmt::insert(eng, table, self.inserts[idx].cols, rows)
     }
-    let table = cache.inserts[idx].table
-    stmt::insert(eng, table, rows)
 }
 
 // Parses one INSERT shape into the template a later statement of that shape is
 // filled from.
 fn compile_insert(shape: String) -> Result<InsertPlan, String> {
     match sql::parser::parse(shape)? {
-        sql::Stmt::Insert { table, rows } => {
+        sql::Stmt::Insert { table, cols, rows } => {
             let mut arity: i64 = 0
             for row in rows {
                 for v in row {
                     if v.tag == codec::TAG_PARAM && v.i + 1 > arity { arity = v.i + 1 }
                 }
             }
-            Ok(InsertPlan { table: table, rows: rows, arity: arity })
+            Ok(InsertPlan { table: table, cols: cols, rows: rows, arity: arity })
         }
         _ => Err("only an INSERT can be prepared this way")
     }
@@ -239,8 +243,8 @@ mod tests {
     }
 
     fn run(eng: &mut engine::Engine, src: String) -> i64 {
-        match engine::exec(eng, src) {
-            Ok((n, _)) => return n
+        match eng.exec(src) {
+            Ok(res) => return res.count
             Err(e) => {
                 assert(false, src + " -> " + e)
                 return -1
@@ -285,7 +289,7 @@ mod tests {
         let mut eng = opened(fresh("plans"))
         assert_eq(run(&mut eng, "CREATE TABLE t (v TEXT, n INT32)"), 0)
         assert_eq(run(&mut eng, "INSERT INTO t VALUES ('a', 1), ('b', 2), ('c', 3)"), 3)
-        let mut cache = super::plans()
+        let mut cache = super::Plans::new()
         // Every statement the grammar answers, run both ways: a cached plan and
         // a fresh parse must agree on every one of them.
         let script = #[
@@ -304,14 +308,14 @@ mod tests {
             "SELECT nope FROM t"
         ]
         for src in script {
-            let cached = engine::cache::exec(&mut eng, &mut cache, src)
-            let fresh_run = engine::exec(&mut eng, src)
+            let cached = cache.exec(&mut eng, src)
+            let fresh_run = eng.exec(src)
             assert_eq(cached.is_ok(), fresh_run.is_ok(), src)
             match cached {
-                Ok((n, mut res)) => {
-                    let mut expect = fresh_run.unwrap_or((0, super::empty_result()))
-                    assert_eq(n, expect.0, src)
-                    assert_eq(engine::render(&mut res), engine::render(&mut expect.1), src)
+                Ok(res) => {
+                    let expect = fresh_run.unwrap_or(super::empty_result())
+                    assert_eq(res.count, expect.count, src)
+                    assert_eq(res.render(), expect.render(), src)
                 }
                 Err(e) => {
                     match fresh_run {
@@ -335,23 +339,23 @@ mod tests {
         let mut eng = opened(fresh("plans_comment"))
         assert_eq(run(&mut eng, "CREATE TABLE t (v TEXT)"), 0)
         assert_eq(run(&mut eng, "INSERT INTO t VALUES ('a'), ('b')"), 2)
-        let mut cache = super::plans()
-        let mut got = engine::cache::exec(&mut eng, &mut cache, "-- the row we want\nSELECT v FROM t WHERE rowid = 2")
-            .unwrap_or((0, super::empty_result()))
-        assert_eq(engine::render(&mut got.1), #["b"])
+        let mut cache = super::Plans::new()
+        let mut got = cache.exec(&mut eng, "-- the row we want\nSELECT v FROM t WHERE rowid = 2")
+            .unwrap_or(super::empty_result())
+        assert_eq(got.render(), #["b"])
         assert_eq(cache.plans.len(), 1, "a comment before the statement does not defeat the cache")
         // And the comment is not part of the shape, so the same statement
         // written without one shares the plan.
-        let mut plain = engine::cache::exec(&mut eng, &mut cache, "SELECT v FROM t WHERE rowid = 1")
-            .unwrap_or((0, super::empty_result()))
-        assert_eq(engine::render(&mut plain.1), #["a"])
+        let mut plain = cache.exec(&mut eng, "SELECT v FROM t WHERE rowid = 1")
+            .unwrap_or(super::empty_result())
+        assert_eq(plain.render(), #["a"])
         assert_eq(cache.plans.len(), 1)
     }
 
     #[test]
     fn a_cached_insert_writes_what_a_fresh_parse_would() {
         let mut eng = opened(fresh("plans_insert"))
-        let mut cache = super::plans()
+        let mut cache = super::Plans::new()
         assert_eq(run(&mut eng, "CREATE TABLE t (v TEXT, n INT32, ok BOOL)"), 0)
         // Every INSERT the grammar takes, run through the cache and compared
         // against what the same statement does through a fresh parse.
@@ -368,11 +372,11 @@ mod tests {
         let mut plain = opened(fresh("plans_insert_plain"))
         assert_eq(run(&mut plain, "CREATE TABLE t (v TEXT, n INT32, ok BOOL)"), 0)
         for src in script {
-            let cached = engine::cache::exec(&mut eng, &mut cache, src)
-            let fresh_run = engine::exec(&mut plain, src)
+            let cached = cache.exec(&mut eng, src)
+            let fresh_run = plain.exec(src)
             assert_eq(cached.is_ok(), fresh_run.is_ok(), src)
             match cached {
-                Ok((n, _)) => assert_eq(n, fresh_run.unwrap_or((-1, super::empty_result())).0, src)
+                Ok(res) => assert_eq(res.count, fresh_run.unwrap_or(super::empty_result()).count, src)
                 Err(e) => {
                     match fresh_run {
                         Ok(_) => assert(false, "cached rejected what a fresh parse ran: " + src)
@@ -384,10 +388,10 @@ mod tests {
         // The two single-row three-value inserts share one template, as do the
         // two spellings; the rest each have their own.
         assert(cache.inserts.len() < script.len(), "inserts of one shape share a template")
-        let mut a = engine::exec(&mut eng, "SELECT v, n, ok FROM t ORDER BY n")
-        let mut b = engine::exec(&mut plain, "SELECT v, n, ok FROM t ORDER BY n")
-        assert_eq(engine::render(&mut a.unwrap_or((0, super::empty_result())).1)
-            engine::render(&mut b.unwrap_or((0, super::empty_result())).1)
+        let mut a = eng.exec("SELECT v, n, ok FROM t ORDER BY n")
+        let mut b = plain.exec("SELECT v, n, ok FROM t ORDER BY n")
+        assert_eq(a.unwrap_or(super::empty_result()).render()
+            b.unwrap_or(super::empty_result()).render()
             "the cache and a fresh parse left the same table behind")
     }
 
@@ -396,10 +400,10 @@ mod tests {
         let dir = fresh("plans_insert_ro")
         let mut writer = opened(dir)
         assert_eq(run(&mut writer, "CREATE TABLE t (v TEXT)"), 0)
-        assert(engine::sync(&mut writer).is_ok())
+        assert(writer.sync().is_ok())
         let mut reader = engine::open(dir, true).unwrap_or_else(|e| panic(e))
-        let mut cache = super::plans()
-        match engine::cache::exec(&mut reader, &mut cache, "INSERT INTO t VALUES ('x')") {
+        let mut cache = super::Plans::new()
+        match cache.exec(&mut reader, "INSERT INTO t VALUES ('x')") {
             Ok(_) => assert(false, "a read-only store took a write")
             Err(e) => assert_eq(e, "store is read-only")
         }
@@ -409,15 +413,15 @@ mod tests {
     #[test]
     fn a_cached_write_still_goes_through_exec() {
         let mut eng = opened(fresh("plans_write"))
-        let mut cache = super::plans()
-        assert(engine::cache::exec(&mut eng, &mut cache, "CREATE TABLE t (v TEXT)").is_ok())
-        assert(engine::cache::exec(&mut eng, &mut cache, "INSERT INTO t VALUES ('a')").is_ok())
-        assert(engine::cache::exec(&mut eng, &mut cache, "UPDATE t SET v = 'b' WHERE rowid = 1").is_ok())
+        let mut cache = super::Plans::new()
+        assert(cache.exec(&mut eng, "CREATE TABLE t (v TEXT)").is_ok())
+        assert(cache.exec(&mut eng, "INSERT INTO t VALUES ('a')").is_ok())
+        assert(cache.exec(&mut eng, "UPDATE t SET v = 'b' WHERE rowid = 1").is_ok())
         assert_eq(cache.plans.len(), 0, "a statement that writes is not planned as a read")
-        let mut read = engine::cache::exec(&mut eng, &mut cache, "SELECT v FROM t").unwrap_or((0, super::empty_result()))
-        assert_eq(engine::render(&mut read.1), #["b"])
+        let mut read = cache.exec(&mut eng, "SELECT v FROM t").unwrap_or(super::empty_result())
+        assert_eq(read.render(), #["b"])
         assert_eq(cache.plans.len(), 1)
-        assert(engine::cache::exec(&mut eng, &mut cache, "DELETE FROM t WHERE rowid = 1").is_ok())
-        assert_eq(engine::cache::exec(&mut eng, &mut cache, "SELECT COUNT(*) FROM t").unwrap_or((0, super::empty_result())).0, 0)
+        assert(cache.exec(&mut eng, "DELETE FROM t WHERE rowid = 1").is_ok())
+        assert_eq(cache.exec(&mut eng, "SELECT COUNT(*) FROM t").unwrap_or(super::empty_result()).count, 0)
     }
 }

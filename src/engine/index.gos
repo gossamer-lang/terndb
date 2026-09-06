@@ -74,6 +74,23 @@ pub (package) fn attach(eng: &mut engine::Engine, table: String, col: String, ci
     build(eng, eng.indexes.len() - 1)
 }
 
+// Drops the index on one column, closing the gap the removal leaves so every
+// later index keeps a place in the vector.
+pub (package) fn detach(eng: &mut engine::Engine, table: String, col: String) {
+    let ix = of(eng, table, col)
+    if ix >= 0 { let _ = eng.indexes.remove(ix) }
+}
+
+// Drops every index a table declared, which is what a dropped table leaves
+// behind in the engine.
+pub (package) fn detach_table(eng: &mut engine::Engine, table: String) {
+    let mut kept: Vec<ColIndex> = #[]
+    for ci in eng.indexes {
+        if ci.table != table { kept.push(ci) }
+    }
+    eng.indexes = kept
+}
+
 // Files every row of the index's table under the value its column holds. Only
 // the columns up to the indexed one are decoded, so a late column costs more to
 // index than an early one and neither costs the whole row.
@@ -113,8 +130,8 @@ fn build(eng: &mut engine::Engine, ix: i64) -> Result<(), String> {
 pub (package) fn key_of(v: codec::Value) -> codec::Value {
     // Adding zero turns a negative zero into a positive one and leaves every
     // other value exactly as it was, which is what makes the two share a key.
-    if v.tag == codec::TAG_F64 { return codec::v_f64(v.f + 0.0) }
-    if v.tag == codec::TAG_F32 { return codec::v_f32(v.f + 0.0) }
+    if v.tag == codec::TAG_F64 { return codec::Value::float(v.f + 0.0) }
+    if v.tag == codec::TAG_F32 { return codec::Value::float32(v.f + 0.0) }
     v
 }
 
@@ -202,8 +219,8 @@ mod tests {
     }
 
     fn run(eng: &mut engine::Engine, src: String) -> i64 {
-        match engine::exec(eng, src) {
-            Ok((n, _)) => return n
+        match eng.exec(src) {
+            Ok(res) => return res.count
             Err(e) => {
                 assert(false, src + " -> " + e)
                 return -1
@@ -212,12 +229,12 @@ mod tests {
     }
 
     fn rows(eng: &mut engine::Engine, src: String) -> Vec<Vec<String>> {
-        match engine::exec(eng, src) {
-            Ok((_, res)) => {
+        match eng.exec(src) {
+            Ok(res) => {
                 let mut out: Vec<Vec<String>> = #[]
                 for row in res.rows {
                     let mut cells: Vec<String> = #[]
-                    for v in row.vals { cells.push(codec::value_to_string(v)) }
+                    for v in row.vals { cells.push(v.to_string()) }
                     out.push(cells)
                 }
                 return out
@@ -236,21 +253,21 @@ mod tests {
         let mut indexed = opened(fresh(name + "_ix"))
         let mut plain = opened(fresh(name + "_plain"))
         for src in setup {
-            assert(engine::exec(&mut indexed, src).is_ok(), src)
-            assert(engine::exec(&mut plain, src).is_ok(), src)
+            assert(indexed.exec(src).is_ok(), src)
+            assert(plain.exec(src).is_ok(), src)
         }
         for src in indexes {
-            assert(engine::exec(&mut indexed, src).is_ok(), src)
+            assert(indexed.exec(src).is_ok(), src)
         }
         for src in script {
-            let a = engine::exec(&mut indexed, src)
-            let b = engine::exec(&mut plain, src)
+            let a = indexed.exec(src)
+            let b = plain.exec(src)
             assert_eq(a.is_ok(), b.is_ok(), src)
             match a {
-                Ok((n, mut ra)) => {
-                    let mut rb = b.unwrap_or((-1, super::empty_result()))
-                    assert_eq(n, rb.0, src)
-                    assert_eq(engine::render(&mut ra), engine::render(&mut rb.1), src)
+                Ok(ra) => {
+                    let rb = b.unwrap_or(super::empty_result())
+                    assert_eq(ra.count, rb.count, src)
+                    assert_eq(ra.render(), rb.render(), src)
                 }
                 Err(e) => {
                     match b {
@@ -260,9 +277,9 @@ mod tests {
                 }
             }
         }
-        let mut fa = engine::exec(&mut indexed, "SELECT * FROM t ORDER BY rowid").unwrap_or((0, super::empty_result()))
-        let mut fb = engine::exec(&mut plain, "SELECT * FROM t ORDER BY rowid").unwrap_or((0, super::empty_result()))
-        assert_eq(engine::render(&mut fa.1), engine::render(&mut fb.1), "the two engines hold the same table")
+        let mut fa = indexed.exec("SELECT * FROM t ORDER BY rowid").unwrap_or(super::empty_result())
+        let mut fb = plain.exec("SELECT * FROM t ORDER BY rowid").unwrap_or(super::empty_result())
+        assert_eq(fa.render(), fb.render(), "the two engines hold the same table")
     }
 
     #[test]
@@ -349,12 +366,12 @@ mod tests {
             i += 1
         }
         assert_eq(run(&mut eng, "CREATE INDEX ON t (ok)"), 0)
-        assert_eq(engine::exec(&mut eng, "SELECT COUNT(*) FROM t WHERE ok = true").unwrap_or((-1, super::empty_result())).0, 100)
-        assert_eq(engine::exec(&mut eng, "SELECT COUNT(*) FROM t WHERE ok = false").unwrap_or((-1, super::empty_result())).0, 100)
+        assert_eq(eng.exec("SELECT COUNT(*) FROM t WHERE ok = true").unwrap_or(super::empty_result()).count, 100)
+        assert_eq(eng.exec("SELECT COUNT(*) FROM t WHERE ok = false").unwrap_or(super::empty_result()).count, 100)
         // Deleting half of one chain leaves the other half reachable.
         assert_eq(run(&mut eng, "DELETE FROM t WHERE ok = true AND n < 100"), 50)
-        assert_eq(engine::exec(&mut eng, "SELECT COUNT(*) FROM t WHERE ok = true").unwrap_or((-1, super::empty_result())).0, 50)
-        assert_eq(engine::exec(&mut eng, "SELECT COUNT(*) FROM t WHERE ok = false").unwrap_or((-1, super::empty_result())).0, 100)
+        assert_eq(eng.exec("SELECT COUNT(*) FROM t WHERE ok = true").unwrap_or(super::empty_result()).count, 50)
+        assert_eq(eng.exec("SELECT COUNT(*) FROM t WHERE ok = false").unwrap_or(super::empty_result()).count, 100)
     }
 
     #[test]
@@ -365,7 +382,7 @@ mod tests {
         assert_eq(run(&mut eng, "INSERT INTO t VALUES ('a', 1), ('b', 2), ('a', 3)"), 3)
         assert_eq(run(&mut eng, "CREATE INDEX ON t (v)"), 0)
         assert_eq(run(&mut eng, "INSERT INTO t VALUES ('a', 4)"), 1)
-        assert(engine::sync(&mut eng).is_ok())
+        assert(eng.sync().is_ok())
 
         let mut again = opened(dir)
         assert_eq(again.indexes.len(), 1, "the declaration came back")
@@ -383,12 +400,12 @@ mod tests {
     fn create_index_names_a_column_the_table_has() {
         let mut eng = opened(fresh("ix_errors"))
         assert_eq(run(&mut eng, "CREATE TABLE t (v TEXT)"), 0)
-        assert(engine::exec(&mut eng, "CREATE INDEX ON nope (v)").is_err(), "the table must exist")
-        assert(engine::exec(&mut eng, "CREATE INDEX ON t (missing)").is_err(), "the column must exist")
+        assert(eng.exec("CREATE INDEX ON nope (v)").is_err(), "the table must exist")
+        assert(eng.exec("CREATE INDEX ON t (missing)").is_err(), "the column must exist")
         assert_eq(run(&mut eng, "CREATE INDEX ON t (v)"), 0)
-        assert(engine::exec(&mut eng, "CREATE INDEX ON t (v)").is_err(), "one index per column")
+        assert(eng.exec("CREATE INDEX ON t (v)").is_err(), "one index per column")
         // The column is named as the table spells it, however the statement did.
-        assert(engine::exec(&mut eng, "CREATE INDEX ON t (V)").is_err(), "case does not make a second index")
+        assert(eng.exec("CREATE INDEX ON t (V)").is_err(), "case does not make a second index")
         assert_eq(eng.indexes.len(), 1)
     }
 
@@ -397,9 +414,9 @@ mod tests {
         let dir = fresh("ix_readonly")
         let mut writer = opened(dir)
         assert_eq(run(&mut writer, "CREATE TABLE t (v TEXT)"), 0)
-        assert(engine::sync(&mut writer).is_ok())
+        assert(writer.sync().is_ok())
         let mut reader = engine::open(dir, true).unwrap_or_else(|e| panic(e))
-        match engine::exec(&mut reader, "CREATE INDEX ON t (v)") {
+        match reader.exec("CREATE INDEX ON t (v)") {
             Ok(_) => assert(false, "a read-only store declared an index")
             Err(e) => assert_eq(e, "store is read-only")
         }

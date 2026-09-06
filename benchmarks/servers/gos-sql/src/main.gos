@@ -25,7 +25,7 @@ fn main() {
 }
 
 fn serve_forever(addr: String, dir: String) -> Result<(), String> {
-    let mut eng = engine::open(dir, true)?
+    let mut eng = engine::open(dir, read_only: true)?
     // The statement is parsed and planned once. Parsing it per request is the
     // larger part of what a keyed read costs.
     let mut by_id = engine::plan::prepare(&mut eng, "SELECT name, email, score, active FROM users WHERE rowid = ?")?
@@ -43,7 +43,7 @@ fn answer(eng: &mut engine::Engine, by_id: &mut engine::plan::Prepared, id: i64)
     // The row is rendered straight out of the bytes the read produced: a
     // request answering one row as JSON has no use for the decoded values, let
     // alone a result set built around them.
-    match engine::plan::read_json(eng, by_id, id) {
+    match by_id.read_json(eng, id) {
         Ok(body) => {
             if body.len() == 0 { return not_found() }
             http::Response::json(200, body)

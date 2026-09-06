@@ -37,7 +37,7 @@ pub fn commit(st: &mut kv::Store) -> Result<(), String> {
         return Err(undo(st, e))
     }
     if st.durable {
-        if let Err(e) = kv::sync(st) { return Err(undo(st, e)) }
+        if let Err(e) = st.sync() { return Err(undo(st, e)) }
     }
     for change in st.staged {
         if change.remove {
@@ -119,11 +119,11 @@ mod tests {
     }
 
     fn opened(dir: String) -> kv::Store {
-        kv::open(dir, false).unwrap_or_else(|e| panic("open " + dir + ": " + e))
+        kv::open(dir).unwrap_or_else(|e| panic("open " + dir + ": " + e))
     }
 
     fn must_get(st: &mut kv::Store, key: String) -> Vec<u8> {
-        match kv::get(st, key) {
+        match st.get(key) {
             kv::Read::Value(v) => return v
             kv::Read::Fault(e) => panic(e)
             kv::Read::Absent => {
@@ -137,35 +137,35 @@ mod tests {
     fn a_batch_is_invisible_until_it_commits() {
         let dir = fresh("batch_visibility")
         let mut st = opened(dir)
-        assert(kv::put(&mut st, "before", #[1u8]).is_ok())
+        assert(st.put("before", #[1u8]).is_ok())
         assert(super::begin(&mut st).is_ok())
-        assert(kv::put(&mut st, "inside", #[2u8]).is_ok())
-        assert(matches(kv::get(&mut st, "inside"), kv::Read::Absent), "an uncommitted write is not readable")
-        assert_eq(kv::len(&mut st), 1, "an uncommitted write is not counted")
+        assert(st.put("inside", #[2u8]).is_ok())
+        assert(matches(st.get("inside"), kv::Read::Absent), "an uncommitted write is not readable")
+        assert_eq(st.len(), 1, "an uncommitted write is not counted")
         assert(super::commit(&mut st).is_ok())
         assert_eq(must_get(&mut st, "inside"), #[2u8])
-        assert_eq(kv::len(&mut st), 2)
+        assert_eq(st.len(), 2)
     }
 
     #[test]
     fn a_rolled_back_batch_leaves_the_store_as_it_was() {
         let dir = fresh("batch_rollback")
         let mut st = opened(dir)
-        assert(kv::put(&mut st, "keep", #[1u8]).is_ok())
+        assert(st.put("keep", #[1u8]).is_ok())
         let mark = st.cur_off
         assert(super::begin(&mut st).is_ok())
-        assert(kv::put(&mut st, "a", #[2u8]).is_ok())
-        assert(kv::put(&mut st, "b", #[3u8]).is_ok())
-        assert(kv::put(&mut st, "keep", #[9u8]).is_ok())
+        assert(st.put("a", #[2u8]).is_ok())
+        assert(st.put("b", #[3u8]).is_ok())
+        assert(st.put("keep", #[9u8]).is_ok())
         assert(super::rollback(&mut st).is_ok())
-        assert_eq(kv::len(&mut st), 1)
-        assert(matches(kv::get(&mut st, "a"), kv::Read::Absent))
+        assert_eq(st.len(), 1)
+        assert(matches(st.get("a"), kv::Read::Absent))
         assert_eq(must_get(&mut st, "keep"), #[1u8], "the overwrite was rolled back too")
         assert_eq(st.cur_off, mark, "the log rewound over the batch")
 
-        assert(kv::put(&mut st, "after", #[4u8]).is_ok())
+        assert(st.put("after", #[4u8]).is_ok())
         let mut again = opened(dir)
-        assert_eq(kv::len(&mut again), 2)
+        assert_eq(again.len(), 2)
         assert_eq(must_get(&mut again, "keep"), #[1u8])
         assert_eq(must_get(&mut again, "after"), #[4u8])
     }
@@ -174,21 +174,21 @@ mod tests {
     fn a_batch_that_never_commits_is_not_replayed() {
         let dir = fresh("batch_uncommitted")
         let mut st = opened(dir)
-        assert(kv::put(&mut st, "committed", #[1u8]).is_ok())
+        assert(st.put("committed", #[1u8]).is_ok())
         assert(super::begin(&mut st).is_ok())
-        assert(kv::put(&mut st, "orphan1", #[2u8]).is_ok())
-        assert(kv::put(&mut st, "orphan2", #[3u8]).is_ok())
-        assert(kv::sync(&mut st).is_ok())
+        assert(st.put("orphan1", #[2u8]).is_ok())
+        assert(st.put("orphan2", #[3u8]).is_ok())
+        assert(st.sync().is_ok())
         // The process stops here: the records are on disk, the commit is not.
         let committed_end = st.batch_start
 
         let mut after = opened(dir)
-        assert_eq(kv::len(&mut after), 1, "an uncommitted batch is not replayed")
-        assert(matches(kv::get(&mut after, "orphan1"), kv::Read::Absent))
-        assert(matches(kv::get(&mut after, "orphan2"), kv::Read::Absent))
+        assert_eq(after.len(), 1, "an uncommitted batch is not replayed")
+        assert(matches(after.get("orphan1"), kv::Read::Absent))
+        assert(matches(after.get("orphan2"), kv::Read::Absent))
         assert_eq(must_get(&mut after, "committed"), #[1u8])
         assert_eq(after.cur_off, committed_end, "the next append reuses the orphaned bytes")
-        assert(kv::put(&mut after, "next", #[4u8]).is_ok())
+        assert(after.put("next", #[4u8]).is_ok())
         assert_eq(must_get(&mut after, "next"), #[4u8])
         assert_eq(must_get(&mut after, "committed"), #[1u8])
     }
@@ -197,17 +197,17 @@ mod tests {
     fn a_batch_deletes_and_writes_together() {
         let dir = fresh("batch_mixed")
         let mut st = opened(dir)
-        assert(kv::put(&mut st, "old", #[1u8]).is_ok())
+        assert(st.put("old", #[1u8]).is_ok())
         assert(super::begin(&mut st).is_ok())
-        assert_eq(kv::delete(&mut st, "old").unwrap_or(false), true)
-        assert(kv::put(&mut st, "new", #[2u8]).is_ok())
+        assert_eq(st.delete("old").unwrap_or(false), true)
+        assert(st.put("new", #[2u8]).is_ok())
         assert_eq(must_get(&mut st, "old"), #[1u8], "the delete is not visible yet")
         assert(super::commit(&mut st).is_ok())
-        assert(matches(kv::get(&mut st, "old"), kv::Read::Absent))
+        assert(matches(st.get("old"), kv::Read::Absent))
         assert_eq(must_get(&mut st, "new"), #[2u8])
 
         let mut after = opened(dir)
-        assert(matches(kv::get(&mut after, "old"), kv::Read::Absent))
+        assert(matches(after.get("old"), kv::Read::Absent))
         assert_eq(must_get(&mut after, "new"), #[2u8])
     }
 

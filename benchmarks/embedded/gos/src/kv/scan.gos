@@ -13,7 +13,7 @@ pub fn pairs(st: &mut kv::Store, prefix: String) -> Result<Vec<kv::KvPair>, Stri
     keys.sort()
     let mut out: Vec<kv::KvPair> = #[]
     for k in keys {
-        match kv::get(st, k) {
+        match st.get(k) {
             kv::Read::Value(v) => out.push(kv::KvPair { key: k, val: v })
             kv::Read::Absent => ()
             kv::Read::Fault(e) => return Err(e)
@@ -100,16 +100,16 @@ mod tests {
     }
 
     fn opened(dir: String) -> kv::Store {
-        kv::open(dir, false).unwrap_or_else(|e| panic("open " + dir + ": " + e))
+        kv::open(dir).unwrap_or_else(|e| panic("open " + dir + ": " + e))
     }
 
     #[test]
     fn scan_returns_matching_keys_in_order() {
         let mut st = opened(fresh("scan"))
-        assert(kv::put(&mut st, "t/r/3", #[3u8]).is_ok())
-        assert(kv::put(&mut st, "t/r/1", #[1u8]).is_ok())
-        assert(kv::put(&mut st, "t/r/2", #[2u8]).is_ok())
-        assert(kv::put(&mut st, "other/r/1", #[9u8]).is_ok())
+        assert(st.put("t/r/3", #[3u8]).is_ok())
+        assert(st.put("t/r/1", #[1u8]).is_ok())
+        assert(st.put("t/r/2", #[2u8]).is_ok())
+        assert(st.put("other/r/1", #[9u8]).is_ok())
         let hits = kv::scan::pairs(&mut st, "t/r/").unwrap_or_else(|e| panic(e))
         assert_eq(hits.len(), 3)
         assert_eq(hits[0].key, "t/r/1")
@@ -124,24 +124,24 @@ mod tests {
     fn presence_and_counts_are_answered_from_the_index() {
         let mut st = opened(fresh("index_only"))
         assert_eq(kv::scan::count_prefix(&mut st, "t/r/"), 0)
-        assert(kv::put(&mut st, "t/r/1", #[1u8]).is_ok())
-        assert(kv::put(&mut st, "t/r/2", #[2u8]).is_ok())
-        assert(kv::put(&mut st, "other", #[3u8]).is_ok())
-        assert(kv::contains(&mut st, "t/r/1"))
-        assert(!kv::contains(&mut st, "t/r/9"))
+        assert(st.put("t/r/1", #[1u8]).is_ok())
+        assert(st.put("t/r/2", #[2u8]).is_ok())
+        assert(st.put("other", #[3u8]).is_ok())
+        assert(st.contains("t/r/1"))
+        assert(!st.contains("t/r/9"))
         assert_eq(kv::scan::count_prefix(&mut st, "t/r/"), 2)
         assert_eq(kv::scan::count_prefix(&mut st, ""), 3, "an empty prefix counts everything")
-        assert_eq(kv::delete(&mut st, "t/r/1").unwrap_or(false), true)
-        assert(!kv::contains(&mut st, "t/r/1"))
+        assert_eq(st.delete("t/r/1").unwrap_or(false), true)
+        assert(!st.contains("t/r/1"))
         assert_eq(kv::scan::count_prefix(&mut st, "t/r/"), 1)
     }
 
     #[test]
     fn scan_skips_deleted_keys() {
         let mut st = opened(fresh("scan_deleted"))
-        assert(kv::put(&mut st, "p/a", #[1u8]).is_ok())
-        assert(kv::put(&mut st, "p/b", #[2u8]).is_ok())
-        assert_eq(kv::delete(&mut st, "p/a").unwrap_or(false), true)
+        assert(st.put("p/a", #[1u8]).is_ok())
+        assert(st.put("p/b", #[2u8]).is_ok())
+        assert_eq(st.delete("p/a").unwrap_or(false), true)
         let hits = kv::scan::pairs(&mut st, "p/").unwrap_or_else(|e| panic(e))
         assert_eq(hits.len(), 1)
         assert_eq(hits[0].key, "p/b")

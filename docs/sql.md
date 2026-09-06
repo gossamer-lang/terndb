@@ -16,6 +16,12 @@ CREATE TABLE users (name TEXT, email TEXT, score FLOAT, active BOOL)
 CREATE INDEX ON users (name)
 ```
 
+`CREATE TABLE IF NOT EXISTS` and `CREATE INDEX IF NOT EXISTS` answer for a
+table or an index already there instead of refusing, so a program may declare
+its schema at every open. `DROP TABLE users` removes a table, its rows and its
+index declarations in one commit, and `DROP INDEX ON users (name)` removes a
+declaration and leaves the rows; both take `IF EXISTS`.
+
 Types: `TEXT` `BOOL` `INT8` `INT16` `INT32` `INT64` `FLOAT32` `FLOAT64`
 `DATETIME`. The usual SQL spellings alias onto them - `INT` and `INTEGER` are
 `INT32`, `BIGINT` is `INT64`, `FLOAT` and `DOUBLE` are `FLOAT64`, `REAL` is
@@ -37,11 +43,13 @@ nothing on disk can go stale. Declare one for a column a `WHERE` names often:
 ```sql
 INSERT INTO users VALUES ('ada', 'ada@example.com', 1.5, true)
 INSERT INTO users VALUES ('grace', 'grace@example.com', 2.5, true), ('alan', 'alan@example.com', 3.5, false)
+INSERT INTO users (name, email) VALUES ('edsger', 'edsger@example.com')
 
 SELECT * FROM users
 SELECT name, score FROM users WHERE name = 'ada'
 SELECT COUNT(*) FROM users WHERE score > 2.0
 SELECT name FROM users WHERE active = true ORDER BY score DESC LIMIT 10
+SELECT name FROM users ORDER BY name LIMIT 10 OFFSET 20
 
 UPDATE users SET score = 9.5 WHERE name = 'ada'
 
@@ -50,9 +58,13 @@ DELETE FROM users WHERE score < 2.0
 COMPACT
 ```
 
-One table per statement. `WHERE` is an `AND` of `=` `!=` `<` `>` `<=` `>=`
-against a column or against `rowid`. There are no joins, no `OR`, no subqueries
-and no multi-statement transactions.
+An `INSERT` naming its columns supplies those and leaves every other column
+`NULL`; one that names none supplies every column in declaration order.
+
+One table per statement. `WHERE` is an `AND` of `=` `!=` (or `<>`) `<` `>` `<=`
+`>=` against a column or against `rowid`. `LIMIT` takes an `OFFSET` beside it,
+which skips that many matching rows first. There are no joins, no `OR`, no
+subqueries and no multi-statement transactions.
 
 `INSERT` answers the number of rows written, `UPDATE` and `DELETE` the number
 they touched, `SELECT` its rows. `COMPACT` merges the log and drops what is
@@ -89,46 +101,46 @@ was rejected, 2 when the command line itself was not one terndb takes.
 The store runs in the caller's own process and the library is one module:
 
 ```gossamer
-let mut db = engine::open("/var/lib/users", false)?
+use terndb::codec::Value
+use terndb::engine
 
-let created, _ = engine::exec_args(&mut db, "INSERT INTO users VALUES (?, ?, ?, ?)",
-    #[codec::v_text(name), codec::v_text(email), codec::v_f64(score), codec::v_bool(true)])?
+let mut db = engine::open("/var/lib/users")?
 
-let _, mut found = engine::exec_args(&mut db,
-    "SELECT name, score FROM users WHERE name = ?", #[codec::v_text(name)])?
+let created = db.exec_args("INSERT INTO users VALUES (?, ?, ?, ?)"
+    #[Value::text(name), Value::text(email), Value::float(score), Value::bool(true)])?
+
+let found = db.exec_args("SELECT name, score FROM users WHERE name = ?", #[Value::text(name)])?
 println("{}", found.cols.join("|"))
-for line in engine::render(&mut found) { println("{}", line) }
+for line in found.render() { println("{}", line) }
 
-let updated, _ = engine::exec_args(&mut db, "UPDATE users SET score = ? WHERE name = ?",
-    #[codec::v_f64(9.5), codec::v_text(name)])?
-let deleted, _ = engine::exec(&mut db, "DELETE FROM users WHERE score < 2.0")?
+let updated = db.exec_args("UPDATE users SET score = ? WHERE name = ?"
+    #[Value::float(9.5), Value::text(name)])?
+let deleted = db.exec("DELETE FROM users WHERE score < 2.0")?
 
-engine::sync(&mut db)?
+db.sync()?
 ```
 
-`engine::open(dir, read_only)` answers an `Engine`; pass `true` for a reader,
-which may not write. `exec` answers `(count, QueryResult)`, where the count is
-the rows an `INSERT` / `UPDATE` / `DELETE` touched or a `COUNT(*)` answered, and
-the result carries `cols` and `rows`. `engine::render(&mut result)` turns the
-rows into the pipe-separated lines the CLI prints; `result.rows[i].vals` holds
-the typed `codec::Value`s for a caller that wants them.
+`engine::open(dir)` answers an `Engine`; `engine::open(dir, read_only: true)`
+answers a reader, which may not write. `exec` answers a `QueryResult` carrying
+`cols`, `rows` and `count` - the rows an `INSERT` / `UPDATE` / `DELETE` touched
+or a `COUNT(*)` answered. `result.render()` turns the rows into the
+pipe-separated lines the CLI prints; `result.rows[i].vals` holds the typed
+`codec::Value`s for a caller that wants them, and `{}` renders one as the CLI
+prints it.
 
-`engine::table_names(&mut db)` lists the tables. `engine::sync(&mut db)` flushes;
-`engine::set_durable(&mut db, false)` trades the per-commit `sync_all` for speed
-on a store that can be rebuilt.
+`db.table_names()` lists the tables. `db.sync()` flushes; `db.set_durable(false)`
+trades the per-commit `sync_all` for speed on a store that can be rebuilt.
 
 ### Values a caller supplies
 
 A `?` stands anywhere the grammar takes a value - the rows of an `INSERT`, the
 assignments of an `UPDATE`, either side of a `WHERE` comparison - and
-`engine::exec_args(&mut db, src, args)` fills the placeholders from `args` in the
-order they were written. `engine::query_args` is the same for a read that wants
-only the rows.
+`db.exec_args(src, args)` fills the placeholders from `args` in the order they
+were written.
 
 ```gossamer
 let name = "ada'); DELETE FROM users; --"
-let mut found = engine::query_args(&mut db, "SELECT score FROM users WHERE name = ?",
-    #[codec::v_text(name)])?
+let found = db.exec_args("SELECT score FROM users WHERE name = ?", #[Value::text(name)])?
 ```
 
 That name is a name: a bound value is narrowed to its column's type the way a
@@ -136,12 +148,13 @@ literal is, and the text it carries never reaches the parser, so a statement
 built once is the whole statement whatever a caller was handed. Building one by
 pasting text together is what this replaces.
 
-The arguments are `codec::Value`s - `v_text`, `v_bool`, `v_i64` (and `v_i8`
-through `v_i32`), `v_f32`, `v_f64`, `v_dt` - each narrowed to the column it
-lands in, so a `DATETIME` column takes `v_dt` or the text spelling a literal
-would carry, and an `INT32` refuses a value outside its range. A statement whose
-placeholder count differs from `args` is refused before it reads or writes, and
-so is a `?` reaching `exec`, which binds nothing.
+The arguments are `codec::Value`s - `Value::text`, `Value::bool`, `Value::int`,
+`Value::float`, `Value::datetime`, `Value::nil`, and `Value::int8` through
+`Value::int32` and `Value::float32` for the narrower widths - each narrowed to
+the column it lands in, so a `DATETIME` column takes `Value::datetime` or the
+text spelling a literal would carry, and an `INT32` refuses a value outside its
+range. A statement whose placeholder count differs from `args` is refused before
+it reads or writes, and so is a `?` reaching `exec`, which binds nothing.
 
 ### A statement run more than once
 
@@ -149,16 +162,16 @@ Parse and plan it once:
 
 ```gossamer
 let mut plan = engine::plan::prepare(&mut db, "SELECT name, score FROM users WHERE score > ?")?
-let _, mut res = engine::plan::run(&mut db, &mut plan, #[codec::v_f64(2.0)])?
+let res = plan.run(&mut db, #[Value::float(2.0)])?
 ```
 
 A `?` is a placeholder filled from `args` in order. `prepare` takes reads;
 writes are planned by the write itself, where the log append and the flush dwarf
 the parse.
 
-For a caller answering many requests, `engine::cache::plans()` holds a per-caller
-cache and `engine::cache::exec(&mut db, &mut cache, src)` reuses the plan for a
-statement whose text it has seen. A cache belongs to whoever runs statements -
+For a caller answering many requests, `engine::cache::Plans::new()` holds a
+per-caller cache and `cache.exec(&mut db, src)` reuses the plan for a statement
+whose shape it has seen. A cache belongs to whoever runs statements -
 one worker, one request handler - so reaching a plan costs no lock.
 
 ## What a statement guarantees
@@ -184,7 +197,7 @@ one worker, one request handler - so reaching a plan costs no lock.
 - **Durable.** A commit is flushed with `sync_all` before it reports success,
   and a file the store creates, renames or removes is followed by a flush of the
   directory itself, so an entry naming a synced file is as durable as the file.
-  `engine::set_durable(&mut db, false)` trades the per-commit flush for
+  `db.set_durable(false)` trades the per-commit flush for
   bulk-loading speed and keeps the other three; it is not how a store that
   answers requests is run.
 
@@ -193,5 +206,5 @@ transactions, no savepoints, and no `BEGIN`/`COMMIT` in the grammar.
 
 A log that ends in a record it cannot verify is read up to its last good commit
 and opened, since a store that recovers is more use than one that refuses to.
-What was read past is not passed over: `engine::faults(&mut db)` lists it, and
+What was read past is not passed over: `db.faults()` lists it, and
 the CLI prints it before it runs a statement.

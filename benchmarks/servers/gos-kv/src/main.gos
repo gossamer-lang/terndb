@@ -37,9 +37,9 @@ fn main() {
 }
 
 fn serve_forever(addr: String, dir: String) -> Result<(), String> {
-    let mut st = kv::open(dir, true)?
+    let mut st = kv::open(dir, read_only: true)?
     let tid = kv::rows::open_table(&mut st, "users")
-    let keys = kv::len(&mut st)
+    let keys = st.len()
     let mut users = Users { store: st, tid: tid, keys: codec::json::keys(#["name", "email", "score", "active"]) }
     println("bench-kv on {}, serving {} ({} keys)", addr, dir, keys)
     let routes = router::Router::new()
