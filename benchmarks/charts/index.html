@@ -19,6 +19,8 @@ On 24 cores (Linux 7.0.0-31-generic).</p>
 <figure><img src="web-embedded-db-response-rate.png" alt="Web server, embedded DB: the store in the web server's own process - response rate, HTTP requests / second"><figcaption>Web server, embedded DB: the store in the web server's own process - response rate, HTTP requests / second</figcaption></figure>
 <figure><img src="web-embedded-db-cpu.png" alt="Web server, embedded DB: the store in the web server's own process - CPU, microseconds / request"><figcaption>Web server, embedded DB: the store in the web server's own process - CPU, microseconds / request</figcaption></figure>
 <figure><img src="web-embedded-db-memory.png" alt="Web server, embedded DB: the store in the web server's own process - memory, peak resident MiB under load"><figcaption>Web server, embedded DB: the store in the web server's own process - memory, peak resident MiB under load</figcaption></figure>
+<figure><img src="query-only-queries.png" alt="Query only: one thread querying the store it is linked against, no HTTP - queries / second"><figcaption>Query only: one thread querying the store it is linked against, no HTTP - queries / second</figcaption></figure>
+<figure><img src="query-only-memory.png" alt="Query only: one thread querying the store it is linked against, no HTTP - memory, peak resident MiB"><figcaption>Query only: one thread querying the store it is linked against, no HTTP - memory, peak resident MiB</figcaption></figure>
 <table>
   <caption>Every HTTP target, sorted by response rate. The store runs in the
   web server's own process, so the memory is that one process.</caption>
@@ -40,11 +42,11 @@ On 24 cores (Linux 7.0.0-31-generic).</p>
   returns. The memory is the whole process, which is what the store costs to
   run.</caption>
   <tr><th>target</th><th>queries/s</th><th>memory, peak MiB</th></tr>
-  <tr><td>gos-kv Embedded:  (gos-kv)</td><td>9,567,232</td><td>14.1</td></tr>
-<tr><td>gos-sql Embedded:  (gos-sql)</td><td>8,468,480</td><td>14.3</td></tr>
-<tr><td>rust-redb Embedded:  (rust-redb)</td><td>2,588,817</td><td>15.6</td></tr>
-<tr><td>rust-redb-typed Embedded:  (rust-redb-typed)</td><td>1,947,658</td><td>11.9</td></tr>
-<tr><td>rust-sqlite Embedded:  (rust-sqlite)</td><td>697,874</td><td>5.9</td></tr>
-<tr><td>go-sqlite Embedded:  (go-sqlite)</td><td>103,935</td><td>18.0</td></tr>
+  <tr><td>Gos terndb Embedded: KV (gos-terndb-embedded-kv)</td><td>9,567,232</td><td>14.1</td></tr>
+<tr><td>Gos terndb Embedded: SQL (gos-terndb-embedded-sql)</td><td>8,468,480</td><td>14.3</td></tr>
+<tr><td>Rust redb Embedded: KV (rust-redb-embedded-kv)</td><td>2,588,817</td><td>15.6</td></tr>
+<tr><td>Rust redb (typed) Embedded: KV (rust-redb-embedded-kv-typed)</td><td>1,947,658</td><td>11.9</td></tr>
+<tr><td>Rust SQLite Embedded: SQL (rust-sqlite-embedded-sql)</td><td>697,874</td><td>5.9</td></tr>
+<tr><td>Go SQLite Embedded: SQL (go-sqlite-embedded-sql)</td><td>103,935</td><td>18.0</td></tr>
 
 </table>

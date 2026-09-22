@@ -1,12 +1,67 @@
 {
-  "config": {"rows": 50000, "seconds": 5, "threads": 1},
-  "host": {"cores": 24, "kernel": "Linux 7.0.0-31-generic"},
+  "config": {
+    "rows": 50000,
+    "seconds": 5,
+    "threads": 1
+  },
+  "host": {
+    "cores": 24,
+    "kernel": "Linux 7.0.0-31-generic"
+  },
   "runs": [
-{"target":"gos-sql","queries":42342400,"seconds":5.000,"qps":8468480.0,"ns_per_query":118.1,"bytes":3824943082,"rss_peak_mb":14.3},
-{"target":"gos-kv","queries":47836160,"seconds":5.000,"qps":9567232.0,"ns_per_query":104.5,"bytes":4321214408,"rss_peak_mb":14.1},
-{"target":"rust-sqlite","queries":3489792,"seconds":5.001,"qps":697873.6,"ns_per_query":1432.9,"bytes":315245571,"rss_peak_mb":5.9},
-{"target":"rust-redb","queries":12944384,"seconds":5.000,"qps":2588817.4,"ns_per_query":386.3,"bytes":1169313293,"rss_peak_mb":15.6},
-{"target":"rust-redb-typed","queries":9739264,"seconds":5.001,"qps":1947657.8,"ns_per_query":513.4,"bytes":879783139,"rss_peak_mb":11.9},
-{"target":"go-sqlite","queries":520192,"seconds":5.005,"qps":103935.1,"ns_per_query":9621.4,"bytes":46990813,"rss_peak_mb":18.0}
+    {
+      "target": "gos-terndb-embedded-sql",
+      "queries": 42342400,
+      "seconds": 5.000,
+      "qps": 8468480.0,
+      "ns_per_query": 118.1,
+      "bytes": 3824943082,
+      "rss_peak_mb": 14.3
+    },
+    {
+      "target": "gos-terndb-embedded-kv",
+      "queries": 47836160,
+      "seconds": 5.000,
+      "qps": 9567232.0,
+      "ns_per_query": 104.5,
+      "bytes": 4321214408,
+      "rss_peak_mb": 14.1
+    },
+    {
+      "target": "rust-sqlite-embedded-sql",
+      "queries": 3489792,
+      "seconds": 5.001,
+      "qps": 697873.6,
+      "ns_per_query": 1432.9,
+      "bytes": 315245571,
+      "rss_peak_mb": 5.9
+    },
+    {
+      "target": "rust-redb-embedded-kv",
+      "queries": 12944384,
+      "seconds": 5.000,
+      "qps": 2588817.4,
+      "ns_per_query": 386.3,
+      "bytes": 1169313293,
+      "rss_peak_mb": 15.6
+    },
+    {
+      "target": "rust-redb-embedded-kv-typed",
+      "queries": 9739264,
+      "seconds": 5.001,
+      "qps": 1947657.8,
+      "ns_per_query": 513.4,
+      "bytes": 879783139,
+      "rss_peak_mb": 11.9
+    },
+    {
+      "target": "go-sqlite-embedded-sql",
+      "queries": 520192,
+      "seconds": 5.005,
+      "qps": 103935.1,
+      "ns_per_query": 9621.4,
+      "bytes": 46990813,
+      "rss_peak_mb": 18.0
+    }
   ]
 }

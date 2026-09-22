@@ -82,7 +82,9 @@ measure() { # name command...
     FIRST=0
     return
   fi
-  out=$(printf '%s' "$out" | jq -c --argjson rss "$rss" '. + {rss_peak_mb: $rss}')
+  # The id is what results, logs and charts are keyed by, whatever label the
+  # binary prints for itself.
+  out=$(printf '%s' "$out" | jq -c --arg t "$name" --argjson rss "$rss" '. + {target: $t, rss_peak_mb: $rss}')
   printf '  %-32s %14s queries/s  %8.1f MiB\n' "$name" \
       "$(printf '%s' "$out" | jq -r '.qps | floor')" "$rss"
   [ "$FIRST" = 1 ] || echo "," >> "$RESULTS.parts"
