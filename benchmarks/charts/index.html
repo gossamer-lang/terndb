@@ -14,25 +14,23 @@
 <h1>terndb benchmarks</h1>
 <p>Over HTTP: 50,000 rows, 8 concurrent workers,
 5s measured per target. In process: 50,000 rows, one thread, 5s measured per target.
-On 24 cores (Linux 7.0.0-28-generic).</p>
+On 24 cores (Linux 7.0.0-31-generic).</p>
 <p>The HTTP charts report the three numbers a deployment is chosen on - response rate, CPU per request and peak memory. A Go client drives concurrent GETs at a web server, and the store runs in that server's own process. The query-only charts have no HTTP in them at all - one thread calling the store it is linked against - so they report queries per second and the memory the store costs to run. Every bar in a chart answered the same request against the same seeded dataset. A variant - the `gos run` tier, or redb holding typed columns - is hatched and shares its path's colour.</p>
 <figure><img src="web-embedded-db-response-rate.png" alt="Web server, embedded DB: the store in the web server's own process - response rate, HTTP requests / second"><figcaption>Web server, embedded DB: the store in the web server's own process - response rate, HTTP requests / second</figcaption></figure>
 <figure><img src="web-embedded-db-cpu.png" alt="Web server, embedded DB: the store in the web server's own process - CPU, microseconds / request"><figcaption>Web server, embedded DB: the store in the web server's own process - CPU, microseconds / request</figcaption></figure>
 <figure><img src="web-embedded-db-memory.png" alt="Web server, embedded DB: the store in the web server's own process - memory, peak resident MiB under load"><figcaption>Web server, embedded DB: the store in the web server's own process - memory, peak resident MiB under load</figcaption></figure>
-<figure><img src="query-only-queries.png" alt="Query only: one thread querying the store it is linked against, no HTTP - queries / second"><figcaption>Query only: one thread querying the store it is linked against, no HTTP - queries / second</figcaption></figure>
-<figure><img src="query-only-memory.png" alt="Query only: one thread querying the store it is linked against, no HTTP - memory, peak resident MiB"><figcaption>Query only: one thread querying the store it is linked against, no HTTP - memory, peak resident MiB</figcaption></figure>
 <table>
   <caption>Every HTTP target, sorted by response rate. The store runs in the
   web server's own process, so the memory is that one process.</caption>
   <tr><th>target</th><th>response rate, req/s</th><th>CPU, us/req</th><th>memory, peak MiB</th></tr>
-  <tr><td>Gos terndb Embedded: KV (gos-terndb-embedded-kv)</td><td>304,910</td><td>6.7</td><td>13.5</td></tr>
-<tr><td>Gos terndb Embedded: SQL (gos-terndb-embedded-sql)</td><td>296,012</td><td>6.9</td><td>13.2</td></tr>
-<tr><td>Rust redb Embedded: KV (rust-redb-embedded-kv)</td><td>217,973</td><td>8.2</td><td>17.9</td></tr>
-<tr><td>Gos terndb (gos run) Embedded: KV (gos-terndb-embedded-kv-gos-run)</td><td>133,315</td><td>36.1</td><td>140.7</td></tr>
-<tr><td>Rust SQLite Embedded: SQL (rust-sqlite-embedded-sql)</td><td>122,525</td><td>23.8</td><td>89.4</td></tr>
-<tr><td>Go SQLite Embedded: SQL (go-sqlite-embedded-sql)</td><td>88,935</td><td>37.9</td><td>53.4</td></tr>
-<tr><td>Gos terndb (gos run) Embedded: SQL (gos-terndb-embedded-sql-gos-run)</td><td>17,579</td><td>55.5</td><td>100.6</td></tr>
-<tr><td>Python SQLite Embedded: SQL (python-sqlite-embedded-sql)</td><td>5,438</td><td>139.0</td><td>138.8</td></tr>
+  <tr><td>Gos terndb Embedded: KV (gos-terndb-embedded-kv)</td><td>321,631</td><td>7.5</td><td>15.4</td></tr>
+<tr><td>Gos terndb Embedded: SQL (gos-terndb-embedded-sql)</td><td>313,118</td><td>7.7</td><td>14.5</td></tr>
+<tr><td>Rust redb Embedded: KV (rust-redb-embedded-kv)</td><td>286,376</td><td>7.4</td><td>17.9</td></tr>
+<tr><td>Rust SQLite Embedded: SQL (rust-sqlite-embedded-sql)</td><td>180,654</td><td>19.7</td><td>53.1</td></tr>
+<tr><td>Gos terndb (gos run) Embedded: KV (gos-terndb-embedded-kv-gos-run)</td><td>151,828</td><td>30.8</td><td>171.6</td></tr>
+<tr><td>Gos terndb (gos run) Embedded: SQL (gos-terndb-embedded-sql-gos-run)</td><td>144,970</td><td>32.9</td><td>172.9</td></tr>
+<tr><td>Go SQLite Embedded: SQL (go-sqlite-embedded-sql)</td><td>93,492</td><td>35.8</td><td>53.1</td></tr>
+<tr><td>Python SQLite Embedded: SQL (python-sqlite-embedded-sql)</td><td>12,699</td><td>102.8</td><td>164.4</td></tr>
 
 </table>
 <table>
@@ -42,11 +40,11 @@ On 24 cores (Linux 7.0.0-28-generic).</p>
   returns. The memory is the whole process, which is what the store costs to
   run.</caption>
   <tr><th>target</th><th>queries/s</th><th>memory, peak MiB</th></tr>
-  <tr><td>Gos terndb Embedded: KV (gos-terndb-embedded-kv)</td><td>3,586,662</td><td>11.8</td></tr>
-<tr><td>Gos terndb Embedded: SQL (gos-terndb-embedded-sql)</td><td>3,474,022</td><td>12.8</td></tr>
-<tr><td>Rust redb Embedded: KV (rust-redb-embedded-kv)</td><td>2,461,743</td><td>15.6</td></tr>
-<tr><td>Rust redb (typed) Embedded: KV (rust-redb-embedded-kv-typed)</td><td>1,804,314</td><td>11.6</td></tr>
-<tr><td>Rust SQLite Embedded: SQL (rust-sqlite-embedded-sql)</td><td>656,555</td><td>5.8</td></tr>
-<tr><td>Go SQLite Embedded: SQL (go-sqlite-embedded-sql)</td><td>95,104</td><td>18.1</td></tr>
+  <tr><td>gos-kv Embedded:  (gos-kv)</td><td>9,567,232</td><td>14.1</td></tr>
+<tr><td>gos-sql Embedded:  (gos-sql)</td><td>8,468,480</td><td>14.3</td></tr>
+<tr><td>rust-redb Embedded:  (rust-redb)</td><td>2,588,817</td><td>15.6</td></tr>
+<tr><td>rust-redb-typed Embedded:  (rust-redb-typed)</td><td>1,947,658</td><td>11.9</td></tr>
+<tr><td>rust-sqlite Embedded:  (rust-sqlite)</td><td>697,874</td><td>5.9</td></tr>
+<tr><td>go-sqlite Embedded:  (go-sqlite)</td><td>103,935</td><td>18.0</td></tr>
 
 </table>

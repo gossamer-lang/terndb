@@ -89,11 +89,13 @@ covers both.
 ## Why it is fast
 
 Rows are addressed by rowid in a dense `Vec` - three words a row - so a keyed
-read builds no key and hashes nothing. A reader holds one sealed generation in
-memory when it fits its budget, and a row in that generation is rendered where
-it lies: no positional read, and no copy of the value out of the buffer first. A
-row outside it costs one positional read, checked against the checksum its slot
-carries.
+read builds no key and hashes nothing. A store holds as many sealed
+generations in memory as its budget allows (`Engine::set_resident_budget`,
+64 MiB by default), and a row in one of them is rendered where it lies: no
+positional read, and no copy of the value out of the buffer first. A row
+outside them costs one positional read, checked against the checksum its slot
+carries. A walk over a whole table reads the log a block at a time, and a merge
+lays each table out in `rowid` order so those blocks follow one another.
 
 What the statement layer costs, measured against the same store through both
 front ends, is in `benchmarks/`: `gos-sql` answers a request with a `SELECT`,

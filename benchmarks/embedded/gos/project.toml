@@ -1,6 +1,6 @@
 [project]
 id = "terndb.db/bench-embedded"
 version = "0.1.0"
-gossamer-version = "^v0.58.13"
+gossamer-version = "^v0.63.1"
 
 [dependencies]

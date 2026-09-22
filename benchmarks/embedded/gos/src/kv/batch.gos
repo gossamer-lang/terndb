@@ -14,6 +14,11 @@ pub (package) struct Staged {
     pub (package) key: String
     pub (package) entry: kv::Entry
     pub (package) remove: bool
+    /// The table and row the key addresses, or -1 for a key nobody placed.
+    pub (package) tid: i64
+    pub (package) rid: i64
+    /// The key's checksum, carried so placing the row recomputes nothing.
+    pub (package) kcrc: i64
 }
 
 /// Opens a batch: nothing written inside it is visible until it commits.
@@ -22,6 +27,9 @@ pub fn begin(st: &mut kv::Store) -> Result<(), String> {
     if st.in_batch { return Err("a batch is already open") }
     st.in_batch = true
     st.batch_start = st.cur_off
+    st.pending_at = st.cur_off
+    st.pending.clear()
+    st.touched = false
     st.staged.clear()
     Ok(())
 }
@@ -33,15 +41,18 @@ pub fn commit(st: &mut kv::Store) -> Result<(), String> {
     // the flush and the index is only touched once both have succeeded. A
     // commit that cannot be made durable is rewound here: leaving the batch
     // open would refuse every statement after it for the life of the store.
-    if let Err(e) = kv::append(st, log::record("", log::KIND_COMMIT, #[], log::record_crc("", #[]))) {
+    if let Err(e) = kv::stage(st, "", log::KIND_COMMIT, #[], log::record_crc("", #[])) {
         return Err(undo(st, e))
     }
+    if let Err(e) = kv::flush_pending(st) { return Err(undo(st, e)) }
     if st.durable {
         if let Err(e) = st.sync() { return Err(undo(st, e)) }
     }
     for change in st.staged {
         if change.remove {
             rows::forget(st, change.key)
+        } else if change.tid >= 0 {
+            rows::remember_row(st, change.tid, change.rid, change.kcrc, change.entry)
         } else {
             rows::remember(st, change.key, change.entry)
         }
@@ -68,7 +79,14 @@ pub fn rollback(st: &mut kv::Store) -> Result<(), String> {
     if !st.in_batch { return Err("no batch is open") }
     st.cur_off = st.batch_start
     st.staged.clear()
+    st.pending.clear()
     st.in_batch = false
+    // Bytes the batch never wrote need no rewind; bytes it wrote early, or a
+    // write that failed part-way, are cut back so the file ends where the store
+    // says it does.
+    st.pending_at = st.batch_start
+    if !st.touched { return Ok(()) }
+    st.touched = false
     match st.data {
         Some(f) => {
             match f.set_len(st.batch_start) {
@@ -209,6 +227,96 @@ mod tests {
         let mut after = opened(dir)
         assert(matches(after.get("old"), kv::Read::Absent))
         assert_eq(must_get(&mut after, "new"), #[2u8])
+    }
+
+    // Enough rows to pass the size at which a batch writes what it has so far.
+    fn fill_past_flush(st: &mut kv::Store, tid: i64) {
+        for rid in 1..40 {
+            assert(kv::rows::write(st, tid, rid, #[7u8; 40_000]).is_ok())
+        }
+    }
+
+    #[test]
+    fn a_large_batch_rolled_back_leaves_the_file_where_it_was() {
+        let dir = fresh("batch_large_rollback")
+        let mut st = opened(dir)
+        assert(st.put("keep", #[1u8]).is_ok())
+        let mark = st.cur_off
+        let tid = kv::rows::open_table(&mut st, "t")
+        assert(super::begin(&mut st).is_ok())
+        fill_past_flush(&mut st, tid)
+        assert(fs::file_size(kv::log::data_path(dir, st.gen)) > mark, "part of the batch was written early")
+        assert(super::rollback(&mut st).is_ok())
+        assert_eq(fs::file_size(kv::log::data_path(dir, st.gen)), mark)
+        assert_eq(st.len(), 1)
+        let mut again = opened(dir)
+        assert_eq(again.len(), 1)
+        assert_eq(must_get(&mut again, "keep"), #[1u8])
+    }
+
+    #[test]
+    fn a_large_batch_that_never_commits_is_not_replayed() {
+        let dir = fresh("batch_large_uncommitted")
+        let mut st = opened(dir)
+        assert(st.put("keep", #[1u8]).is_ok())
+        let tid = kv::rows::open_table(&mut st, "t")
+        assert(super::begin(&mut st).is_ok())
+        fill_past_flush(&mut st, tid)
+        assert(st.sync().is_ok())
+        // The process stops here, with part of the batch on disk.
+        let mut after = opened(dir)
+        assert_eq(after.len(), 1, "no row of the batch is replayed")
+        assert_eq(after.faults.len(), 0, "an unfinished batch is not a fault")
+        // A write shorter than the abandoned batch leaves its tail behind it,
+        // which the next open must not read as a damaged record.
+        assert(after.put("next", #[2u8]).is_ok())
+        let mut again = opened(dir)
+        assert_eq(again.len(), 2)
+        assert_eq(again.faults, #[])
+        assert_eq(must_get(&mut again, "next"), #[2u8])
+    }
+
+    #[test]
+    fn what_an_abandoned_batch_leaves_behind_is_never_read_as_a_record() {
+        let dir = fresh("batch_abandoned_tail")
+        let mut st = opened(dir)
+        assert(st.put("keep", #[1u8]).is_ok())
+        // The abandoned value carries, eight bytes in, what reads as a whole
+        // record header whose checksum is wrong: crc 0x09090909, a put, a
+        // one-byte key and a one-byte value.
+        let mut val: Vec<u8> = #[0u8; 8]
+        val.extend(#[9u8, 9, 9, 9, 0, 1, 0, 1, 0, 0, 0, 65, 66])
+        assert(super::begin(&mut st).is_ok())
+        assert(st.put("abandon", val).is_ok())
+        assert(kv::flush_pending(&mut st).is_ok())
+        assert(st.sync().is_ok())
+        // The process stops. The next write - an 11-byte header, a one-byte key
+        // and a three-byte value, then an 11-byte commit - ends exactly where
+        // that header begins.
+        let mut after = opened(dir)
+        assert(after.put("n", #[1u8, 2, 3]).is_ok())
+        let mut again = opened(dir)
+        assert_eq(again.faults, #[], "an abandoned batch is not a damaged log")
+        assert_eq(again.len(), 2)
+        assert_eq(must_get(&mut again, "n"), #[1u8, 2, 3])
+    }
+
+    #[test]
+    fn a_commit_that_cannot_be_written_leaves_nothing_visible() {
+        let dir = fresh("batch_write_fails")
+        let mut st = opened(dir)
+        assert(st.put("keep", #[1u8]).is_ok())
+        let writable = st.data
+        // A handle opened for reading refuses the batch's one write.
+        st.data = kv::log::open_read(kv::log::data_path(dir, st.gen))
+        assert(st.put("lost", #[2u8]).is_err())
+        assert(matches(st.get("lost"), kv::Read::Absent))
+        st.data = writable
+        assert(st.put("after", #[3u8]).is_ok(), "the store takes writes again")
+        let mut again = opened(dir)
+        assert_eq(again.len(), 2)
+        assert(matches(again.get("lost"), kv::Read::Absent))
+        assert_eq(must_get(&mut again, "after"), #[3u8])
     }
 
     #[test]

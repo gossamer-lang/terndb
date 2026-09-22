@@ -1,5 +1,22 @@
 # Changelog
 
+## 0.3.0
+
+- Requires Gossamer 0.63.1.
+- A text column renders through `String::push_json_quoted`, so a row's JSON escapes text exactly as `std::encoding::json` does: `0x08` and `0x0c` are written `\b` and `\f` rather than `\u0008` and `\u000c`, and `<`, `>`, `&`, U+2028, and U+2029 are written as `\u` escapes.
+- A statement's records reach the log in one write at commit: a 2,000-row `INSERT` makes one write where it made 2,003.
+- `ORDER BY rowid` is accepted, `ASC` or `DESC`, and costs no sort.
+- `ORDER BY <col> LIMIT n` holds only the leading rows while it walks and fully decodes only the rows it returns; rows with equal values come back in row-id order, with or without a `LIMIT`.
+- Table walks (a non-indexed `WHERE`, `ORDER BY`, `UPDATE` and `DELETE` with a filter, building an index) read the log in blocks instead of one read per row.
+- `COMPACT` copies each live record as it lies, checked against its checksum, writes in large blocks, and lays each table out in row-id order.
+- Hint files are written in sections with a trailing checksum, and a hint that fails it is replaced by reading the data file; hints written by 0.2.0 still open.
+- Opening a store places rows from hints and from the log without spelling out their keys.
+- Readers and writers hold as many sealed generations in memory as `Engine::set_resident_budget` allows (64 MiB by default), and every read path uses them.
+- Values built with `Value::int8`, `int16`, `int32`, `float32` and `datetime` are accepted by columns of their own type, and any whole number is accepted as a row id.
+- A writer cuts away a batch a crash left unfinished before it appends, so a later, shorter write no longer makes the next open report a damaged record.
+- A writer opening a log that stops at a damaged record writes to a new generation and leaves the damaged one on disk.
+- `terndb bench` also measures inserts, walks, ordered reads, `COMPACT` and reopening, and times each phase in nanoseconds so a fast phase no longer reads as 0.
+
 ## 0.2.0
 
 - Requires Gossamer 0.58.13: a library method and a caller's free function of the same name shared one entry in the toolchain's parameter table, so a program with its own `fn run` or `fn get` received a reference where it declared a value.

@@ -4,6 +4,7 @@ use crate::kv
 use crate::sql
 use super::filter
 use super::scan
+use super::order
 
 // A statement parsed and planned once, so running it again costs neither.
 //
@@ -37,7 +38,6 @@ pub struct Prepared {
     /// `,"<column>":` per projected column, built here so a render appends one
     /// piece per column rather than three.
     json_keys: Vec<String>
-    has_order: bool
     order_idx: i64
     order_asc: bool
     limit: i64
@@ -81,7 +81,7 @@ pub fn prepare(eng: &mut engine::Engine, src: String) -> Result<Prepared, String
                     }
                 }
             }
-            let order_idx = if q.has_order { schema::col_index(&mut def, q.order_col)? } else { -1 }
+            let order_idx = if q.has_order { order::resolve(&mut def, q.order_col)? } else { order::NONE }
             // One row id and nothing else to test is a single read: no walk, no
             // ordering to settle, and no limit that could cut it short.
             let point_read = filter.id_ops.len() == 1 && filter.id_ops[0] == sql::OP_EQ
@@ -92,7 +92,7 @@ pub fn prepare(eng: &mut engine::Engine, src: String) -> Result<Prepared, String
                 tid: tid, def: def, filter: filter
                 count_only: q.count_only, picks: picks, identity: identity
                 json_keys: codec::json::keys(out_cols), out_cols: out_cols
-                has_order: q.has_order, order_idx: order_idx, order_asc: q.order_asc
+                order_idx: order_idx, order_asc: q.order_asc
                 limit: q.limit, offset: q.offset
             })
         }
@@ -210,7 +210,7 @@ impl Prepared {
         // walked once on the path that runs most often.
         let rid = if self.filter.id_eq_arg >= 0 {
             let a = args[self.filter.id_eq_arg]
-            if a.tag != codec::TAG_I64 && a.tag != codec::TAG_I32 {
+            if !codec::is_int(a.tag) {
                 return Err("rowid compares against a whole number, not " + codec::type_name_for_tag(a.tag))
             }
             a.i
@@ -238,23 +238,12 @@ impl Prepared {
     // rows it matches, and the order and limit the plan settled.
     fn run_walk(&mut self, eng: &mut engine::Engine, args: Vec<codec::Value>) -> Result<engine::QueryResult, String> {
         let filter = filter::bind(self.filter, args)?
-        let want = if self.count_only { scan::Want::Count } else { scan::Want::Values }
-        // An ORDER BY has to see every match before it can say which ones survive
-        // the limit; without one, the walk stops as soon as the limit is filled.
-        let cap = if self.has_order || self.limit < 0 { -1 } else { self.limit + self.offset }
-        let matched, mut kept = scan::table(eng, &mut self.def, filter, want, cap)?
         if self.count_only {
-            return engine::counted(engine::window_count(matched, self.offset, self.limit))
+            let cap = if self.limit < 0 { -1 } else { self.limit + self.offset }
+            let walk = scan::table(eng, &mut self.def, filter, scan::Want::Count, cap, false, scan::no_top())?
+            return engine::counted(engine::window_count(walk.matched, self.offset, self.limit))
         }
-        if self.has_order {
-            let oi = self.order_idx
-            if self.order_asc {
-                kept.sort_by(|a, b| schema::cmp_vals(a.vals[oi], b.vals[oi]))
-            } else {
-                kept.sort_by(|a, b| schema::cmp_vals(b.vals[oi], a.vals[oi]))
-            }
-        }
-        kept = engine::window(kept, self.offset, self.limit)
+        let kept = order::rows(eng, &mut self.def, filter, self.order_idx, self.order_asc, self.limit, self.offset)?
         if self.identity { return Ok(engine::QueryResult { cols: self.out_cols, rows: kept, count: kept.len() }) }
         let mut projected: Vec<engine::Row> = #[]
         for row in kept {

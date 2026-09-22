@@ -64,18 +64,21 @@ pub (package) fn decode(buf: Vec<u8>) -> Result<engine::TableDef, String> {
     Ok(def)
 }
 
-// A literal is accepted for a column when it names the same kind of value:
-// the parser only ever produces i64, f64, text, bool and nil, so this is where
-// each one is narrowed to the column's declared width.
+// A value is accepted for a column when it names the same kind of value, and
+// is narrowed here to the column's declared width. A literal is always i64,
+// f64, text, bool or nil; a bound value may be any width the caller built, so
+// a whole number is range-checked whatever width it arrived at, and a float
+// of either width is taken by either float column.
 pub (package) fn coerce(val: codec::Value, tag: u8, col: String) -> Result<codec::Value, String> {
     if val.tag == codec::TAG_NIL { return Ok(codec::Value::nil()) }
     if tag == codec::TAG_TEXT && val.tag == codec::TAG_TEXT { return Ok(val) }
     if tag == codec::TAG_BOOL && val.tag == codec::TAG_BOOL { return Ok(val) }
     if tag == codec::TAG_DT {
+        if val.tag == codec::TAG_DT { return Ok(val) }
         if val.tag == codec::TAG_TEXT { return Ok(codec::Value::datetime(codec::datetime::parse(val.s)?)) }
-        if val.tag == codec::TAG_I64 { return Ok(codec::Value::datetime(val.i)) }
+        if codec::is_int(val.tag) { return Ok(codec::Value::datetime(val.i)) }
     }
-    if val.tag == codec::TAG_I64 {
+    if codec::is_int(val.tag) {
         match codec::int_range(tag) {
             Some((lo, hi)) => {
                 if val.i < lo || val.i > hi {
@@ -90,9 +93,9 @@ pub (package) fn coerce(val: codec::Value, tag: u8, col: String) -> Result<codec
         if tag == codec::TAG_F32 { return Ok(codec::Value::float32(val.i as f64)) }
         if tag == codec::TAG_F64 { return Ok(codec::Value::float(val.i as f64)) }
     }
-    if val.tag == codec::TAG_F64 {
+    if is_float(val.tag) {
         if tag == codec::TAG_F32 { return Ok(codec::Value::float32(val.f)) }
-        if tag == codec::TAG_F64 { return Ok(val) }
+        if tag == codec::TAG_F64 { return Ok(codec::Value::float(val.f)) }
     }
     Err("column '" + col + "' is " + codec::type_name_for_tag(tag) +
         "; a " + codec::type_name_for_tag(val.tag) + " value does not fit it")

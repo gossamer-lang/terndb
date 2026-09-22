@@ -13,22 +13,22 @@ use crate::sql
 pub struct Timing {
     pub label: String
     pub ops: i64
-    pub total_ms: i64
+    pub total_ns: i64
 }
 
 /// Nanoseconds per operation, as a float so a sub-microsecond op still reads.
 pub fn ns_per_op(t: Timing) -> f64 {
-    if t.ops <= 0 { 0.0 } else { (t.total_ms as f64) * 1000000.0 / (t.ops as f64) }
+    if t.ops <= 0 { 0.0 } else { (t.total_ns as f64) / (t.ops as f64) }
 }
 
 /// Operations per second, the rate the report is written in.
 pub fn per_second(t: Timing) -> f64 {
-    if t.total_ms <= 0 { 0.0 } else { (t.ops as f64) * 1000.0 / (t.total_ms as f64) }
+    if t.total_ns <= 0 { 0.0 } else { (t.ops as f64) * 1_000_000_000.0 / (t.total_ns as f64) }
 }
 
 /// One line describing a timing: what was measured, and how many a second.
 pub fn render(t: Timing) -> String {
-    format("{:<30} {:>14.0} queries/s", t.label, per_second(t))
+    format("{:<38} {:>14.0} queries/s", t.label, per_second(t))
 }
 
 /// The peak resident set of this process in MiB, where the kernel publishes one.
@@ -56,8 +56,8 @@ pub fn peak_rss_mb() -> Option<f64> {
 /// The closing line of a run: what the process cost to run.
 pub fn memory_line() -> String {
     match peak_rss_mb() {
-        Some(mb) => format("{:<30} {:>14.1} MiB", "peak resident memory", mb)
-        None => format("{:<30} {:>14} MiB", "peak resident memory", "-")
+        Some(mb) => format("{:<38} {:>14.1} MiB", "peak resident memory", mb)
+        None => format("{:<38} {:>14} MiB", "peak resident memory", "-")
     }
 }
 
@@ -133,7 +133,7 @@ pub fn time_get(dir: String, n: i64) -> Result<Timing, String> {
         keys.push(key_of(k))
         k += 1
     }
-    let start = time::now_ms()
+    let start = time::monotonic_nanos()
     let mut hits: i64 = 0
     let mut i: i64 = 0
     while i < n {
@@ -144,15 +144,15 @@ pub fn time_get(dir: String, n: i64) -> Result<Timing, String> {
         }
         i += 1
     }
-    let elapsed = time::now_ms() - start
+    let elapsed = time::monotonic_nanos() - start
     if hits <= 0 { return Err("bench: read nothing") }
-    Ok(Timing { label: "kv::get", ops: n, total_ms: elapsed })
+    Ok(Timing { label: "kv::get", ops: n, total_ns: elapsed })
 }
 
 /// Times `n` whole-file reads of the baseline payload.
 pub fn time_fs_read(dir: String, n: i64) -> Result<Timing, String> {
     let path = dir + "/baseline.bin"
-    let start = time::now_ms()
+    let start = time::monotonic_nanos()
     let mut bytes: i64 = 0
     let mut i: i64 = 0
     while i < n {
@@ -162,9 +162,9 @@ pub fn time_fs_read(dir: String, n: i64) -> Result<Timing, String> {
         }
         i += 1
     }
-    let elapsed = time::now_ms() - start
+    let elapsed = time::monotonic_nanos() - start
     if bytes <= 0 { return Err("bench: read nothing") }
-    Ok(Timing { label: "fs::read (same payload)", ops: n, total_ms: elapsed })
+    Ok(Timing { label: "fs::read (same payload)", ops: n, total_ns: elapsed })
 }
 
 /// Fills a table with `rows` rows for the statement benchmarks.
@@ -193,24 +193,24 @@ pub fn prepare_sql(dir: String, rows: i64) -> Result<engine::Engine, String> {
 
 /// Times `reps` runs of one statement against an already-filled engine.
 pub fn time_stmt(eng: &mut engine::Engine, label: String, src: String, reps: i64) -> Result<Timing, String> {
-    let start = time::now_ms()
+    let start = time::monotonic_nanos()
     let mut i: i64 = 0
     while i < reps {
         let _ = eng.exec(src)?
         i += 1
     }
-    Ok(Timing { label: label, ops: reps, total_ms: time::now_ms() - start })
+    Ok(Timing { label: label, ops: reps, total_ns: time::monotonic_nanos() - start })
 }
 
 /// Times parsing one statement, which is where a long VALUES list is felt.
 pub fn time_parse(label: String, src: String, reps: i64) -> Result<Timing, String> {
-    let start = time::now_ms()
+    let start = time::monotonic_nanos()
     let mut i: i64 = 0
     while i < reps {
         let _ = sql::parser::parse(src)?
         i += 1
     }
-    Ok(Timing { label: label, ops: reps, total_ms: time::now_ms() - start })
+    Ok(Timing { label: label, ops: reps, total_ns: time::monotonic_nanos() - start })
 }
 
 /// Runs the statement benchmarks and returns the report lines.
@@ -232,6 +232,69 @@ pub fn sql_report(dir: String, rows: i64) -> Result<Vec<String>, String> {
         i += 1
     }
     out.push(render(time_parse("parse 200-row INSERT", wide, reps)?))
+    Ok(out)
+}
+
+// Times `reps` statements, each built from its repetition number, so every
+// insert names a row of its own.
+fn time_each(eng: &mut engine::Engine, label: String, reps: i64, stmt: Fn(i64) -> String) -> Result<Timing, String> {
+    let mut srcs: Vec<String> = #[]
+    for i in 0..reps { srcs.push(stmt(i)) }
+    let start = time::monotonic_nanos()
+    for src in srcs { let _ = eng.exec(src)? }
+    Ok(Timing { label: label, ops: reps, total_ns: time::monotonic_nanos() - start })
+}
+
+// One INSERT carrying `n` rows, numbered from `from`.
+fn wide_insert(from: i64, n: i64) -> String {
+    let mut stmt = "INSERT INTO bench VALUES "
+    for i in 0..n {
+        if i > 0 { stmt += ", " }
+        let id = from + i
+        stmt += "(" + id.to_string() + ", 'name-" + id.to_string() + "', 1.5, true)"
+    }
+    stmt
+}
+
+// Times reopening the store in `dir`, which is what a restart pays before it
+// answers anything.
+fn time_open(dir: String, label: String, reps: i64) -> Result<Timing, String> {
+    let start = time::monotonic_nanos()
+    for _ in 0..reps {
+        let eng = engine::open(dir, read_only: true)?
+        if eng.table_names().len() == 0 { return Err("bench: reopened an empty store") }
+    }
+    Ok(Timing { label: label, ops: reps, total_ns: time::monotonic_nanos() - start })
+}
+
+/// Runs the write, walk, ordering, merge and open benchmarks over a table of
+/// `rows` rows and returns the report lines.
+pub fn store_report(dir: String, rows: i64) -> Result<Vec<String>, String> {
+    let mut eng = prepare_sql(dir, rows)?
+    let mut out = #[format("terndb store benchmark: {} rows in {}", rows, dir)]
+    let reps: i64 = 50
+    // The inserts add a tenth of the table between them, so the statements
+    // timed after them walk a table of the size that was asked for.
+    let wide = if rows >= 5_000 { 500 } else { max(rows / 50, 1) }
+    let batches = max(rows / (40 * wide), 1)
+    eng.set_durable(false)
+    out.push(render(time_each(&mut eng, "INSERT 1 row (no fsync)", reps, |i| wide_insert(rows + i, 1))?))
+    out.push(render(time_each(&mut eng, "INSERT " + wide.to_string() + " rows (no fsync)", batches, |i| wide_insert(rows * 2 + i * wide, wide))?))
+    eng.set_durable(true)
+    out.push(render(time_each(&mut eng, "INSERT 1 row (fsync)", reps, |i| wide_insert(rows * 4 + i, 1))?))
+    out.push(render(time_each(&mut eng, "INSERT " + wide.to_string() + " rows (fsync)", batches, |i| wide_insert(rows * 5 + i * wide, wide))?))
+    out.push(render(time_stmt(&mut eng, "scan: COUNT(*) WHERE name =", "SELECT COUNT(*) FROM bench WHERE name = 'name-7'", reps)?))
+    out.push(render(time_stmt(&mut eng, "scan: UPDATE WHERE id <", "UPDATE bench SET score = 2.5 WHERE id < " + (rows / 10).to_string(), reps)?))
+    out.push(render(time_stmt(&mut eng, "ORDER BY name LIMIT 20", "SELECT * FROM bench ORDER BY name LIMIT 20", reps)?))
+    out.push(render(time_stmt(&mut eng, "ORDER BY id DESC LIMIT 20 OFFSET 100", "SELECT * FROM bench ORDER BY id DESC LIMIT 20 OFFSET 100", reps)?))
+    // Half the table superseded, so the merge moves as much as it drops.
+    let _ = eng.exec("UPDATE bench SET score = 3.5 WHERE id < " + (rows / 2).to_string())?
+    out.push(render(time_stmt(&mut eng, "COMPACT (half superseded)", "COMPACT", 1)?))
+    eng.sync()?
+    out.push(render(time_open(dir, "open (no index)", reps)?))
+    let _ = eng.exec("CREATE INDEX IF NOT EXISTS ON bench (name)")?
+    eng.sync()?
+    out.push(render(time_open(dir, "open (one index)", reps)?))
     Ok(out)
 }
 
@@ -304,8 +367,23 @@ mod tests {
     }
 
     #[test]
+    fn the_store_benchmark_runs_every_phase() {
+        let dir = "/tmp/terndb_bench_test/store"
+        let _ = fs::remove_dir_all(dir)
+        match super::store_report(dir, 300) {
+            Ok(lines) => {
+                assert_eq(lines.len(), 12)
+                for line in lines.slice(1, lines.len()).unwrap_or(#[]) {
+                    assert(line.contains("queries/s"), "got: " + line)
+                }
+            }
+            Err(e) => assert(false, e)
+        }
+    }
+
+    #[test]
     fn ns_per_op_divides_the_measured_total() {
-        assert_eq(super::ns_per_op(super::Timing { label: "x", ops: 1000, total_ms: 1 }), 1000.0)
-        assert_eq(super::ns_per_op(super::Timing { label: "x", ops: 0, total_ms: 5 }), 0.0)
+        assert_eq(super::ns_per_op(super::Timing { label: "x", ops: 1000, total_ns: 1_000_000 }), 1000.0)
+        assert_eq(super::ns_per_op(super::Timing { label: "x", ops: 0, total_ns: 5 }), 0.0)
     }
 }

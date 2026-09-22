@@ -1,28 +1,38 @@
 use std::fs
+use std::hash::crc32
 
 // terndb KV engine: a Bitcask-style append-only log with an in-memory index.
 //
 //   data record:  [crc u32 LE][kind u8][klen u16 LE][vlen u32 LE][key][value]
-//   hint record:  [klen u16 LE][vlen u32 LE][crc u32 LE][offset u64 LE][key]
+//   hint file:    "TNH2", then sections:
+//                   table: [1][nlen u16][name][count u64][top u64]
+//                          count x [rid u64][offset u64][vlen u32][crc u32][kcrc u32]
+//                   keys:  [2][count u64]
+//                          count x [klen u16][vlen u32][crc u32][offset u64][key]
+//                 and a trailer [0][records u64][crc32 of all before it u32].
+//                 A hint without "TNH2" is the older form: key records only.
 //
 // Files are named `<gen>.data`, with `<gen>.hint` beside a generation that
 // compaction has merged. A generation carrying a hint file is sealed: nothing
 // is ever appended to it again, so the hint stays an exact description of the
 // data file and a restart can rebuild that generation's index without reading
-// a single value byte. Writes go to the one unsealed generation.
+// a single value byte. Writes go to the one unsealed generation. A merge lays
+// each table's rows out in row-id order, so a walk over a table reads its
+// generation a block at a time.
 //
-// A read is one index lookup plus one positional read of the value. The record's
-// checksum is carried in the index rather than re-read from its header, so a get
-// touches the file exactly once and still verifies what it returns.
+// A read is one index lookup plus one positional read of the value, or a look
+// at the sealed generations the store holds in memory. The record's checksum is
+// carried in the index rather than re-read from its header, so a get touches the
+// file at most once and still verifies what it returns.
 //
-// Writes are transactional. A batch appends its records and then a commit
-// record, and only a committed batch is ever visible: the index is updated when
-// the commit lands, and a rebuild applies records only as far as the last commit
-// it saw. A batch interrupted by a crash is therefore invisible and its bytes
-// are overwritten by the next append, which is what makes a multi-row statement
-// all-or-nothing.
+// Writes are transactional. A batch gathers its records and a commit record and
+// writes them together, and only a committed batch is ever visible: the index is
+// updated when the commit lands, and a rebuild applies records only as far as
+// the last commit it saw. A batch interrupted by a crash is therefore invisible,
+// and a writer opening the store cuts it away before it appends, which is what
+// makes a multi-row statement all-or-nothing.
 //
-// The parts: [`log`] frames a record and names the files, [`index`] is what the
+// The parts: [`log`] frames a record and names the files, [`rows`] is what the
 // store holds in memory, [`batch`] makes a group of records visible at once,
 // [`recover`] rebuilds the index at open, [`scan`] answers a key prefix, and
 // [`compact`] merges the log.
@@ -85,17 +95,18 @@ pub struct Store {
     /// Fraction of the log that may be superseded before a commit merges it,
     /// or 0 to leave merging to the caller.
     pub auto_compact: f64
-    /// The sealed generation whose bytes the store holds, or 0 for none.
+    /// The sealed generations whose bytes the store holds, back to back in
+    /// `resident_bytes`, each starting at the matching `resident_base`.
     ///
     /// A sealed generation carries a hint file and is never appended to
     /// again, so nothing can make the held bytes wrong and nothing has to
-    /// invalidate them. One generation is held rather than a map of them: a
-    /// compacted store has one, and the bytes are reached as a field so a
-    /// read is a look at them rather than a copy out of a container.
-    pub resident_gen: i64
-    /// The held generation's bytes, empty when none is held.
+    /// invalidate them. The bytes are one buffer reached as a field, so a read
+    /// is a look at them rather than a copy out of a container.
+    pub resident_gens: Vec<i64>
+    pub resident_base: Vec<i64>
+    /// The held generations' bytes, empty when none is held.
     pub resident_bytes: Vec<u8>
-    /// Bytes a held generation may occupy, or 0 to hold none.
+    /// Bytes the held generations may occupy between them, or 0 to hold none.
     pub resident_budget: i64
     /// The exclusive lock a writer holds on the directory, for as long as it is
     /// open. A reader takes none.
@@ -109,6 +120,19 @@ pub struct Store {
     in_batch: bool
     batch_start: i64
     staged: Vec<batch::Staged>
+    /// The open batch's records not yet written, which land at `pending_at`.
+    ///
+    /// A batch is written as one piece at its commit rather than a record at a
+    /// time: its records are invisible until the commit record lands, so the
+    /// file only has to hold them by then.
+    pending: Vec<u8>
+    pending_at: i64
+    /// Whether the open batch has written to the file, which is what a
+    /// rollback has to cut back.
+    touched: bool
+    /// How many row-shaped keys the hash index has been handed, so a row that
+    /// has only ever been held densely costs no hash probe to place.
+    hashed_rows: i64
 }
 
 /// Opens the store in `dir`, rebuilding the index from the generations already there.
@@ -119,7 +143,7 @@ pub fn open(dir: String, read_only: bool = false) -> Result<Store, String> {
     let gens = log::data_generations(dir)?
     // The generation without a hint file beside it is the one writes went to,
     // and how far its records reach is where the next one goes.
-    let unsealed, unsealed_end = rebuild(&mut st, dir, gens)
+    let unsealed, unsealed_end, damaged = rebuild(&mut st, dir, gens)
     if read_only {
         st.gen = if unsealed > 0 { unsealed } else { newest_or(gens, 1) }
         // A reader opens every generation it might read before it answers
@@ -127,22 +151,35 @@ pub fn open(dir: String, read_only: bool = false) -> Result<Store, String> {
         // the store's own state untouched while it serves, which is what lets
         // several readers work from one store at the same time.
         warm_readers(&mut st, gens)
-        rows::admit_resident(&mut st, gens)
+        rows::admit_resident(&mut st)
         return Ok(st)
     }
     // Writes go above every generation the directory holds. Generations are
     // replayed in order, so a sealed one above the active file would be read
     // back over the records appended below it.
+    //
+    // A generation whose replay stopped at a damaged record is left as it is,
+    // so what the damage cost stays on disk to be looked at, and writes start a
+    // generation of their own above it.
     let newest = newest_or(gens, 0)
-    if unsealed == newest && unsealed > 0 {
+    if unsealed == newest && unsealed > 0 && !damaged {
         st.gen = unsealed
         st.cur_off = unsealed_end
     } else {
         st.gen = newest + 1
         st.cur_off = 0
     }
-    st.data = Some(log::open_append(log::data_path(dir, st.gen))?)
+    let f = log::open_append(log::data_path(dir, st.gen))?
+    // Whatever lies past the last commit is a batch that never finished. It is
+    // cut away rather than written over: a shorter write would leave the rest
+    // of it behind the new commit, where the next replay would read it.
+    if fs::file_size(log::data_path(dir, st.gen)) > st.cur_off {
+        if let Err(e) = f.set_len(st.cur_off) { return Err("open: truncating an unfinished batch: " + e.message()) }
+        if let Err(e) = f.sync_all() { return Err("open: sync: " + e.message()) }
+    }
+    st.data = Some(f)
     log::sync_dir(dir)?
+    rows::admit_resident(&mut st)
     Ok(st)
 }
 
@@ -178,7 +215,12 @@ fn empty_store(dir: String, read_only: bool) -> Store {
         read_only: read_only, live_bytes: 0, dead_bytes: 0, readers: Map::new()
         tables: #[]
         durable: true, auto_compact: compact::AUTO_COMPACT_RATIO, in_batch: false, batch_start: 0, staged: #[]
-        resident_gen: 0
+        pending: #[]
+        pending_at: 0
+        touched: false
+        hashed_rows: 0
+        resident_gens: #[]
+        resident_base: #[]
         resident_bytes: #[]
         resident_budget: rows::RESIDENT_BUDGET
         lock: None
@@ -188,10 +230,12 @@ fn empty_store(dir: String, read_only: bool) -> Store {
 
 // Fills the index from every generation the directory holds: from a sealed
 // generation's hint file where there is one, and from the data file otherwise.
-// Answers the unsealed generation and where its records end.
-fn rebuild(st: &mut Store, dir: String, gens: Vec<i64>) -> (i64, i64) {
+// Answers the unsealed generation, where its committed records end, and whether
+// its replay stopped at a damaged record rather than at the end of its log.
+fn rebuild(st: &mut Store, dir: String, gens: Vec<i64>) -> (i64, i64, bool) {
     let mut unsealed: i64 = 0
     let mut unsealed_end: i64 = 0
+    let mut damaged = false
     for g in gens {
         if fs::is_file(log::hint_path(dir, g)) {
             // A hint describes a data file rather than replacing it, so a hint
@@ -201,11 +245,13 @@ fn rebuild(st: &mut Store, dir: String, gens: Vec<i64>) -> (i64, i64) {
                 let _ = recover::rebuild_from_data(st, g, log::data_path(dir, g))
             }
         } else {
+            let before = st.faults.len()
             unsealed = g
             unsealed_end = recover::rebuild_from_data(st, g, log::data_path(dir, g))
+            damaged = st.faults.len() > before
         }
     }
-    (unsealed, unsealed_end)
+    (unsealed, unsealed_end, damaged)
 }
 
 // Whether generation `gen` was rebuilt whole from its hint file.
@@ -222,42 +268,76 @@ fn newest_or(gens: Vec<i64>, fallback: i64) -> i64 {
     gens[gens.len() - 1]
 }
 
-pub (package) fn append(st: &mut Store, rec: Vec<u8>) -> Result<i64, String> {
+// A batch holds this many bytes before it writes what it has so far, which is
+// where one write's fixed cost has stopped mattering against the bytes it
+// carries. What it writes early is still invisible until the commit lands.
+pub (package) const PENDING_FLUSH: i64 = 1_048_576
+
+// Frames a record into the open batch and answers the offset it will occupy.
+pub (package) fn stage(st: &mut Store, key: String, kind: u8, val: Vec<u8>, crc: i64) -> Result<i64, String> {
     if st.read_only { return Err("store is read-only") }
-    let off = st.cur_off
+    if st.data.is_none() { return Err("store not open for writing") }
+    let off = st.pending_at + st.pending.len()
+    log::record_into(&mut st.pending, key, kind, val, crc)
+    st.cur_off = st.pending_at + st.pending.len()
+    if st.pending.len() >= PENDING_FLUSH { flush_pending(st)? }
+    Ok(off)
+}
+
+// Writes the batch's staged bytes where they belong in the active file.
+pub (package) fn flush_pending(st: &mut Store) -> Result<(), String> {
+    if st.pending.len() == 0 { return Ok(()) }
+    st.touched = true
     match st.data {
         Some(f) => {
-            match f.write_at(rec, off) {
+            match f.write_at(st.pending, st.pending_at) {
                 Ok(n) => {
-                    if n != rec.len() { return Err("short write: " + n.to_string() + " of " + rec.len().to_string() + " bytes") }
+                    if n != st.pending.len() {
+                        return Err("short write: " + n.to_string() + " of " + st.pending.len().to_string() + " bytes")
+                    }
                 }
                 Err(e) => return Err("write: " + e.message())
             }
         }
         None => return Err("store not open for writing")
     }
-    st.cur_off = off + rec.len()
-    Ok(off)
+    st.pending_at += st.pending.len()
+    st.pending.clear()
+    Ok(())
+}
+
+// Stages `val` under `key`, as a batch of one when no batch is open. `tid` and
+// `rid` name the row the key addresses, or are -1 for a key the caller has not
+// placed; `kcrc` is the key's checksum, which the record's continues from.
+pub (package) fn stage_put(st: &mut Store, key: String, val: Vec<u8>, kcrc: i64, tid: i64, rid: i64) -> Result<(), String> {
+    if key == "" { return Err("put: key must not be empty") }
+    if key.byte_len() > MAX_KEY_LEN { return Err("put: key exceeds " + MAX_KEY_LEN.to_string() + " bytes") }
+    if val.len() > MAX_VALUE_LEN { return Err("put: value exceeds " + MAX_VALUE_LEN.to_string() + " bytes") }
+    let alone = batch::solo(st)
+    if alone { batch::begin(st)? }
+    let gen = st.gen
+    let crc = crc32::update(kcrc, val)
+    let off = match stage(st, key, log::KIND_PUT, val, crc) {
+        Ok(o) => o
+        Err(e) => return Err(if alone { batch::undo(st, e) } else { e })
+    }
+    st.staged.push(batch::Staged {
+        key: key
+        entry: Entry { file: gen, offset: off, vlen: val.len(), crc: crc }
+        remove: false
+        tid: tid
+        rid: rid
+        kcrc: kcrc
+    })
+    if alone { batch::commit(st)? }
+    Ok(())
 }
 
 /// The operations every key in the store is reached through.
 impl Store {
     /// Stores `val` under `key`, replacing any previous value.
     pub fn put(&mut self, key: String, val: Vec<u8>) -> Result<(), String> {
-        if key == "" { return Err("put: key must not be empty") }
-        if key.byte_len() > MAX_KEY_LEN { return Err("put: key exceeds " + MAX_KEY_LEN.to_string() + " bytes") }
-        if val.len() > MAX_VALUE_LEN { return Err("put: value exceeds " + MAX_VALUE_LEN.to_string() + " bytes") }
-        let alone = batch::solo(self)
-        if alone { batch::begin(self)? }
-        let gen = self.gen
-        let crc = log::record_crc(key, val)
-        let off = match append(self, log::record(key, log::KIND_PUT, val, crc)) {
-            Ok(o) => o
-            Err(e) => return Err(if alone { batch::undo(self, e) } else { e })
-        }
-        self.staged.push(batch::Staged { key: key, entry: Entry { file: gen, offset: off, vlen: val.len(), crc: crc }, remove: false })
-        if alone { batch::commit(self)? }
-        Ok(())
+        stage_put(self, key, val, crc32::checksum(key.as_bytes()), -1, -1)
     }
 
     /// Removes `key`, reporting whether it was present.
@@ -265,10 +345,17 @@ impl Store {
         if !self.contains(key) && !batch::staged_holds(self, key) { return Ok(false) }
         let alone = batch::solo(self)
         if alone { batch::begin(self)? }
-        if let Err(e) = append(self, log::record(key, log::KIND_DELETE, #[], log::record_crc(key, #[]))) {
+        if let Err(e) = stage(self, key, log::KIND_DELETE, #[], log::record_crc(key, #[])) {
             return Err(if alone { batch::undo(self, e) } else { e })
         }
-        self.staged.push(batch::Staged { key: key, entry: Entry { file: 0, offset: 0, vlen: 0, crc: 0 }, remove: true })
+        self.staged.push(batch::Staged {
+            key: key
+            entry: Entry { file: 0, offset: 0, vlen: 0, crc: 0 }
+            remove: true
+            tid: -1
+            rid: -1
+            kcrc: 0
+        })
         if alone { batch::commit(self)? }
         Ok(true)
     }
@@ -501,6 +588,36 @@ mod tests {
             #[1u8, 2, 3, 4], "what the log holds before the fault is still there")
         assert_eq(after.faults.len(), 1, "a store that read past a fault says so")
         assert(after.faults[0].contains("failed its checksum"), "got: " + after.faults[0])
+    }
+
+    #[test]
+    fn a_damaged_log_is_kept_and_written_above() {
+        let dir = fresh("damaged_kept")
+        let mut st = opened(dir)
+        assert(st.put("first", #[1u8]).is_ok())
+        assert(st.put("k", #[1u8, 2, 3, 4]).is_ok())
+        assert(st.sync().is_ok())
+        let path = kv::log::data_path(dir, st.gen)
+        let mut bytes = fs::read(path).unwrap_or(#[])
+        let at = bytes.len() - kv::log::HEADER_LEN - 1
+        bytes[at] = bytes[at] + 1u8
+        assert(fs::write(path, bytes).is_ok())
+        let size = fs::file_size(path)
+
+        let mut after = opened(dir)
+        assert_eq(after.faults.len(), 1)
+        assert(after.gen > 1, "writes go to a generation of their own")
+        assert(after.put("later", #[5u8]).is_ok())
+        assert_eq(fs::file_size(path), size, "the damaged generation is left as it was")
+
+        let mut again = opened(dir)
+        assert_eq(again.faults.len(), 1, "the damage is still reported")
+        assert_eq(must_get(&mut again, "first"), #[1u8])
+        assert_eq(must_get(&mut again, "later"), #[5u8])
+        assert(again.put("more", #[6u8]).is_ok())
+        let mut third = opened(dir)
+        assert_eq(must_get(&mut third, "more"), #[6u8])
+        assert_eq(must_get(&mut third, "later"), #[5u8])
     }
 
     #[test]

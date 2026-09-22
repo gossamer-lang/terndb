@@ -2,6 +2,7 @@ use std::fs
 use std::hash::crc32
 use crate::kv
 use super::log
+use super::compact
 
 // What the store holds in memory: a dense slot per row for the tables whose
 // keys are `<table>/r/<rowid>`, and a hash entry for every other key.
@@ -121,6 +122,37 @@ pub (package) fn locate_row(st: &mut kv::Store, key: String) -> (i64, i64) {
     (-1, -1)
 }
 
+/// The table and row id the key in `buf[start..start + len]` names among the
+/// tables already opened, read where it lies, or `(-1, -1)` when it names none.
+///
+/// A row id is written without a leading zero, so one row is never reachable
+/// under two spellings of its key.
+pub (package) fn locate_row_bytes(st: &mut kv::Store, buf: Vec<u8>, start: i64, len: i64) -> (i64, i64) {
+    for t in 0..st.tables.len() {
+        let prefix = st.tables[t].prefix.as_bytes()
+        let n = prefix.len()
+        if len <= n { continue }
+        let mut same = true
+        for i in 0..n {
+            if buf[start + i] != prefix[i] {
+                same = false
+                break
+            }
+        }
+        if !same { continue }
+        if buf[start + n] == 48u8 { return (-1, -1) }
+        let mut v: i64 = 0
+        for i in start + n..start + len {
+            let c = buf[i] as i64
+            if c < 48 || c > 57 { return (-1, -1) }
+            v = v * 10 + (c - 48)
+            if v > MAX_ROWID { return (-1, -1) }
+        }
+        return (t, v)
+    }
+    (-1, -1)
+}
+
 // The table and rowid a key should be stored under, opening the table on the
 // first row of it. `(-1, -1)` sends the key to the hash index: it is not a
 // canonical row key, or its rowid reaches so far past the table's top that a
@@ -144,6 +176,13 @@ fn locate_or_open_row(st: &mut kv::Store, key: String) -> (i64, i64) {
     (-1, -1)
 }
 
+// Sizes `tid`'s slots for row ids up to `top` in one step, for a caller that
+// knows the highest row it is about to place.
+pub (package) fn reserve(st: &mut kv::Store, tid: i64, top: i64) {
+    let want = 3 * top + 3
+    if st.tables[tid].slots.len() < want { st.tables[tid].slots.resize(want, 0) }
+}
+
 // Grows `tid`'s slots to hold `rid` and answers the index of its first word.
 fn slot_for(st: &mut kv::Store, tid: i64, rid: i64) -> i64 {
     let want = 3 * rid + 3
@@ -162,31 +201,12 @@ pub (package) fn row_record_len(st: &mut kv::Store, tid: i64, rid: i64, vlen: i6
 pub (package) fn remember(st: &mut kv::Store, key: String, e: kv::Entry) {
     let tid, rid = locate_or_open_row(st, key)
     if tid >= 0 {
-        // A key the hash index answered before a dense slot could hold it
-        // moves rather than being held in both.
-        if let Some(old) = st.index.get(key) {
-            st.live_bytes -= old.vlen
-            st.dead_bytes += log::record_len(key, old.vlen)
-            let _ = st.index.remove(key)
-        }
         // The key's own checksum is taken once, here, so a read never rebuilds
         // the key to check the record it found.
-        let kcrc = crc32::checksum(key.as_bytes())
-        let s = slot_for(st, tid, rid)
-        if st.tables[tid].slots[s + 1] == 0 {
-            st.tables[tid].live += 1
-        } else {
-            let plen = log::loc_vlen(st.tables[tid].slots[s])
-            st.live_bytes -= plen
-            st.dead_bytes += row_record_len(st, tid, rid, plen)
-        }
-        st.tables[tid].slots[s] = log::pack_loc(e.offset, e.vlen)
-        st.tables[tid].slots[s + 1] = log::pack_gc(e.file, e.crc)
-        st.tables[tid].slots[s + 2] = kcrc
-        if rid > st.tables[tid].top { st.tables[tid].top = rid }
-        st.live_bytes += e.vlen
+        remember_dense(st, tid, rid, crc32::checksum(key.as_bytes()), e)
         return
     }
+    if row_prefix_end(key) >= 0 { st.hashed_rows += 1 }
     if let Some(old) = st.index.get(key) {
         st.live_bytes -= old.vlen
         st.dead_bytes += log::record_len(key, old.vlen)
@@ -195,21 +215,71 @@ pub (package) fn remember(st: &mut kv::Store, key: String, e: kv::Entry) {
     st.live_bytes += e.vlen
 }
 
-pub (package) fn forget(st: &mut kv::Store, key: String) {
-    let tid, rid = locate_row(st, key)
-    if tid >= 0 {
-        let s = 3 * rid
-        if s + 2 < st.tables[tid].slots.len() && st.tables[tid].slots[s + 1] != 0 {
-            let plen = log::loc_vlen(st.tables[tid].slots[s])
-            st.live_bytes -= plen
-            st.dead_bytes += row_record_len(st, tid, rid, plen)
-            st.tables[tid].slots[s] = 0
-            st.tables[tid].slots[s + 1] = 0
-            st.tables[tid].slots[s + 2] = 0
-            st.tables[tid].live -= 1
-            return
+/// Places row `rid` of table `tid`, whose key checksums to `kcrc`, without
+/// spelling or parsing its key: the caller already knows which row it is.
+pub (package) fn remember_row(st: &mut kv::Store, tid: i64, rid: i64, kcrc: i64, e: kv::Entry) {
+    if rid >= 1 && rid <= st.tables[tid].top + ROWID_SLACK {
+        remember_dense(st, tid, rid, kcrc, e)
+        return
+    }
+    remember(st, st.tables[tid].prefix + rid.to_string(), e)
+}
+
+// Holds row `rid` of `tid` in its dense slot.
+fn remember_dense(st: &mut kv::Store, tid: i64, rid: i64, kcrc: i64, e: kv::Entry) {
+    // A key the hash index answered before a dense slot could hold it moves
+    // rather than being held in both. Only a store that ever hashed a row key
+    // can hold one there, so the others skip the probe.
+    if st.hashed_rows > 0 {
+        let key = st.tables[tid].prefix + rid.to_string()
+        if let Some(old) = st.index.get(key) {
+            st.live_bytes -= old.vlen
+            st.dead_bytes += log::record_len(key, old.vlen)
+            let _ = st.index.remove(key)
         }
     }
+    let s = slot_for(st, tid, rid)
+    if st.tables[tid].slots[s + 1] == 0 {
+        st.tables[tid].live += 1
+    } else {
+        let plen = log::loc_vlen(st.tables[tid].slots[s])
+        st.live_bytes -= plen
+        st.dead_bytes += row_record_len(st, tid, rid, plen)
+    }
+    st.tables[tid].slots[s] = log::pack_loc(e.offset, e.vlen)
+    st.tables[tid].slots[s + 1] = log::pack_gc(e.file, e.crc)
+    st.tables[tid].slots[s + 2] = kcrc
+    if rid > st.tables[tid].top { st.tables[tid].top = rid }
+    st.live_bytes += e.vlen
+}
+
+pub (package) fn forget(st: &mut kv::Store, key: String) {
+    let tid, rid = locate_row(st, key)
+    if tid >= 0 && forget_dense(st, tid, rid) { return }
+    forget_hashed(st, key)
+}
+
+/// Removes row `rid` of table `tid`, wherever the index holds it.
+pub (package) fn forget_row(st: &mut kv::Store, tid: i64, rid: i64) {
+    if forget_dense(st, tid, rid) { return }
+    if st.hashed_rows > 0 { forget_hashed(st, st.tables[tid].prefix + rid.to_string()) }
+}
+
+// Empties row `rid`'s dense slot, answering whether it held the row.
+fn forget_dense(st: &mut kv::Store, tid: i64, rid: i64) -> bool {
+    let s = 3 * rid
+    if rid < 1 || s + 2 >= st.tables[tid].slots.len() || st.tables[tid].slots[s + 1] == 0 { return false }
+    let plen = log::loc_vlen(st.tables[tid].slots[s])
+    st.live_bytes -= plen
+    st.dead_bytes += row_record_len(st, tid, rid, plen)
+    st.tables[tid].slots[s] = 0
+    st.tables[tid].slots[s + 1] = 0
+    st.tables[tid].slots[s + 2] = 0
+    st.tables[tid].live -= 1
+    true
+}
+
+fn forget_hashed(st: &mut kv::Store, key: String) {
     if let Some(old) = st.index.get(key) {
         st.live_bytes -= old.vlen
         st.dead_bytes += log::record_len(key, old.vlen)
@@ -228,6 +298,15 @@ pub (package) fn forget(st: &mut kv::Store, key: String) {
 /// never written or since deleted is [`kv::Read::Absent`].
 pub fn read(st: &mut kv::Store, tid: i64, rid: i64) -> kv::Read {
     if tid < 0 || rid < 1 { return kv::Read::Absent }
+    // A row in a generation the store holds is copied out of memory rather
+    // than read from the file.
+    let start, end = span(st, tid, rid)
+    if end > start {
+        match st.resident_bytes.slice(start, end) {
+            Ok(v) => return kv::Read::Value(v)
+            Err(_) => ()
+        }
+    }
     let s = 3 * rid
     if s + 2 >= st.tables[tid].slots.len() { return kv::Read::Absent }
     let gc = st.tables[tid].slots[s + 1]
@@ -272,6 +351,143 @@ fn read_row_value(f: fs::File, at: i64, vlen: i64, kcrc: i64, crc: i64, prefix: 
 // How a row is named in a fault: the key it is stored under.
 fn row_name(prefix: String, rid: i64) -> String { "row " + prefix + rid.to_string() }
 
+/// Where a row's value lies for a [`Cursor`], checked against its checksum.
+pub enum Place {
+    /// No row is there.
+    Absent
+    /// The row is there and cannot be produced, and this says why.
+    Fault(String)
+    /// `[start, end)` of [`kv::Store::resident_bytes`].
+    Resident(i64, i64)
+    /// `[start, end)` of the cursor's window `block`, read out of
+    /// [`Cursor::blocks`] as `cur.blocks[block]`.
+    Block(i64, i64, i64)
+}
+
+/// A walk over one table's rows that reads the log a block at a time.
+///
+/// A window read going up the row ids starts at a record's first byte, so every
+/// row an upward walk is handed lies whole inside the window it names.
+///
+/// Rows of one table can sit in several generations, so a window is kept per
+/// generation. A window grows while the rows the walk asks for lie next to each
+/// other in the file, and a row the walk jumps to is read on its own: a log laid
+/// out in row-id order is read in large blocks, and one that is not costs no
+/// more than reading each row by itself.
+pub struct Cursor {
+    tid: i64
+    /// Whether the walk goes up the row ids (1) or down them (-1).
+    step: i64
+    gens: Vec<i64>
+    /// File offset of each window's first byte.
+    offs: Vec<i64>
+    pub blocks: Vec<Vec<u8>>
+    /// How far the next read of each generation reaches past the row it wants.
+    ahead: Vec<i64>
+    /// Where the row last served from each generation starts and ends,
+    /// which is what tells a row that follows it in the file.
+    last_start: Vec<i64>
+    last_end: Vec<i64>
+}
+
+/// A cursor over table `tid`, walking row ids upward when `step` is 1 and
+/// downward when it is -1.
+pub fn cursor(tid: i64, step: i64) -> Cursor {
+    Cursor { tid: tid, step: step, gens: #[], offs: #[], blocks: #[], ahead: #[], last_start: #[], last_end: #[] }
+}
+
+// The window index a cursor keeps for `gen`, adding an empty one on first use.
+fn window_for(cur: &mut Cursor, gen: i64) -> i64 {
+    for i in 0..cur.gens.len() {
+        if cur.gens[i] == gen { return i }
+    }
+    cur.gens.push(gen)
+    cur.offs.push(0)
+    cur.blocks.push(#[])
+    cur.ahead.push(0)
+    cur.last_start.push(-1)
+    cur.last_end.push(-1)
+    cur.gens.len() - 1
+}
+
+/// Where row `rid` of the cursor's table lies, reading the log only when no
+/// window already holds it.
+///
+/// The value is checked against the checksum its slot carries before it is
+/// placed, so a damaged row is a [`Place::Fault`] exactly as [`read`] reports it.
+pub fn locate(st: &mut kv::Store, cur: &mut Cursor, rid: i64) -> Place {
+    let tid = cur.tid
+    if tid < 0 || rid < 1 { return Place::Absent }
+    let s = 3 * rid
+    if s + 2 >= st.tables[tid].slots.len() { return Place::Absent }
+    let gc = st.tables[tid].slots[s + 1]
+    if gc == 0 { return Place::Absent }
+    let start, end = span(st, tid, rid)
+    if end > start { return Place::Resident(start, end) }
+    let loc = st.tables[tid].slots[s]
+    let vlen = log::loc_vlen(loc)
+    let rec = log::loc_offset(loc)
+    let at = rec + log::HEADER_LEN + st.tables[tid].prefix.byte_len() + log::digits_len(rid)
+    let gen = log::gc_gen(gc)
+    let w = window_for(cur, gen)
+    // A window is read from a record's first byte, so a row it holds is held
+    // whole: a merge copies the record out of it, header and key included.
+    let held = rec >= cur.offs[w] && at + vlen <= cur.offs[w] + cur.blocks[w].len()
+    if !held {
+        match refill(st, cur, w, gen, rec, at, vlen) {
+            Some(fault) => return Place::Fault(row_name(st.tables[tid].prefix, rid) + ": " + fault)
+            None => ()
+        }
+    }
+    cur.last_start[w] = rec
+    cur.last_end[w] = at + vlen
+    let a = at - cur.offs[w]
+    if crc32::update_window(st.tables[tid].slots[s + 2], cur.blocks[w], a, a + vlen) != log::gc_crc(gc) {
+        return Place::Fault(row_name(st.tables[tid].prefix, rid) + ": checksum mismatch")
+    }
+    Place::Block(w, a, a + vlen)
+}
+
+// Reads a window of generation `gen` holding the value at `[at, at + vlen)`,
+// whose record starts at `rec`, and answers why it could not.
+//
+// The window reaches further the longer the walk has found each row next to the
+// one before it, and shrinks back to the one row when it jumps.
+fn refill(st: &mut kv::Store, cur: &mut Cursor, w: i64, gen: i64, rec: i64, at: i64, vlen: i64) -> Option<String> {
+    let follows = if cur.step > 0 { rec == cur.last_end[w] } else { at + vlen == cur.last_start[w] }
+    if follows {
+        let grown = max(2 * cur.ahead[w], 2 * (at + vlen - rec))
+        cur.ahead[w] = min(grown, log::SCAN_BLOCK)
+    } else {
+        cur.ahead[w] = 0
+    }
+    let len = max(at + vlen - rec, cur.ahead[w])
+    // A walk up the row ids reads on from this record; a walk down them reads
+    // the block that ends with it.
+    let from = if cur.step > 0 { rec } else { max(at + vlen - len, 0) }
+    let f = if gen == st.gen && st.data.is_some() {
+        st.data
+    } else {
+        kv::reader_for(st, gen)
+    }
+    match f {
+        Some(file) => {
+            match file.read_at(len, from) {
+                Ok(bytes) => {
+                    if from + bytes.len() < at + vlen {
+                        return Some(max(from + bytes.len() - at, 0).to_string() + " of " + vlen.to_string() + " bytes readable")
+                    }
+                    cur.blocks[w] = bytes
+                    cur.offs[w] = from
+                    None
+                }
+                Err(e) => Some(e.message())
+            }
+        }
+        None => Some("generation " + gen.to_string() + " cannot be opened")
+    }
+}
+
 /// Where row `rid` sits inside the buffer the store holds, as `(start, end)`,
 /// or `(0, 0)` when this cannot place it there.
 ///
@@ -293,10 +509,11 @@ pub fn span(st: &mut kv::Store, tid: i64, rid: i64) -> (i64, i64) {
     if gc == 0 { return (0, 0) }
     let gen = log::gc_gen(gc)
     if gen == st.gen { return (0, 0) }
-    if st.resident_gen != gen { return (0, 0) }
+    let base = resident_base(st, gen)
+    if base < 0 { return (0, 0) }
     let loc = st.tables[tid].slots[s]
     let vlen = log::loc_vlen(loc)
-    let at = log::loc_offset(loc) + log::HEADER_LEN + st.tables[tid].prefix.byte_len() + log::digits_len(rid)
+    let at = base + log::loc_offset(loc) + log::HEADER_LEN + st.tables[tid].prefix.byte_len() + log::digits_len(rid)
     if at < 0 || vlen <= 0 || at + vlen > st.resident_bytes.len() { return (0, 0) }
     if crc32::update_window(st.tables[tid].slots[s + 2], st.resident_bytes, at, at + vlen)
     != log::gc_crc(gc)
@@ -306,35 +523,61 @@ pub fn span(st: &mut kv::Store, tid: i64, rid: i64) -> (i64, i64) {
     (at, at + vlen)
 }
 
-// Holds one sealed generation's bytes, chosen once while the store is being
-// opened. Residency is settled here rather than on the read path for two
-// reasons: a store that decides it per read would swap buffers whenever
-// consecutive rows fall in different generations, and a reader that is already
-// answering requests shares its state with every thread serving one, so a
-// buffer admitted then would be stored into a value those threads already
-// reach.
-//
-// The largest generation that fits the budget is the one held: it is the one
-// the most rows are read from. A generation still being appended to is never
-// admitted, since its bytes are not final.
-pub (package) fn admit_resident(st: &mut kv::Store, gens: Vec<i64>) {
-    if st.resident_budget <= 0 { return }
-    let mut best: i64 = 0
-    let mut best_size: i64 = 0
-    for g in gens {
-        if g == st.gen { continue }
-        if !fs::is_file(log::hint_path(st.dir, g)) { continue }
-        let size = fs::file_size(log::data_path(st.dir, g))
-        if size <= 0 || size > st.resident_budget { continue }
-        if size > best_size { best = g; best_size = size }
+// Where generation `gen` starts inside the held bytes, or -1 when it is not
+// held.
+fn resident_base(st: &mut kv::Store, gen: i64) -> i64 {
+    for i in 0..st.resident_gens.len() {
+        if st.resident_gens[i] == gen { return st.resident_base[i] }
     }
-    if best == 0 { return }
-    match fs::read(log::data_path(st.dir, best)) {
-        Ok(b) => {
-            st.resident_bytes = b
-            st.resident_gen = best
+    -1
+}
+
+// Settles which sealed generations the store holds in memory, replacing what it
+// held before, and reads them in back to back.
+//
+// A reader settles this once while it is being opened. It decides nothing on
+// the read path for two reasons: a store deciding per read would swap buffers
+// whenever consecutive rows fall in different generations, and a reader that
+// is already answering requests shares its state with every thread serving one,
+// so a buffer admitted then would be stored into a value those threads already
+// reach. A writer also settles it again after each merge, which is the one
+// thing that changes which sealed generations there are.
+//
+// The generations holding the most live bytes go in first, since they are the
+// ones the most rows are read from, for as long as the budget has room. A
+// generation still being appended to is never admitted, since its bytes are
+// not final.
+pub (package) fn admit_resident(st: &mut kv::Store) {
+    st.resident_bytes = #[]
+    st.resident_gens = #[]
+    st.resident_base = #[]
+    if st.resident_budget <= 0 { return }
+    let gens = match log::data_generations(st.dir) {
+        Ok(g) => g
+        Err(_) => return
+    }
+    let live_in = compact::live_by_gen(st)
+    let mut sealed: Vec<i64> = #[]
+    for g in gens {
+        if g != st.gen && fs::is_file(log::hint_path(st.dir, g)) { sealed.push(g) }
+    }
+    // The most live bytes first, and the older generation first among equals,
+    // so every opener of one store holds the same generations.
+    sealed.sort_by(|a, b| {
+        let d = live_in.get(b).unwrap_or(0) - live_in.get(a).unwrap_or(0)
+        if d != 0 { d } else { a - b }
+    })
+    for g in sealed {
+        let size = fs::file_size(log::data_path(st.dir, g))
+        if size <= 0 || st.resident_bytes.len() + size > st.resident_budget { continue }
+        match fs::read(log::data_path(st.dir, g)) {
+            Ok(b) => {
+                st.resident_gens.push(g)
+                st.resident_base.push(st.resident_bytes.len())
+                st.resident_bytes.extend(b)
+            }
+            Err(_) => ()
         }
-        Err(_) => ()
     }
 }
 
@@ -365,7 +608,7 @@ pub fn write(st: &mut kv::Store, tid: i64, rid: i64, val: Vec<u8>) -> Result<(),
     if tid < 0 || tid >= st.tables.len() { return Err("put_row: no such table") }
     if rid < 1 { return Err("put_row: rowid must be positive") }
     let key = st.tables[tid].prefix + rid.to_string()
-    st.put(key, val)
+    kv::stage_put(st, key, val, crc32::checksum(key.as_bytes()), tid, rid)
 }
 
 /// Removes row `rid` of table `tid`, reporting whether it was there.

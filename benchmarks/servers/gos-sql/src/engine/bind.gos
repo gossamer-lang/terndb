@@ -198,6 +198,24 @@ mod tests {
     }
 
     #[test]
+    fn every_value_constructor_binds_to_a_column_of_its_own_type() {
+        let mut eng = opened(fresh("bind_widths"))
+        assert_eq(run(&mut eng, "CREATE TABLE w (a INT8, b INT16, c INT32, d INT64, e FLOAT32, f FLOAT64, g DATETIME)", #[]), 0)
+        assert_eq(run(&mut eng, "INSERT INTO w VALUES (?, ?, ?, ?, ?, ?, ?)"
+            #[codec::Value::int8(-8), codec::Value::int16(-300), codec::Value::int32(70_000)
+                codec::Value::int(1 << 40), codec::Value::float32(0.5), codec::Value::float(2.25)
+                codec::Value::datetime(1_700_000_000_000)]), 1)
+        assert_eq(rows(&mut eng, "SELECT a, b, c, d, e, f FROM w WHERE c = ?", #[codec::Value::int32(70_000)])
+            #[#["-8", "-300", "70000", "1099511627776", "0.5", "2.25"]])
+        assert_eq(rows(&mut eng, "SELECT COUNT(*) FROM w WHERE g = ?", #[codec::Value::datetime(1_700_000_000_000)]), #[#["1"]])
+        // A narrow value still has to fit the column it is bound to.
+        assert(eng.exec_args("UPDATE w SET a = ?", #[codec::Value::int16(300)]).is_err(), "300 does not fit an INT8")
+        // A row id is a whole number at any width.
+        assert_eq(rows(&mut eng, "SELECT a FROM w WHERE rowid = ?", #[codec::Value::int8(1)]), #[#["-8"]])
+        assert_eq(rows(&mut eng, "SELECT a FROM w WHERE rowid >= ?", #[codec::Value::int16(1)]), #[#["-8"]])
+    }
+
+    #[test]
     fn a_statement_is_refused_unless_its_placeholders_are_all_bound() {
         let mut eng = opened(fresh("bind_arity"))
         users(&mut eng)

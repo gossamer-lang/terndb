@@ -12,6 +12,37 @@ pub enum Want {
     Count
     Ids
     Values
+    /// The leading matches under an order, held in a [`Top`] rather than kept
+    /// whole, so an `ORDER BY ... LIMIT` holds what it answers and no more.
+    Top
+}
+
+/// What a walk found: how many rows matched, and what it kept of them.
+pub (package) struct Walk {
+    pub (package) matched: i64
+    pub (package) rows: Vec<engine::Row>
+    pub (package) top: Top
+}
+
+/// The `k` leading rows by one column, as a heap whose root is the one that
+/// would be answered last, so a better row replaces it in one sift.
+///
+/// Only the ordering value and the row id are held: the rows answered are read
+/// whole once the walk has settled which they are.
+pub (package) struct Top {
+    col: i64
+    asc: bool
+    k: i64
+    keys: Vec<codec::Value>
+    rids: Vec<i64>
+}
+
+/// A [`Top`] that holds nothing, for a walk that keeps rows another way.
+pub (package) fn no_top() -> Top { Top { col: -1, asc: true, k: 0, keys: #[], rids: #[] } }
+
+/// A [`Top`] keeping the `k` leading rows ordered by column `col`.
+pub (package) fn top_of(col: i64, asc: bool, k: i64) -> Top {
+    Top { col: col, asc: asc, k: k, keys: #[], rids: #[] }
 }
 
 // What a walk keeps from each row it visits: the columns the filter needs
@@ -23,29 +54,34 @@ struct Take {
     full: i64
 }
 
-// Walks the table in rowid order, decoding each row once and testing it as it
-// goes, so only the matches are ever held. `cap` stops the walk as soon as the
-// caller can take no more, which is what makes LIMIT without ORDER BY cheap.
+// Walks the table in rowid order - descending when `reverse` - decoding each
+// row once and testing it as it goes, so only the matches are ever held. `cap`
+// stops the walk as soon as the caller can take no more, which is what makes
+// LIMIT without ORDER BY cheap.
 //
 // The walk visits rowids rather than index keys: it costs one map lookup per
 // id, against iterating and sorting every key in the store for each statement.
-pub (package) fn table(eng: &mut engine::Engine, def: &mut engine::TableDef, filter: filter::Filter, want: Want, cap: i64) -> Result<(i64, Vec<engine::Row>), String> {
+pub (package) fn table(eng: &mut engine::Engine, def: &mut engine::TableDef, filter: filter::Filter, want: Want, cap: i64, reverse: bool, top: Top) -> Result<Walk, String> {
     let table = def.name
     // Every row of the table is reached by its id, so the walk builds no key.
     let tid = kv::rows::table_id(&mut eng.store, table)
     // A row is decoded twice over: first just the columns the filter names, and
     // then, only if it matched and the caller wants values, the whole of it. A
     // selective statement therefore decodes the full row only for its matches.
+    let mut probe = probe_width(filter)
+    if want == Want::Top && top.col + 1 > probe { probe = top.col + 1 }
     let take = Take {
         want: want
-        probe: probe_width(filter)
+        probe: probe
         full: if want == Want::Values { def.cols.len() } else { 0 }
     }
+    let mut sink = Walk { matched: 0, rows: #[], top: top }
     // A bare COUNT(*) is answered from the index, without building a key or
     // reading a row.
     if take.probe == 0 && take.full == 0 && want == Want::Count && filter.id_ops.len() == 0 {
         let live = kv::rows::count(&mut eng.store, tid)
-        return Ok((if cap >= 0 && live > cap { cap } else { live }, #[]))
+        sink.matched = if cap >= 0 && live > cap { cap } else { live }
+        return Ok(sink)
     }
     // An equality test on the row id names one row, so the walk is that row.
     let mut first: i64 = 1
@@ -57,27 +93,28 @@ pub (package) fn table(eng: &mut engine::Engine, def: &mut engine::TableDef, fil
     let mut wanted = codec::Value::nil()
     let chain = indexed_chain(eng, def, filter, &mut wanted)
     let mut f = filter
-    let mut rows: Vec<engine::Row> = #[]
-    let mut matched: i64 = 0
+    let mut cur = kv::rows::cursor(tid, if reverse { -1 } else { 1 })
     if chain >= 0 {
-        for rid in chain_rows(eng, chain, wanted) {
-            if cap >= 0 && matched >= cap { break }
+        let candidates = chain_rows(eng, chain, wanted)
+        let n = candidates.len()
+        for i in 0..n {
+            if cap >= 0 && sink.matched >= cap { break }
+            let rid = if reverse { candidates[n - 1 - i] } else { candidates[i] }
             if rid < first || rid >= past { continue }
-            if filter::id_holds(&mut f, rid) && row(eng, tid, rid, &mut f, take, &mut rows)? {
-                matched += 1
+            if filter::id_holds(&mut f, rid) && row(eng, &mut cur, tid, rid, &mut f, take, &mut sink)? {
+                sink.matched += 1
             }
         }
-        return Ok((matched, rows))
+        return Ok(sink)
     }
-    let mut rid: i64 = first
-    while rid < past {
-        if cap >= 0 && matched >= cap { break }
-        if filter::id_holds(&mut f, rid) && row(eng, tid, rid, &mut f, take, &mut rows)? {
-            matched += 1
+    for i in 0..past - first {
+        if cap >= 0 && sink.matched >= cap { break }
+        let rid = if reverse { past - 1 - i } else { first + i }
+        if filter::id_holds(&mut f, rid) && row(eng, &mut cur, tid, rid, &mut f, take, &mut sink)? {
+            sink.matched += 1
         }
-        rid += 1
     }
-    Ok((matched, rows))
+    Ok(sink)
 }
 
 // How much of a row the filter has to see: one past the last column it names.
@@ -134,22 +171,30 @@ fn chain_rows(eng: &mut engine::Engine, chain: i64, wanted: codec::Value) -> Vec
 //
 // A row is read twice over at most: the columns the filter names, and then, for
 // a match the caller wants values from, the rest of it.
-fn row(eng: &mut engine::Engine, tid: i64, rid: i64, filter: &mut filter::Filter, take: Take, rows: &mut Vec<engine::Row>) -> Result<bool, String> {
+fn row(eng: &mut engine::Engine, cur: &mut kv::rows::Cursor, tid: i64, rid: i64, filter: &mut filter::Filter, take: Take, sink: &mut Walk) -> Result<bool, String> {
     // When nothing about the row's contents is needed - an unfiltered delete,
     // say - its presence in the index is the whole answer.
     if take.probe == 0 && take.full == 0 {
         if !kv::rows::holds(&mut eng.store, tid, rid) { return Ok(false) }
-        rows.push(engine::Row { rowid: rid, vals: #[] })
+        if take.want == Want::Ids { sink.rows.push(engine::Row { rowid: rid, vals: #[] }) }
         return Ok(true)
     }
-    let bytes = match kv::rows::read(&mut eng.store, tid, rid) {
-        kv::Read::Value(b) => b
-        kv::Read::Absent => return Ok(false)
-        kv::Read::Fault(e) => return Err(e)
+    // The row is decoded where the cursor found it, in the store's held bytes
+    // or in the cursor's window, without being copied out of either.
+    match kv::rows::locate(&mut eng.store, cur, rid) {
+        kv::rows::Place::Absent => Ok(false)
+        kv::rows::Place::Fault(e) => Err(e)
+        kv::rows::Place::Resident(start, end) => keep(eng.store.resident_bytes, start, end, rid, filter, take, sink)
+        kv::rows::Place::Block(w, start, end) => keep(cur.blocks[w], start, end, rid, filter, take, sink)
     }
+}
+
+// Tests the row held in `buf[start..end]` against every comparison and keeps
+// what the caller asked for, answering whether it matched.
+fn keep(buf: Vec<u8>, start: i64, end: i64, rid: i64, filter: &mut filter::Filter, take: Take, sink: &mut Walk) -> Result<bool, String> {
     let mut vals: Vec<codec::Value> = #[]
     if take.probe > 0 {
-        vals = codec::decode_row(bytes, take.probe)?
+        vals = codec::decode_row_at(buf, start, end, take.probe)?
         let nconds = filter.cols.len()
         let mut c: i64 = 0
         while c < nconds {
@@ -161,18 +206,101 @@ fn row(eng: &mut engine::Engine, tid: i64, rid: i64, filter: &mut filter::Filter
     }
     match take.want {
         Want::Count => ()
-        Want::Ids => rows.push(engine::Row { rowid: rid, vals: #[] })
+        Want::Ids => sink.rows.push(engine::Row { rowid: rid, vals: #[] })
         Want::Values => {
-            if take.probe < take.full { vals = codec::decode_row(bytes, take.full)? }
-            rows.push(engine::Row { rowid: rid, vals: vals })
+            if take.probe < take.full { vals = codec::decode_row_at(buf, start, end, take.full)? }
+            sink.rows.push(engine::Row { rowid: rid, vals: vals })
         }
+        Want::Top => offer(&mut sink.top, vals[sink.top.col], rid)
     }
     Ok(true)
+}
+
+// Whether `(a, ra)` is answered ahead of `(b, rb)`. Equal values keep row-id
+// order in either direction, which is what a stable sort of a walk taken in
+// row-id order answers, so bounding the sort changes no answer.
+fn ahead(asc: bool, a: codec::Value, ra: i64, b: codec::Value, rb: i64) -> bool {
+    let c = schema::cmp_vals(a, b)
+    if c != 0 { return if asc { c < 0 } else { c > 0 } }
+    ra < rb
+}
+
+// Considers row `rid`, whose ordering value is `v`, for a place in `top`.
+fn offer(top: &mut Top, v: codec::Value, rid: i64) {
+    if top.k <= 0 { return }
+    if top.rids.len() < top.k {
+        top.keys.push(v)
+        top.rids.push(rid)
+        sift_up(top, top.rids.len() - 1)
+        return
+    }
+    if ahead(top.asc, v, rid, top.keys[0], top.rids[0]) {
+        top.keys[0] = v
+        top.rids[0] = rid
+        sift_down(top, 0)
+    }
+}
+
+// Whether slot `i` is answered ahead of slot `j`.
+fn slot_ahead(top: &mut Top, i: i64, j: i64) -> bool {
+    ahead(top.asc, top.keys[i], top.rids[i], top.keys[j], top.rids[j])
+}
+
+fn swap_slots(top: &mut Top, i: i64, j: i64) {
+    top.keys.swap(i, j)
+    top.rids.swap(i, j)
+}
+
+// The heap keeps the row answered last at the root, so each parent is behind
+// both of its children.
+fn sift_up(top: &mut Top, at: i64) {
+    let mut i = at
+    while i > 0 {
+        let p = (i - 1) / 2
+        if !slot_ahead(top, p, i) { return }
+        swap_slots(top, p, i)
+        i = p
+    }
+}
+
+fn sift_down(top: &mut Top, at: i64) {
+    let n = top.rids.len()
+    let mut i = at
+    loop {
+        let l = 2 * i + 1
+        if l >= n { return }
+        let r = l + 1
+        let mut last = l
+        if r < n && slot_ahead(top, l, r) { last = r }
+        if !slot_ahead(top, i, last) { return }
+        swap_slots(top, i, last)
+        i = last
+    }
+}
+
+/// The row ids `top` kept, in the order they are answered.
+pub (package) fn ranked(top: &mut Top) -> Vec<i64> {
+    let n = top.rids.len()
+    let mut out: Vec<i64> = #[0; n]
+    // The root is always the row answered last of those still held, so taking
+    // it repeatedly fills the answer from the back.
+    for i in 0..n {
+        out[n - 1 - i] = top.rids[0]
+        let end = top.rids.len() - 1
+        swap_slots(top, 0, end)
+        let _ = top.keys.pop()
+        let _ = top.rids.pop()
+        sift_down(top, 0)
+    }
+    out
 }
 
 #[cfg(test)]
 mod tests {
     use std::fs
+    use crate::kv
+    use crate::codec
+    use crate::engine
     fn fresh(name: String) -> String {
         let dir = "/tmp/terndb_engine_test/" + name
         let _ = fs::remove_dir_all(dir)
@@ -242,5 +370,94 @@ mod tests {
         assert_eq(rows(&mut eng, "SELECT COUNT(*) FROM users WHERE age > 26"), #[#["2"]])
         assert_eq(rows(&mut eng, "SELECT COUNT(*) FROM users WHERE age > 100"), #[#["0"]])
         assert_eq(run(&mut eng, "SELECT COUNT(*) FROM users WHERE age > 26"), 2)
+    }
+
+    // Every row of `t` as a row-at-a-time read answers it, in row-id order:
+    // the reference a walk through the cursor is held to.
+    fn read_one_by_one(st: &mut kv::Store) -> Vec<Vec<String>> {
+        let tid = kv::rows::table_id(st, "t")
+        let mut out: Vec<Vec<String>> = #[]
+        for rid in 1..kv::rows::last_id(st, tid) + 1 {
+            match kv::rows::read(st, tid, rid) {
+                kv::Read::Value(b) => {
+                    let mut cells: Vec<String> = #[]
+                    for v in codec::decode_row(b, 2).unwrap_or_else(|e| panic(e)) { cells.push(v.to_string()) }
+                    out.push(cells)
+                }
+                kv::Read::Absent => ()
+                kv::Read::Fault(e) => panic(e)
+            }
+        }
+        out
+    }
+
+    fn reversed(rows: Vec<Vec<String>>) -> Vec<Vec<String>> {
+        let mut out: Vec<Vec<String>> = #[]
+        for i in 0..rows.len() { out.push(rows[rows.len() - 1 - i]) }
+        out
+    }
+
+    fn walks_agree(eng: &mut engine::Engine, want: Vec<Vec<String>>, when: String) {
+        assert_eq(rows(eng, "SELECT * FROM t"), want, when + ": upward walk")
+        assert_eq(rows(eng, "SELECT * FROM t ORDER BY rowid DESC"), reversed(want), when + ": downward walk")
+    }
+
+    #[test]
+    fn a_walk_through_blocks_answers_what_reading_each_row_answers() {
+        let dir = fresh("cursor_walks")
+        let mut eng = opened(dir)
+        assert_eq(run(&mut eng, "CREATE TABLE t (n INT32, s TEXT)"), 0)
+        for i in 1..400 {
+            // Lengths vary so rows straddle block boundaries, and one row is
+            // larger than a block on its own.
+            let text = if i == 150 { "x".repeat(300_000) } else { "v".repeat(i % 37) + i.to_string() }
+            let _ = eng.exec_args("INSERT INTO t VALUES (?, ?)", #[codec::Value::int32(i), codec::Value::text(text)]).unwrap_or_else(|e| panic("insert " + i.to_string() + ": " + e))
+        }
+        walks_agree(&mut eng, read_one_by_one(&mut eng.store), "written in order")
+        assert(run(&mut eng, "UPDATE t SET s = 'moved' WHERE n > 300") > 0)
+        assert(run(&mut eng, "DELETE FROM t WHERE n < 20") > 0)
+        walks_agree(&mut eng, read_one_by_one(&mut eng.store), "rows in two places in one generation")
+        assert_eq(run(&mut eng, "COMPACT"), 0)
+        assert(run(&mut eng, "UPDATE t SET s = 'again' WHERE n > 100 AND n < 130") > 0)
+        walks_agree(&mut eng, read_one_by_one(&mut eng.store), "rows across generations")
+        // A writer holds the generation its merge made, and answers the same
+        // whether it holds anything or not.
+        let tid = kv::rows::table_id(&mut eng.store, "t")
+        let held, past = kv::rows::span(&mut eng.store, tid, 50)
+        assert(past > held, "a merged row is read from memory")
+        eng.set_resident_budget(0)
+        walks_agree(&mut eng, read_one_by_one(&mut eng.store), "nothing held")
+        eng.set_resident_budget(1 << 30)
+        walks_agree(&mut eng, read_one_by_one(&mut eng.store), "everything sealed held")
+        // A held copy that no longer matches its checksum is passed over for
+        // the file, which still holds the row.
+        let before = read_one_by_one(&mut eng.store)
+        eng.store.resident_bytes = eng.store.resident_bytes.map(|b| b ^ 1u8)
+        walks_agree(&mut eng, before, "a damaged copy in memory")
+        assert(eng.sync().is_ok())
+        let mut reader = engine::open(dir, true).unwrap_or_else(|e| panic(e))
+        walks_agree(&mut reader, read_one_by_one(&mut reader.store), "a reader holding a generation in memory")
+    }
+
+    #[test]
+    fn a_walk_through_blocks_reports_a_damaged_row() {
+        let dir = fresh("cursor_damage")
+        let mut eng = opened(dir)
+        assert_eq(run(&mut eng, "CREATE TABLE t (n INT32, s TEXT)"), 0)
+        assert_eq(run(&mut eng, "INSERT INTO t VALUES (1, 'aaaa'), (2, 'bbbb'), (3, 'cccc')"), 3)
+        assert(eng.sync().is_ok())
+        let path = kv::log::data_path(dir, eng.store.gen)
+        let mut bytes = fs::read(path).unwrap_or(#[])
+        // The second row's text ends just before the third row's record - a
+        // header, its key, and an INT32 and a four-byte TEXT - and the commit
+        // record.
+        let third = kv::log::HEADER_LEN + "t/r/3".byte_len() + (1 + 4) + (1 + 4 + 4)
+        let at = bytes.len() - kv::log::HEADER_LEN - third - 1
+        bytes[at] = bytes[at] + 1u8
+        assert(fs::write(path, bytes).is_ok())
+        match eng.exec("SELECT * FROM t WHERE n > 0") {
+            Ok(_) => assert(false, "a damaged row is not skipped")
+            Err(e) => assert(e.contains("t/r/2") && e.contains("checksum"), "got: " + e)
+        }
     }
 }

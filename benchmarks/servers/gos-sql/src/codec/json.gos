@@ -109,40 +109,11 @@ pub fn render_window(buf: Vec<u8>, start: i64, end: i64, keys: Vec<String>, id: 
     out
 }
 
-// A text column's bytes as a JSON string, escaped where JSON asks for it.
-//
-// Every byte JSON escapes is ASCII, so a run of text may be cut at one and the
-// multi-byte characters either side of the cut stay whole. False means the
-// bytes are not the UTF-8 the column claims.
+// A text column's bytes as a JSON string, escaped as the language's own JSON
+// writer escapes one. False means the bytes are not the UTF-8 the column
+// claims.
 fn text_into(out: &mut String, buf: Vec<u8>, start: i64, end: i64) -> bool {
-    out.push_str("\"")
-    let mut run = start
-    let mut b = start
-    while b < end {
-        let byte = buf[b]
-        if byte == 34u8 || byte == 92u8 || byte < 32u8 {
-            if b > run && !out.push_utf8(buf, run, b) { return false }
-            out.push_str(escape_byte(byte))
-            run = b + 1
-        }
-        b += 1
-    }
-    if end > run && !out.push_utf8(buf, run, end) { return false }
-    out.push_str("\"")
-    true
-}
-
-// The escape JSON spells a byte with, for the bytes it does not take as they
-// are.
-fn escape_byte(byte: u8) -> String {
-    match byte {
-        34u8 => "\\\""
-        92u8 => "\\\\"
-        10u8 => "\\n"
-        13u8 => "\\r"
-        9u8 => "\\t"
-        _ => "\\u00" + hex_byte(byte as i64)
-    }
+    out.push_json_quoted(buf, start, end)
 }
 
 // A raw fixed-width field read as the signed integer it stands for.

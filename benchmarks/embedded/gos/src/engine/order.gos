@@ -1,0 +1,63 @@
+use crate::engine
+use crate::codec
+use crate::kv
+use super::filter
+use super::scan
+
+// The rows a SELECT answers, in the order and window it asked for.
+//
+// Row-id order is the order the walk already visits rows in, so ordering by it
+// costs nothing and lets the walk stop at the window's end. Ordering by a
+// column under a LIMIT keeps only the leading rows while the walk runs and
+// reads whole only the rows it answers, so the cost of the order is the rows
+// returned rather than the rows matched.
+
+/// The statement names no order.
+pub (package) const NONE: i64 = -1
+
+/// The statement orders by the row id.
+pub (package) const ROWID: i64 = -2
+
+/// What an `ORDER BY` names in `def`: a column index, [`ROWID`], or an error
+/// naming the column the table does not have.
+pub (package) fn resolve(def: &mut engine::TableDef, name: String) -> Result<i64, String> {
+    if name.to_lowercase() == schema::ROWID { return Ok(ROWID) }
+    schema::col_index(def, name)
+}
+
+/// The matching rows, whole, ordered by `by` ([`NONE`], [`ROWID`] or a column
+/// index) and cut to the window `offset` / `limit`, where a negative `limit`
+/// takes every row.
+pub (package) fn rows(eng: &mut engine::Engine, def: &mut engine::TableDef, filter: filter::Filter, by: i64, asc: bool, limit: i64, offset: i64) -> Result<Vec<engine::Row>, String> {
+    if by == NONE || by == ROWID {
+        let cap = if limit < 0 { -1 } else { limit + offset }
+        let walk = scan::table(eng, def, filter, scan::Want::Values, cap, by == ROWID && !asc, scan::no_top())?
+        return Ok(engine::window(walk.rows, offset, limit))
+    }
+    if limit < 0 {
+        let walk = scan::table(eng, def, filter, scan::Want::Values, -1, false, scan::no_top())?
+        let mut kept = walk.rows
+        // Equal values fall back to row-id order, the tie-break a limited order
+        // uses too, so the answer does not rest on how the sort treats ties.
+        kept.sort_by(|a, b| {
+            let c = schema::cmp_vals(a.vals[by], b.vals[by])
+            if c != 0 { if asc { c } else { 0 - c } } else { a.rowid - b.rowid }
+        })
+        return Ok(engine::window(kept, offset, limit))
+    }
+    let mut walk = scan::table(eng, def, filter, scan::Want::Top, -1, false, scan::top_of(by, asc, limit + offset))?
+    let ranked = scan::ranked(&mut walk.top)
+    let tid = kv::rows::table_id(&mut eng.store, def.name)
+    let mut out: Vec<engine::Row> = #[]
+    // Rows before the offset were needed to place the window and are not
+    // answered, so they are never read whole.
+    for i in offset..ranked.len() {
+        let rid = ranked[i]
+        match kv::rows::read(&mut eng.store, tid, rid) {
+            kv::Read::Value(bytes) => out.push(engine::Row { rowid: rid, vals: codec::decode_row(bytes, def.cols.len())? })
+            kv::Read::Absent => return Err("row " + rid.to_string() + " of " + def.name + " went missing inside one statement")
+            kv::Read::Fault(e) => return Err(e)
+        }
+    }
+    Ok(out)
+}

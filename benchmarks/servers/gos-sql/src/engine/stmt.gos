@@ -3,6 +3,7 @@ use crate::codec
 use crate::kv
 use crate::sql
 use super::scan
+use super::order
 
 // One statement carried out against the store, from the `Stmt` the parser
 // produced.
@@ -165,29 +166,23 @@ pub (package) fn insert(eng: &mut engine::Engine, table: String, cols: Vec<Strin
 pub (package) fn select(eng: &mut engine::Engine, q: sql::Query) -> Result<engine::QueryResult, String> {
     let mut def = engine::get_def(eng, q.table)?
     let filter = filter::compile(&mut def, q.conds)?
-    let want = if q.count_only { scan::Want::Count } else { scan::Want::Values }
+    // The order is resolved before any row is read, so a statement naming a
+    // column the table does not have is refused whatever the table holds.
+    let by = if q.has_order { order::resolve(&mut def, q.order_col)? } else { order::NONE }
     // A statement that names one row by its id is answered by the one read
     // that holds it, the way a prepared `WHERE rowid = ?` is: the walk exists
     // to find rows the key does not already name.
     if names_one_row(filter, q.has_order, q.limit) && q.offset == 0 {
         return by_id(eng, &mut def, q.cols, q.count_only, filter.id_vals[0])
     }
-    // An ORDER BY has to see every match before it can say which ones survive
-    // the limit; without one, the walk stops as soon as the limit is filled.
-    let cap = if q.has_order || q.limit < 0 { -1 } else { q.limit + q.offset }
-    let matched, mut kept = scan::table(eng, &mut def, filter, want, cap)?
     if q.count_only {
-        return engine::counted(engine::window_count(matched, q.offset, q.limit))
+        // A COUNT answers how many rows match, whatever order they are in.
+        let cap = if q.limit < 0 { -1 } else { q.limit + q.offset }
+        let walk = scan::table(eng, &mut def, filter, scan::Want::Count, cap, false, scan::no_top())?
+        return engine::counted(engine::window_count(walk.matched, q.offset, q.limit))
     }
-    if q.has_order {
-        let oi = schema::col_index(&mut def, q.order_col)?
-        if q.order_asc {
-            kept.sort_by(|a, b| schema::cmp_vals(a.vals[oi], b.vals[oi]))
-        } else {
-            kept.sort_by(|a, b| schema::cmp_vals(b.vals[oi], a.vals[oi]))
-        }
-    }
-    project(&mut def, q.cols, engine::window(kept, q.offset, q.limit))
+    let kept = order::rows(eng, &mut def, filter, by, q.order_asc, q.limit, q.offset)?
+    project(&mut def, q.cols, kept)
 }
 
 // Whether the statement names one row by its id and nothing else, which one
@@ -262,7 +257,7 @@ pub (package) fn update(eng: &mut engine::Engine, table: String, sets: Vec<(Stri
         targets.push(ci)
         values.push(schema::coerce(val, def.tags[ci], def.cols[ci])?)
     }
-    let _, hits = scan::table(eng, &mut def, filter, scan::Want::Values, -1)?
+    let hits = scan::table(eng, &mut def, filter, scan::Want::Values, -1, false, scan::no_top())?.rows
     let tid = kv::rows::table_id(&mut eng.store, table)
     let indexed = index::covers(eng, table)
     let mut writes: Vec<(i64, Vec<u8>)> = #[]
@@ -298,7 +293,7 @@ pub (package) fn delete(eng: &mut engine::Engine, table: String, conds: Vec<sql:
     // values are going, in which case it needs the rows as well.
     let indexed = index::covers(eng, table)
     let want = if indexed { scan::Want::Values } else { scan::Want::Ids }
-    let _, hits = scan::table(eng, &mut def, filter, want, -1)?
+    let hits = scan::table(eng, &mut def, filter, want, -1, false, scan::no_top())?.rows
     let tid = kv::rows::table_id(&mut eng.store, table)
     let mut ids: Vec<i64> = #[]
     let mut gone: Vec<Vec<codec::Value>> = #[]
@@ -399,6 +394,60 @@ mod tests {
         assert_eq(rows(&mut eng, "SELECT name FROM users ORDER BY age DESC LIMIT 2"), #[#["bob"], #["alice"]])
         assert_eq(run(&mut eng, "SELECT * FROM users LIMIT 0"), 0)
         assert_eq(run(&mut eng, "SELECT * FROM users LIMIT 99"), 3, "a LIMIT past the end keeps everything")
+    }
+
+    #[test]
+    fn order_by_rowid_follows_the_walk_in_either_direction() {
+        let mut eng = opened(fresh("order_rowid"))
+        users(&mut eng)
+        assert_eq(rows(&mut eng, "SELECT name FROM users ORDER BY rowid"), #[#["alice"], #["bob"], #["carol"]])
+        assert_eq(rows(&mut eng, "SELECT name FROM users ORDER BY ROWID DESC"), #[#["carol"], #["bob"], #["alice"]])
+        assert_eq(rows(&mut eng, "SELECT name FROM users ORDER BY rowid DESC LIMIT 1 OFFSET 1"), #[#["bob"]])
+        assert_eq(rows(&mut eng, "SELECT name FROM users WHERE age > 26 ORDER BY rowid DESC"), #[#["bob"], #["alice"]])
+        assert_eq(rows(&mut eng, "SELECT COUNT(*) FROM users ORDER BY rowid DESC LIMIT 2"), #[#["2"]])
+        assert(eng.exec("SELECT * FROM users ORDER BY nothing").is_err(), "an unknown order column is refused")
+    }
+
+    // A small deterministic stream of numbers, so the ordering test covers the
+    // same table on every tier.
+    fn next(seed: &mut i64) -> i64 {
+        *seed = (*seed * 1_103_515_245 + 12_345) % 2_147_483_648
+        *seed
+    }
+
+    #[test]
+    fn a_limited_order_answers_what_the_whole_sort_answers() {
+        let mut eng = opened(fresh("order_top"))
+        assert_eq(run(&mut eng, "CREATE TABLE t (n INT32, s TEXT, f FLOAT64, b BOOL, d DATETIME)"), 0)
+        let mut seed: i64 = 7
+        for _ in 0..120 {
+            // Few distinct values, so ties are common, and a NULL in every column.
+            let n = if next(&mut seed) % 9 == 0 { "NULL" } else { (next(&mut seed) % 7 - 3).to_string() }
+            let s = if next(&mut seed) % 11 == 0 { "NULL" } else { "'k" + (next(&mut seed) % 5).to_string() + "'" }
+            let f = if next(&mut seed) % 13 == 0 { "NULL" } else { ((next(&mut seed) % 9) as f64 / 4.0 - 1.0).to_string() }
+            let b = if next(&mut seed) % 2 == 0 { "true" } else { "false" }
+            let d = "'2024-01-0" + (1 + next(&mut seed) % 3).to_string() + "T00:00:00Z'"
+            assert_eq(run(&mut eng, "INSERT INTO t VALUES (" + n + ", " + s + ", " + f + ", " + b + ", " + d + ")"), 1)
+        }
+        // Deleted rows leave gaps in the row ids the walk has to step over.
+        let doomed = run(&mut eng, "SELECT COUNT(*) FROM t WHERE n = 2")
+        assert(doomed > 0)
+        assert_eq(run(&mut eng, "DELETE FROM t WHERE n = 2"), doomed)
+        let mut cache = engine::cache::Plans::new()
+        for col in #["n", "s", "f", "b", "d", "rowid"] {
+            for dir in #["", " DESC"] {
+                let whole = rows(&mut eng, "SELECT * FROM t WHERE b = true ORDER BY " + col + dir)
+                for (limit, offset) in #[(0, 0), (1, 0), (5, 0), (5, 3), (40, 17), (200, 0), (10, 500)] {
+                    let src = "SELECT * FROM t WHERE b = true ORDER BY " + col + dir +
+                        " LIMIT " + limit.to_string() + " OFFSET " + offset.to_string()
+                    let mut want: Vec<Vec<String>> = #[]
+                    for i in offset..min(offset + limit, whole.len()) { want.push(whole[i]) }
+                    assert_eq(rows(&mut eng, src), want, src)
+                    let res = cache.exec(&mut eng, src).unwrap_or_else(|e| panic(src + " -> " + e))
+                    assert_eq(res.count, want.len(), "prepared: " + src)
+                }
+            }
+        }
     }
 
     #[test]

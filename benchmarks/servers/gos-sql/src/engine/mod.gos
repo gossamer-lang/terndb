@@ -149,6 +149,16 @@ impl Engine {
     /// commit may be lost if the machine stops before the operating system writes
     /// it out. It is for bulk loading, not for serving.
     pub fn set_durable(&mut self, durable: bool) { self.store.durable = durable }
+
+    /// Sets how many bytes of sealed log the engine holds in memory, 0 for
+    /// none, and settles what it holds under the new budget.
+    ///
+    /// A read-only engine shared between threads is configured before it is
+    /// shared: what it holds is settled here, not while it answers.
+    pub fn set_resident_budget(&mut self, bytes: i64) {
+        self.store.resident_budget = bytes
+        kv::rows::admit_resident(&mut self.store)
+    }
 }
 
 pub (package) fn empty_result() -> QueryResult { QueryResult { cols: #[], rows: #[], count: 0 } }

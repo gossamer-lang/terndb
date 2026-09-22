@@ -43,7 +43,7 @@ pub (package) fn compile(def: &mut engine::TableDef, conds: Vec<sql::Cond>) -> R
     for cond in conds {
         if cond.col.to_lowercase() == schema::ROWID {
             let is_param = cond.val.tag == codec::TAG_PARAM
-            if !is_param && cond.val.tag != codec::TAG_I64 && cond.val.tag != codec::TAG_I32 {
+            if !is_param && !codec::is_int(cond.val.tag) {
                 return Err("rowid compares against a whole number, not " + codec::type_name_for_tag(cond.val.tag))
             }
             if cond.op == sql::OP_EQ {
@@ -84,7 +84,7 @@ pub (package) fn bind(template: Filter, args: Vec<codec::Value>) -> Result<Filte
         let n = f.id_args[i]
         if n < 0 { continue }
         if n >= args.len() { return Err(missing_arg(n, args.len())) }
-        if args[n].tag != codec::TAG_I64 && args[n].tag != codec::TAG_I32 {
+        if !codec::is_int(args[n].tag) {
             return Err("rowid compares against a whole number, not " +
                 codec::type_name_for_tag(args[n].tag))
         }

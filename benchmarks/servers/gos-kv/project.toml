@@ -1,3 +1,4 @@
 [project]
 id = "terndb.db/bench-kv"
 version = "0.1.0"
+gossamer-version = "^v0.63.1"

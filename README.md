@@ -1,4 +1,4 @@
-# terndb 0.2.0
+# terndb 0.3.0
 
 [![CI](https://github.com/danpozmanter/terndb/actions/workflows/ci.yml/badge.svg)](https://github.com/danpozmanter/terndb/actions/workflows/ci.yml)
 
@@ -13,7 +13,7 @@ INSERT INTO users VALUES ('ada', 'ada@example.com', 1.5, true)
 SELECT name, score FROM users WHERE name = 'ada'
 ```
 
-Requires Gossamer 0.58.13 or later.
+Requires Gossamer 0.62.1 or later.
 
 ## Usage
 

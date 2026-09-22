@@ -1,5 +1,4 @@
 use std::fs
-use std::encoding::binary
 use std::hash::crc32
 
 // The log's own vocabulary: how a record is framed, where a generation's files
@@ -9,6 +8,11 @@ use std::hash::crc32
 pub (package) const HEADER_LEN: i64 = 11
 
 pub (package) const HINT_LEN: i64 = 18
+
+// The most a sequential read takes from the log at once: enough that a walk
+// over many small records costs a read per block rather than per record, and
+// little enough to hold one per generation being read.
+pub (package) const SCAN_BLOCK: i64 = 262_144
 
 pub (package) const KIND_PUT: u8 = 0
 
@@ -137,12 +141,23 @@ pub (package) fn record_crc(key: String, val: Vec<u8>) -> i64 {
 }
 
 pub (package) fn record(key: String, kind: u8, val: Vec<u8>, crc: i64) -> Vec<u8> {
-    let kb = key.as_bytes()
-    let mut out = binary::put_u32_le(#[], crc)
-    out.push(kind)
-    out.extend(binary::put_u16_le(#[], kb.len()))
-    out.extend(binary::put_u32_le(#[], val.len()))
-    out.extend(kb)
-    out.extend(val)
+    let mut out: Vec<u8> = #[]
+    record_into(&mut out, key, kind, val, crc)
     out
+}
+
+// Appends one framed record to `buf`, the header written field by field in
+// place rather than assembled from pieces of its own.
+pub (package) fn record_into(buf: &mut Vec<u8>, key: String, kind: u8, val: Vec<u8>, crc: i64) {
+    push_le(buf, crc, 4)
+    buf.push(kind)
+    push_le(buf, key.byte_len(), 2)
+    push_le(buf, val.len(), 4)
+    buf.extend(key.as_bytes())
+    buf.extend(val)
+}
+
+// Appends the low `width` bytes of `v`, least significant first.
+pub (package) fn push_le(buf: &mut Vec<u8>, v: i64, width: i64) {
+    for i in 0..width { buf.push(((v >> (8 * i)) & 255) as u8) }
 }

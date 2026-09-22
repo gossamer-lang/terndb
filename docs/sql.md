@@ -62,8 +62,9 @@ An `INSERT` naming its columns supplies those and leaves every other column
 `NULL`; one that names none supplies every column in declaration order.
 
 One table per statement. `WHERE` is an `AND` of `=` `!=` (or `<>`) `<` `>` `<=`
-`>=` against a column or against `rowid`. `LIMIT` takes an `OFFSET` beside it,
-which skips that many matching rows first. There are no joins, no `OR`, no
+`>=` against a column or against `rowid`. `ORDER BY` names one column or
+`rowid`, and rows with equal values come back in `rowid` order. `LIMIT` takes an
+`OFFSET` beside it, which skips that many matching rows first. There are no joins, no `OR`, no
 subqueries and no multi-statement transactions.
 
 `INSERT` answers the number of rows written, `UPDATE` and `DELETE` the number
@@ -176,10 +177,11 @@ one worker, one request handler - so reaching a plan costs no lock.
 
 ## What a statement guarantees
 
-- **Atomic.** A statement's records are appended and then a commit record; the
-  index moves only once that commit is durable. A rebuild applies records as far
-  as the last commit it saw, so a statement interrupted by a crash leaves
-  nothing behind and its bytes are overwritten by the next append. A write that
+- **Atomic.** A statement's records and its commit record are written
+  together; the index moves only once that commit is durable. A rebuild applies
+  records as far as the last commit it saw, so a statement interrupted by a
+  crash leaves nothing behind, and the next writer to open the store cuts its
+  bytes away before it appends. A write that
   fails part-way rewinds the log, and a rewind that itself fails is reported
   beside the failure that asked for it.
 - **Consistent.** Types, column counts and value ranges are checked before a

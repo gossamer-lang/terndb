@@ -9,35 +9,156 @@ use super::rows
 // Rebuilding the index at open, from a sealed generation's hint file where
 // there is one and from the data file otherwise.
 
-const SCAN_BLOCK: i64 = 262_144
+/// The first bytes of a hint written in sections: a table's rows by row id,
+/// then the keys the hash index holds. A hint without them is the older form,
+/// one record per key.
+pub (package) const HINT_MAGIC: String = "TNH2"
+
+/// Section tags of a sectioned hint.
+pub (package) const HINT_END: u8 = 0
+pub (package) const HINT_TABLE: u8 = 1
+pub (package) const HINT_KEYS: u8 = 2
+
+// One row of a table section: row id, offset, value length, record checksum and
+// key checksum.
+const HINT_ROW_LEN: i64 = 28
 
 // Fills the index from a sealed generation's hint file, answering whether the
-// file described every record it holds: a hint that runs out part-way through
-// describes some of the generation, and the caller reads the rest from the data
-// file rather than serving a store that is missing keys.
+// file described every record it holds: a hint that runs out part-way through,
+// or fails its own checksum, describes the generation no better than not at
+// all, and the caller reads the data file instead.
 pub (package) fn rebuild_from_hints(st: &mut kv::Store, gen: i64, buf: Vec<u8>) -> bool {
-    let mut p: i64 = 0
-    while p + log::HINT_LEN <= buf.len() {
-        let head = match buf.slice(p, p + log::HINT_LEN) {
-            Ok(h) => h
-            Err(_) => return false
-        }
-        let klen = binary::get_u16_le_at(head, 0).unwrap_or(0u16) as i64
-        let vlen = binary::get_u32_le_at(head, 2).unwrap_or(0u32) as i64
-        let crc = binary::get_u32_le_at(head, 6).unwrap_or(0u32) as i64
-        let off = binary::get_u64_le_at(head, 10).unwrap_or(0u64) as i64
-        let kstart = p + log::HINT_LEN
-        let key = match buf.slice(kstart, kstart + klen) {
-            Ok(b) => match log::key_from(b) {
-                Some(k) => k
-                None => return false
-            }
-            Err(_) => return false
-        }
-        rows::remember(st, key, kv::Entry { file: gen, offset: off, vlen: vlen, crc: crc })
-        p = kstart + klen
+    if is_sectioned(buf) {
+        // The whole hint is checked before any of it is applied, so a hint the
+        // data file has to stand in for leaves nothing half-placed behind it.
+        if !sections(st, gen, buf, false) { return false }
+        return sections(st, gen, buf, true)
     }
-    p == buf.len()
+    rebuild_from_flat_hints(st, gen, buf)
+}
+
+fn is_sectioned(buf: Vec<u8>) -> bool {
+    let magic = HINT_MAGIC.as_bytes()
+    if buf.len() < magic.len() { return false }
+    for i in 0..magic.len() {
+        if buf[i] != magic[i] { return false }
+    }
+    true
+}
+
+// Walks a sectioned hint, placing each record when `apply` and only checking
+// the hint's shape otherwise. Answers whether the hint is whole: every section
+// intact, the trailer's count matching the records read, and the trailer's
+// checksum matching every byte before it.
+fn sections(st: &mut kv::Store, gen: i64, buf: Vec<u8>, apply: bool) -> bool {
+    let n = buf.len()
+    if n < HINT_MAGIC.byte_len() + 13 { return false }
+    let sum = binary::get_u32_le_at(buf, n - 4).unwrap_or(0u32) as i64
+    if !apply && crc32::update_window(0, buf, 0, n - 4) != sum { return false }
+    let mut p = HINT_MAGIC.byte_len()
+    let mut seen: i64 = 0
+    while p < n - 4 {
+        let tag = buf[p]
+        p += 1
+        if tag == HINT_END {
+            if p + 8 != n - 4 { return false }
+            return binary::get_u64_le_at(buf, p).unwrap_or(0u64) as i64 == seen
+        }
+        if tag == HINT_KEYS {
+            if p + 8 > n - 4 { return false }
+            let count = binary::get_u64_le_at(buf, p).unwrap_or(0u64) as i64
+            p += 8
+            for _ in 0..count {
+                let next = flat_record(st, gen, buf, p, n - 4, apply)
+                if next < 0 { return false }
+                p = next
+                seen += 1
+            }
+        } else if tag == HINT_TABLE {
+            if p + 2 > n - 4 { return false }
+            let nlen = binary::get_u16_le_at(buf, p).unwrap_or(0u16) as i64
+            p += 2
+            if p + nlen + 16 > n - 4 { return false }
+            let name = match buf.slice(p, p + nlen) {
+                Ok(b) => match log::key_from(b) {
+                    Some(k) => k
+                    None => return false
+                }
+                Err(_) => return false
+            }
+            p += nlen
+            let count = binary::get_u64_le_at(buf, p).unwrap_or(0u64) as i64
+            let top = binary::get_u64_le_at(buf, p + 8).unwrap_or(0u64) as i64
+            p += 16
+            if count < 0 || p + count * HINT_ROW_LEN > n - 4 { return false }
+            if apply {
+                let tid = rows::open_table(st, name)
+                rows::reserve(st, tid, top)
+                for i in 0..count {
+                    let r = p + i * HINT_ROW_LEN
+                    let rid = binary::get_u64_le_at(buf, r).unwrap_or(0u64) as i64
+                    rows::remember_row(st, tid, rid, binary::get_u32_le_at(buf, r + 24).unwrap_or(0u32) as i64, kv::Entry {
+                        file: gen
+                        offset: binary::get_u64_le_at(buf, r + 8).unwrap_or(0u64) as i64
+                        vlen: binary::get_u32_le_at(buf, r + 16).unwrap_or(0u32) as i64
+                        crc: binary::get_u32_le_at(buf, r + 20).unwrap_or(0u32) as i64
+                    })
+                }
+            } else {
+                // Row ids climb within a section and stay within the top its
+                // header names, which is what lets a reader size the table once.
+                let mut last: i64 = 0
+                for i in 0..count {
+                    let rid = binary::get_u64_le_at(buf, p + i * HINT_ROW_LEN).unwrap_or(0u64) as i64
+                    if rid <= last || rid > top { return false }
+                    last = rid
+                }
+            }
+            p += count * HINT_ROW_LEN
+            seen += count
+        } else {
+            return false
+        }
+    }
+    false
+}
+
+// One record in the older hint shape, `[klen][vlen][crc][offset][key]`, at `p`
+// of `buf[..end]`. Places it when `apply`, and answers the offset past it, or
+// -1 when it does not fit or its key is not UTF-8.
+fn flat_record(st: &mut kv::Store, gen: i64, buf: Vec<u8>, p: i64, end: i64, apply: bool) -> i64 {
+    if p + log::HINT_LEN > end { return -1 }
+    let klen = binary::get_u16_le_at(buf, p).unwrap_or(0u16) as i64
+    let kstart = p + log::HINT_LEN
+    if kstart + klen > end { return -1 }
+    let key = match buf.slice(kstart, kstart + klen) {
+        Ok(b) => match log::key_from(b) {
+            Some(k) => k
+            None => return -1
+        }
+        Err(_) => return -1
+    }
+    if apply {
+        rows::remember(st, key, kv::Entry {
+            file: gen
+            offset: binary::get_u64_le_at(buf, p + 10).unwrap_or(0u64) as i64
+            vlen: binary::get_u32_le_at(buf, p + 2).unwrap_or(0u32) as i64
+            crc: binary::get_u32_le_at(buf, p + 6).unwrap_or(0u32) as i64
+        })
+    }
+    kstart + klen
+}
+
+// A hint in the older form: one flat record per key and nothing around them,
+// whole when its records reach exactly to its end.
+fn rebuild_from_flat_hints(st: &mut kv::Store, gen: i64, buf: Vec<u8>) -> bool {
+    let mut p: i64 = 0
+    while p < buf.len() {
+        let next = flat_record(st, gen, buf, p, buf.len(), true)
+        if next < 0 { return false }
+        p = next
+    }
+    true
 }
 
 // A sliding window over one file, so a scan costs a block of memory rather
@@ -55,7 +176,7 @@ struct Block {
 // a different thing and is reported as one.
 fn ensure(f: fs::File, blk: &mut Block, at: i64, len: i64) -> Result<bool, String> {
     if at >= blk.off && at + len <= blk.off + blk.bytes.len() { return Ok(true) }
-    let want = if len > SCAN_BLOCK { len } else { SCAN_BLOCK }
+    let want = if len > log::SCAN_BLOCK { len } else { log::SCAN_BLOCK }
     match f.read_at(want, at) {
         Ok(b) => {
             if b.len() < len { return Ok(false) }
@@ -114,13 +235,11 @@ pub (package) fn rebuild_from_data(st: &mut kv::Store, gen: i64, path: String) -
             Ok(false) => return committed
             Err(e) => return unreadable(st, gen, p, committed, e)
         }
-        // The block may have moved to cover the whole record.
+        // The block may have moved to cover the whole record. The record is
+        // checked where it lies, and a row's key is recognised there too, so a
+        // row replays without its key being copied out or spelled as text.
         let base = p - blk.off + log::HEADER_LEN
-        let body = match blk.bytes.slice(base, base + head.klen + head.vlen) {
-            Ok(b) => b
-            Err(_) => return committed
-        }
-        if crc32::checksum(body) as i64 != head.crc {
+        if crc32::update_window(0, blk.bytes, base, base + head.klen + head.vlen) != head.crc {
             damaged(st, gen, p, committed)
             return committed
         }
@@ -132,7 +251,15 @@ pub (package) fn rebuild_from_data(st: &mut kv::Store, gen: i64, path: String) -
             committed = p
             continue
         }
-        let key = match body.slice(0, head.klen) {
+        let entry = kv::Entry { file: gen, offset: at, vlen: head.vlen, crc: head.crc }
+        let remove = head.kind == log::KIND_DELETE
+        let tid, rid = rows::locate_row_bytes(st, blk.bytes, base, head.klen)
+        if tid >= 0 {
+            let kcrc = crc32::update_window(0, blk.bytes, base, base + head.klen)
+            staged.push(batch::Staged { key: "", entry: entry, remove: remove, tid: tid, rid: rid, kcrc: kcrc })
+            continue
+        }
+        let key = match blk.bytes.slice(base, base + head.klen) {
             Ok(b) => match log::key_from(b) {
                 Some(k) => k
                 None => {
@@ -142,11 +269,7 @@ pub (package) fn rebuild_from_data(st: &mut kv::Store, gen: i64, path: String) -
             }
             Err(_) => return committed
         }
-        staged.push(batch::Staged {
-            key: key
-            entry: kv::Entry { file: gen, offset: at, vlen: head.vlen, crc: head.crc }
-            remove: head.kind == log::KIND_DELETE
-        })
+        staged.push(batch::Staged { key: key, entry: entry, remove: remove, tid: -1, rid: -1, kcrc: 0 })
     }
 }
 
@@ -185,7 +308,13 @@ fn damaged(st: &mut kv::Store, gen: i64, at: i64, committed: i64) {
 // The index changes of one committed batch.
 fn apply(st: &mut kv::Store, staged: Vec<batch::Staged>) {
     for change in staged {
-        if change.remove {
+        if change.tid >= 0 {
+            if change.remove {
+                rows::forget_row(st, change.tid, change.rid)
+            } else {
+                rows::remember_row(st, change.tid, change.rid, change.kcrc, change.entry)
+            }
+        } else if change.remove {
             rows::forget(st, change.key)
         } else {
             rows::remember(st, change.key, change.entry)

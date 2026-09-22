@@ -100,23 +100,20 @@ fn build(eng: &mut engine::Engine, ix: i64) -> Result<(), String> {
     let tid = kv::rows::table_id(&mut eng.store, table)
     let top = kv::rows::last_id(&mut eng.store, tid)
     let width = ci + 1
-    let mut vals: Vec<codec::Value> = #[]
-    let mut rid: i64 = 1
-    while rid <= top {
+    let mut cur = kv::rows::cursor(tid, 1)
+    for rid in 1..top + 1 {
         // A row the table holds has to be readable for the index over it to
         // describe the table; one that is not stops the index being built.
-        match kv::rows::read(&mut eng.store, tid, rid) {
-            kv::Read::Value(bytes) => {
-                if !codec::decode_row_into(bytes, width, &mut vals) {
-                    return Err("index " + table + "." + eng.indexes[ix].col + ": row " +
-                        rid.to_string() + " is malformed")
-                }
-                add(eng, ix, rid, vals[ci])
-            }
-            kv::Read::Absent => ()
-            kv::Read::Fault(e) => return Err(e)
+        let vals = match kv::rows::locate(&mut eng.store, &mut cur, rid) {
+            kv::rows::Place::Absent => continue
+            kv::rows::Place::Fault(e) => return Err(e)
+            kv::rows::Place::Resident(start, end) => codec::decode_row_at(eng.store.resident_bytes, start, end, width)
+            kv::rows::Place::Block(w, start, end) => codec::decode_row_at(cur.blocks[w], start, end, width)
         }
-        rid += 1
+        match vals {
+            Ok(v) => add(eng, ix, rid, v[ci])
+            Err(_) => return Err("index " + table + "." + eng.indexes[ix].col + ": row " + rid.to_string() + " is malformed")
+        }
     }
     Ok(())
 }
@@ -277,8 +274,8 @@ mod tests {
                 }
             }
         }
-        let mut fa = indexed.exec("SELECT * FROM t ORDER BY rowid").unwrap_or(super::empty_result())
-        let mut fb = plain.exec("SELECT * FROM t ORDER BY rowid").unwrap_or(super::empty_result())
+        let fa = indexed.exec("SELECT * FROM t ORDER BY rowid").unwrap_or_else(|e| panic(e))
+        let fb = plain.exec("SELECT * FROM t ORDER BY rowid").unwrap_or_else(|e| panic(e))
         assert_eq(fa.render(), fb.render(), "the two engines hold the same table")
     }
 

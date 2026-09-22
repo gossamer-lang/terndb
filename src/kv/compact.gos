@@ -1,8 +1,10 @@
 use std::fs
 use std::encoding::binary
+use std::hash::crc32
 use crate::kv
 use super::log
-use super::scan
+use super::recover
+use super::rows
 
 // Merging the log: the live records of the generations worth rewriting go into
 // one sealed generation, and the space the superseded ones held is reclaimed.
@@ -59,7 +61,7 @@ fn flush_hints(f: fs::File, buf: Vec<u8>, off: i64) -> Result<i64, String> {
 // What each generation's live records occupy, keyed by generation. The index is
 // the only thing that knows which records are still live, so this is where a
 // generation's waste is worked out from.
-fn live_by_gen(st: &mut kv::Store) -> Map<i64, i64> {
+pub (package) fn live_by_gen(st: &mut kv::Store) -> Map<i64, i64> {
     let mut live_in: Map<i64, i64> = Map::new()
     for k in st.index.keys() {
         if let Some(e) = st.index.get(k) {
@@ -159,43 +161,35 @@ pub (package) fn compact_dirty(st: &mut kv::Store) -> Result<(), String> {
     compact_into(st, dirty)
 }
 
-// Points `key` at a record that has just been moved. The accounting is left to
-// `reaccount`, because a partial merge cannot work it out from what it moved.
-fn relocate(st: &mut kv::Store, key: String, e: kv::Entry) {
-    let tid, rid = rows::locate_row(st, key)
-    if tid >= 0 && rid >= 1 {
-        let s = 3 * rid
-        if s + 2 < st.tables[tid].slots.len() && st.tables[tid].slots[s + 1] != 0 {
-            st.tables[tid].slots[s] = log::pack_loc(e.offset, e.vlen)
-            st.tables[tid].slots[s + 1] = log::pack_gc(e.file, e.crc)
-            return
-        }
-    }
-    let _ = st.index.insert(key, e)
-}
-
-// Which generation holds the live record for `key`, or -1 when nothing does.
-fn entry_gen(st: &mut kv::Store, key: String) -> i64 {
-    let tid, rid = rows::locate_row(st, key)
-    if tid >= 0 && rid >= 1 {
-        let s = 3 * rid
-        if s + 2 < st.tables[tid].slots.len() && st.tables[tid].slots[s + 1] != 0 {
-            return log::gc_gen(st.tables[tid].slots[s + 1])
-        }
-    }
-    match st.index.get(key) {
-        Some(e) => e.file
-        None => -1
-    }
-}
-
 // Where the merge put each record it moved, and where the merged generation
 // ends. The index is only pointed at them once the walk is over: the index the
 // walk reads to find the live records is the one it would otherwise rewrite.
+//
+// Rows are kept as the table, row id and the two slot words that place them,
+// so moving one builds no key; the few keys the hash index holds keep theirs.
 struct Moved {
+    tids: Vec<i64>
+    rids: Vec<i64>
+    locs: Vec<i64>
+    gcs: Vec<i64>
     keys: Vec<String>
     entries: Vec<kv::Entry>
     end: i64
+}
+
+// What the merge is writing: the merged generation's bytes not yet written and
+// where they go, and the hint being built beside them.
+struct Out {
+    mf: fs::File
+    buf: Vec<u8>
+    at: i64
+    hf: fs::File
+    hbuf: Vec<u8>
+    hoff: i64
+    /// Checksum of every hint byte written so far, which the hint's trailer
+    /// carries so a hint that was damaged is never trusted.
+    hcrc: i64
+    hcount: i64
 }
 
 fn compact_into(st: &mut kv::Store, merging: Vec<i64>) -> Result<(), String> {
@@ -207,13 +201,22 @@ fn compact_into(st: &mut kv::Store, merging: Vec<i64>) -> Result<(), String> {
     // only ever sealed by a hint that is complete and describes durable data.
     let hstage = log::hint_path(st.dir, merged) + ".part"
     let hf = log::open_fresh(hstage)?
-    let moved = move_live(st, merging, mf, hf, merged)?
-    seal(mf, hf, hstage, log::hint_path(st.dir, merged), moved.end, st.dir)?
+    let mut out = Out { mf: mf, buf: #[], at: 0, hf: hf, hbuf: #[], hoff: 0, hcrc: 0, hcount: 0 }
+    out.hbuf.extend(recover::HINT_MAGIC.as_bytes())
+    let moved = move_live(st, merging, &mut out, merged)?
+    seal(&mut out, hstage, log::hint_path(st.dir, merged), st.dir)?
     start_active(st, merged + 1)?
-    for i in 0..moved.keys.len() { relocate(st, moved.keys[i], moved.entries[i]) }
+    for i in 0..moved.rids.len() {
+        let s = 3 * moved.rids[i]
+        st.tables[moved.tids[i]].slots[s] = moved.locs[i]
+        st.tables[moved.tids[i]].slots[s + 1] = moved.gcs[i]
+    }
+    for i in 0..moved.keys.len() { let _ = st.index.insert(moved.keys[i], moved.entries[i]) }
     drop_merged(st, merging, merged)?
     // The merge wrote one commit record to seal the generation it made.
     reaccount(st, log::HEADER_LEN)?
+    // The generations the store held may be gone and the merged one is new.
+    rows::admit_resident(st)
     Ok(())
 }
 
@@ -229,70 +232,201 @@ fn newest_generation(st: &mut kv::Store) -> Result<i64, String> {
 // Copies the live records of `merging` into the merged generation, writing the
 // hint that will seal it as it goes. A record in a generation nobody is merging
 // stays where it is, and so does the index entry pointing at it.
-fn move_live(st: &mut kv::Store, merging: Vec<i64>, mf: fs::File, hf: fs::File, merged: i64) -> Result<Moved, String> {
-    let mut moved = Moved { keys: #[], entries: #[], end: 0 }
-    let mut hbuf: Vec<u8> = #[]
-    let mut hoff: i64 = 0
-    for k in scan::keys(st, "") {
-        if !merging.contains(entry_gen(st, k)) { continue }
-        // A record the merge cannot read is one it would drop on the floor: the
-        // generations it came from are removed once the merge is done, so a
-        // record that fails its checksum stops the merge instead.
-        let v = match st.get(k) {
-            kv::Read::Value(v) => v
-            kv::Read::Absent => continue
-            kv::Read::Fault(e) => return Err("compact: " + e)
+//
+// Each record is copied as it lies - header, key and value - after checking it
+// against the checksum the index carries: the key and value are unchanged, so
+// the checksum the record was written with is still the right one.
+//
+// A record the merge cannot read is one it would drop on the floor: the
+// generations it came from are removed once the merge is done, so a record that
+// fails its checksum stops the merge instead.
+fn move_live(st: &mut kv::Store, merging: Vec<i64>, out: &mut Out, merged: i64) -> Result<Moved, String> {
+    let mut moved = Moved { tids: #[], rids: #[], locs: #[], gcs: #[], keys: #[], entries: #[], end: 0 }
+    let mut hashed: Vec<String> = #[]
+    for k in st.index.keys() {
+        if let Some(e) = st.index.get(k) {
+            if merging.contains(e.file) { hashed.push(k) }
         }
-        let crc = log::record_crc(k, v)
-        let rec = log::record(k, log::KIND_PUT, v, crc)
-        match mf.write_at(rec, moved.end) {
-            Ok(n) => {
-                if n != rec.len() { return Err("compact: short write") }
-            }
-            Err(e) => return Err("compact: write: " + e.message())
-        }
-        moved.keys.push(k)
-        moved.entries.push(kv::Entry { file: merged, offset: moved.end, vlen: v.len(), crc: crc })
-        hint_into(&mut hbuf, k, v.len(), crc, moved.end)
-        if hbuf.len() >= HINT_FLUSH {
-            hoff = flush_hints(hf, hbuf, hoff)?
-            hbuf = #[]
-        }
-        moved.end += rec.len()
     }
-    let _ = flush_hints(hf, hbuf, hoff)?
+    hashed.sort()
+    out.hbuf.push(recover::HINT_KEYS)
+    log::push_le(&mut out.hbuf, hashed.len(), 8)
+    for k in hashed {
+        let e = match st.index.get(k) {
+            Some(e) => e
+            None => continue
+        }
+        let rec = whole_record(st, k, e)?
+        let at = emit(out, rec, 0, rec.len())?
+        moved.keys.push(k)
+        moved.entries.push(kv::Entry { file: merged, offset: at, vlen: e.vlen, crc: e.crc })
+        hint_into(&mut out.hbuf, k, e.vlen, e.crc, at)
+        out.hcount += 1
+        flush_hints_due(out)?
+    }
+    for tid in 0..st.tables.len() {
+        move_table(st, tid, merging, out, merged, &mut moved)?
+    }
+    moved.end = out.at + out.buf.len()
     Ok(moved)
+}
+
+// Moves one table's rows in row-id order, so the merged generation holds each
+// table's rows where a walk up the row ids reads them one block after another.
+fn move_table(st: &mut kv::Store, tid: i64, merging: Vec<i64>, out: &mut Out, merged: i64, moved: &mut Moved) -> Result<(), String> {
+    // The section header names how many rows follow and the highest of them, so
+    // a reader sizes the table once rather than a row at a time.
+    let mut count: i64 = 0
+    let mut top: i64 = 0
+    for rid in 1..st.tables[tid].top + 1 {
+        let gc = st.tables[tid].slots[3 * rid + 1]
+        if gc != 0 && merging.contains(log::gc_gen(gc)) {
+            count += 1
+            top = rid
+        }
+    }
+    if count == 0 { return Ok(()) }
+    out.hbuf.push(recover::HINT_TABLE)
+    log::push_le(&mut out.hbuf, st.tables[tid].name.byte_len(), 2)
+    out.hbuf.extend(st.tables[tid].name.as_bytes())
+    log::push_le(&mut out.hbuf, count, 8)
+    log::push_le(&mut out.hbuf, top, 8)
+    let mut cur = rows::cursor(tid, 1)
+    for rid in 1..top + 1 {
+        let s = 3 * rid
+        let gc = st.tables[tid].slots[s + 1]
+        if gc == 0 || !merging.contains(log::gc_gen(gc)) { continue }
+        let head = rows::row_record_len(st, tid, rid, 0)
+        let at = match rows::locate(st, &mut cur, rid) {
+            rows::Place::Absent => return Err("compact: row " + rid.to_string() + " of " + st.tables[tid].name + " went missing during the merge")
+            rows::Place::Fault(e) => return Err("compact: " + e)
+            rows::Place::Resident(a, b) => copy_row(out, st.resident_bytes, a - head, b, gc)?
+            rows::Place::Block(w, a, b) => copy_row(out, cur.blocks[w], a - head, b, gc)?
+        }
+        let loc = st.tables[tid].slots[s]
+        moved.tids.push(tid)
+        moved.rids.push(rid)
+        moved.locs.push(log::pack_loc(at, log::loc_vlen(loc)))
+        moved.gcs.push(log::pack_gc(merged, log::gc_crc(gc)))
+        log::push_le(&mut out.hbuf, rid, 8)
+        log::push_le(&mut out.hbuf, at, 8)
+        log::push_le(&mut out.hbuf, log::loc_vlen(loc), 4)
+        log::push_le(&mut out.hbuf, log::gc_crc(gc), 4)
+        log::push_le(&mut out.hbuf, st.tables[tid].slots[s + 2], 4)
+        out.hcount += 1
+        flush_hints_due(out)?
+    }
+    Ok(())
+}
+
+// Checks the record in `src[start..end]` against the checksum its slot
+// carries and copies it into the merge, answering where it now starts.
+//
+// The value was already checked when it was placed; this checks the header and
+// key it carries as well, so a record copied as it lies is as sound as one
+// written afresh.
+fn copy_row(out: &mut Out, src: Vec<u8>, start: i64, end: i64, gc: i64) -> Result<i64, String> {
+    if !record_holds(src, start, end, log::gc_crc(gc)) { return Err("compact: a record's header does not match its row") }
+    emit(out, src, start, end)
+}
+
+// Whether `buf[start..end]` is one whole put record whose header and contents
+// agree with each other and with the checksum `crc` the index carries.
+fn record_holds(buf: Vec<u8>, start: i64, end: i64, crc: i64) -> bool {
+    if start < 0 || end > buf.len() || end - start < log::HEADER_LEN { return false }
+    let stored = binary::get_u32_le_at(buf, start).unwrap_or(0u32) as i64
+    let klen = binary::get_u16_le_at(buf, start + 5).unwrap_or(0u16) as i64
+    let vlen = binary::get_u32_le_at(buf, start + 7).unwrap_or(0u32) as i64
+    if buf[start + 4] != log::KIND_PUT || log::HEADER_LEN + klen + vlen != end - start { return false }
+    stored == crc && crc32::update_window(0, buf, start + log::HEADER_LEN, end) == crc
+}
+
+// The whole record the hash index names for `key`, checked before it is
+// copied.
+fn whole_record(st: &mut kv::Store, key: String, e: kv::Entry) -> Result<Vec<u8>, String> {
+    let len = log::record_len(key, e.vlen)
+    let f = if e.file == st.gen && st.data.is_some() { st.data } else { kv::reader_for(st, e.file) }
+    let rec = match f {
+        Some(file) => match file.read_at(len, e.offset) {
+            Ok(b) => b
+            Err(err) => return Err("compact: '" + key + "': " + err.message())
+        }
+        None => return Err("compact: '" + key + "': generation " + e.file.to_string() + " cannot be opened")
+    }
+    if !record_holds(rec, 0, rec.len(), e.crc) { return Err("compact: '" + key + "': checksum mismatch") }
+    Ok(rec)
+}
+
+// Appends `src[start..end]` to the merged generation, writing out what has
+// gathered once there is enough of it, and answers where the bytes start.
+fn emit(out: &mut Out, src: Vec<u8>, start: i64, end: i64) -> Result<i64, String> {
+    let at = out.at + out.buf.len()
+    match src.slice(start, end) {
+        Ok(part) => out.buf.extend(part)
+        Err(e) => return Err("compact: " + e.message())
+    }
+    if out.buf.len() >= kv::PENDING_FLUSH { flush_out(out)? }
+    Ok(at)
+}
+
+fn flush_out(out: &mut Out) -> Result<(), String> {
+    if out.buf.len() == 0 { return Ok(()) }
+    match out.mf.write_at(out.buf, out.at) {
+        Ok(n) => {
+            if n != out.buf.len() { return Err("compact: short write") }
+        }
+        Err(e) => return Err("compact: write: " + e.message())
+    }
+    out.at += out.buf.len()
+    out.buf.clear()
+    Ok(())
+}
+
+// Writes out the hint bytes gathered so far once there are enough of them, so
+// a large store's hint is never held whole.
+fn flush_hints_due(out: &mut Out) -> Result<(), String> {
+    if out.hbuf.len() < HINT_FLUSH { return Ok(()) }
+    flush_hint_bytes(out)
+}
+
+fn flush_hint_bytes(out: &mut Out) -> Result<(), String> {
+    out.hcrc = crc32::update(out.hcrc, out.hbuf)
+    out.hoff = flush_hints(out.hf, out.hbuf, out.hoff)?
+    out.hbuf.clear()
+    Ok(())
 }
 
 // One hint record: what the reader needs to place a value without reading it.
 fn hint_into(buf: &mut Vec<u8>, key: String, vlen: i64, crc: i64, off: i64) {
-    buf.extend(binary::put_u16_le(#[], key.byte_len()))
-    buf.extend(binary::put_u32_le(#[], vlen))
-    buf.extend(binary::put_u32_le(#[], crc))
-    buf.extend(binary::put_u64_le(#[], off))
+    log::push_le(buf, key.byte_len(), 2)
+    log::push_le(buf, vlen, 4)
+    log::push_le(buf, crc, 4)
+    log::push_le(buf, off, 8)
     buf.extend(key.as_bytes())
 }
 
-// Closes the merged generation: the commit record a rebuild reads up to, both
-// files made durable, and the hint moved into place.
+// Closes the merged generation: the commit record a rebuild reads up to, the
+// hint's trailer, both files made durable, and the hint moved into place.
 //
 // The hint file is what seals the generation, so it appears only once the data
 // it describes is durable; the fresh active file keeps that seal true.
-fn seal(mf: fs::File, hf: fs::File, hstage: String, hpath: String, end: i64, dir: String) -> Result<(), String> {
-    let commit = log::record("", log::KIND_COMMIT, #[], log::record_crc("", #[]))
-    match mf.write_at(commit, end) {
-        Ok(n) => {
-            if n != commit.len() { return Err("compact: short commit write") }
-        }
-        Err(e) => return Err("compact: commit: " + e.message())
-    }
-    if let Err(e) = mf.sync_all() { return Err("compact: sync: " + e.message()) }
-    if let Err(e) = hf.sync_all() { return Err("compact: hint sync: " + e.message()) }
+fn seal(out: &mut Out, hstage: String, hpath: String, dir: String) -> Result<(), String> {
+    log::record_into(&mut out.buf, "", log::KIND_COMMIT, #[], log::record_crc("", #[]))
+    flush_out(out)?
+    // The trailer closes the hint: its record count, then a checksum of every
+    // byte before the checksum itself.
+    out.hbuf.push(recover::HINT_END)
+    log::push_le(&mut out.hbuf, out.hcount, 8)
+    out.hcrc = crc32::update(out.hcrc, out.hbuf)
+    log::push_le(&mut out.hbuf, out.hcrc, 4)
+    out.hoff = flush_hints(out.hf, out.hbuf, out.hoff)?
+    out.hbuf.clear()
+    if let Err(e) = out.mf.sync_all() { return Err("compact: sync: " + e.message()) }
+    if let Err(e) = out.hf.sync_all() { return Err("compact: hint sync: " + e.message()) }
     if let Err(e) = fs::rename(hstage, hpath) { return Err("compact: hint: " + e.message()) }
     // The hint is what seals the generation, so the entry naming it is made
     // durable here rather than left to whatever writes the directory next.
     log::sync_dir(dir)
-
 }
 
 // Opens the generation writes go to after the merge. The readers go with the
@@ -556,5 +690,138 @@ mod tests {
         assert_eq(st.gen, 1, "a store this small is left alone")
         assert(super::dead_ratio(&mut st) > 0.9)
         assert_eq(st.len(), 1)
+    }
+
+    // A table written back to front, with a few keys beside it, so the merge
+    // has both kinds of index entry to move and a layout to put right.
+    fn backwards(dir: String) -> kv::Store {
+        let mut st = opened(dir)
+        let tid = kv::rows::open_table(&mut st, "t")
+        let mut rid: i64 = 60
+        while rid >= 1 {
+            assert(kv::rows::write(&mut st, tid, rid, ("row-" + rid.to_string()).as_bytes()).is_ok())
+            rid -= 1
+        }
+        assert(st.put("schema/t", #[1u8, 2]).is_ok())
+        assert(st.put("other", #[3u8]).is_ok())
+        assert_eq(kv::rows::remove(&mut st, tid, 7).unwrap_or(false), true)
+        st
+    }
+
+    // The dense index of table `t` and the hash index, as words and keys, for
+    // comparing what two opens built.
+    fn index_of(st: &mut kv::Store) -> (Vec<i64>, Vec<String>) {
+        let tid = kv::rows::table_id(st, "t")
+        let mut keys: Vec<String> = #[]
+        for k in st.index.keys() {
+            let e = st.index.get(k).unwrap_or(kv::Entry { file: 0, offset: 0, vlen: 0, crc: 0 })
+            keys.push(k + "@" + e.file.to_string() + ":" + e.offset.to_string() + ":" + e.vlen.to_string() + ":" + e.crc.to_string())
+        }
+        keys.sort()
+        (st.tables[tid].slots, keys)
+    }
+
+    #[test]
+    fn a_merge_lays_each_table_out_in_row_id_order() {
+        let dir = fresh("compact_row_order")
+        let mut st = backwards(dir)
+        assert(super::run(&mut st).is_ok())
+        let tid = kv::rows::table_id(&mut st, "t")
+        let mut last: i64 = -1
+        for rid in 1..61 {
+            if rid == 7 { continue }
+            let at = kv::log::loc_offset(st.tables[tid].slots[3 * rid])
+            assert(at > last, "row " + rid.to_string() + " follows the row before it")
+            last = at
+            assert_eq(kv::rows::read(&mut st, tid, rid), kv::Read::Value(("row-" + rid.to_string()).as_bytes()))
+        }
+        assert(matches(kv::rows::read(&mut st, tid, 7), kv::Read::Absent))
+        assert_eq(st.len(), 61)
+    }
+
+    #[test]
+    fn a_merge_refuses_a_record_whose_header_was_damaged() {
+        let dir = fresh("compact_bad_header")
+        let mut st = opened(dir)
+        let tid = kv::rows::open_table(&mut st, "t")
+        assert(kv::rows::write(&mut st, tid, 1, #[1u8, 2, 3]).is_ok())
+        assert(kv::rows::write(&mut st, tid, 2, #[4u8, 5, 6]).is_ok())
+        let path = kv::log::data_path(dir, st.gen)
+        let mut bytes = fs::read(path).unwrap_or(#[])
+        // The first record's key starts right after its header; its value, and
+        // so the checksum a read makes, is left alone.
+        bytes[kv::log::HEADER_LEN] = bytes[kv::log::HEADER_LEN] + 1u8
+        assert(fs::write(path, bytes).is_ok())
+        match super::run(&mut st) {
+            Ok(()) => assert(false, "a damaged record is not copied into the merge")
+            Err(e) => assert(e.contains("header"), "got: " + e)
+        }
+        assert_eq(kv::rows::read(&mut st, tid, 2), kv::Read::Value(#[4u8, 5, 6]), "the store is as it was")
+    }
+
+    #[test]
+    fn a_hint_builds_the_index_the_data_file_builds() {
+        let dir = fresh("hint_matches_data")
+        let mut st = backwards(dir)
+        assert(super::run(&mut st).is_ok())
+        let merged = st.gen - 1
+        let mut from_hint = opened(dir)
+        let want = index_of(&mut from_hint)
+        let hint = kv::log::hint_path(dir, merged)
+        let saved = fs::read(hint).unwrap_or(#[])
+        assert(saved.len() > 0)
+        assert(fs::remove_file(hint).is_ok())
+        let mut from_data = opened(dir)
+        assert_eq(index_of(&mut from_data), want, "the data file agrees with its hint")
+        assert(fs::write(hint, saved).is_ok())
+    }
+
+    #[test]
+    fn a_hint_that_is_not_whole_is_answered_by_the_data_file() {
+        let dir = fresh("hint_damaged")
+        let mut st = backwards(dir)
+        assert(super::run(&mut st).is_ok())
+        let merged = st.gen - 1
+        let hint = kv::log::hint_path(dir, merged)
+        let good = fs::read(hint).unwrap_or(#[])
+        let mut reference = opened(dir)
+        let want = index_of(&mut reference)
+        let mut truncated = good.slice(0, good.len() - 9).unwrap_or(#[])
+        let mut flipped = good
+        flipped[good.len() / 2] = flipped[good.len() / 2] + 1u8
+        let mut unmarked = good
+        unmarked[0] = 88u8
+        for (name, bytes) in #[("truncated", truncated), ("flipped", flipped), ("unmarked", unmarked)] {
+            assert(fs::write(hint, bytes).is_ok())
+            let mut after = opened(dir)
+            assert_eq(index_of(&mut after), want, name)
+            assert_eq(after.len(), 61, name)
+        }
+    }
+
+    #[test]
+    fn a_hint_in_the_older_flat_form_still_opens() {
+        let dir = fresh("hint_flat")
+        let mut st = backwards(dir)
+        assert(super::run(&mut st).is_ok())
+        let merged = st.gen - 1
+        let want = index_of(&mut st)
+        // What 0.2.0 wrote: one flat record per key, and nothing around them.
+        let mut flat: Vec<u8> = #[]
+        for k in kv::scan::keys(&mut st, "") {
+            let tid, rid = kv::rows::locate_row(&mut st, k)
+            if tid >= 0 {
+                let s = 3 * rid
+                super::hint_into(&mut flat, k, kv::log::loc_vlen(st.tables[tid].slots[s])
+                    kv::log::gc_crc(st.tables[tid].slots[s + 1]), kv::log::loc_offset(st.tables[tid].slots[s]))
+            } else {
+                let e = st.index.get(k).unwrap_or(kv::Entry { file: 0, offset: 0, vlen: 0, crc: 0 })
+                super::hint_into(&mut flat, k, e.vlen, e.crc, e.offset)
+            }
+        }
+        assert(fs::write(kv::log::hint_path(dir, merged), flat).is_ok())
+        let mut after = opened(dir)
+        assert_eq(index_of(&mut after), want)
+        assert_eq(after.faults, #[])
     }
 }
