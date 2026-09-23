@@ -1,6 +1,6 @@
 # Tern DB
 
-[![CI](https://github.com/danpozmanter/terndb/actions/workflows/ci.yml/badge.svg)](https://github.com/danpozmanter/terndb/actions/workflows/ci.yml)
+[![CI](https://github.com/gossamer-lang/terndb/actions/workflows/ci.yml/badge.svg)](https://github.com/gossamer-lang/terndb/actions/workflows/ci.yml)
 
 A small database that lives inside your program. You talk to it with simple
 SQL, and it saves everything to a folder on disk. There is no separate server
