@@ -29,7 +29,7 @@ pub struct Plans {
 /// table, so a keyed read costs a lookup and a render and nothing else.
 pub struct KvTable {
     pub tid: i64
-    pub keys: Vec<String>
+    pub keys: codec::json::RenderPlan
 }
 
 /// An INSERT parsed once: the table it names and the rows it writes, with a
@@ -100,7 +100,7 @@ impl Plans {
             None => {
                 let def = engine::get_def(eng, table)?
                 let tid = kv::rows::open_table(&mut eng.store, table)
-                self.kv_tables.push(KvTable { tid: tid, keys: codec::json::keys(def.cols) })
+                self.kv_tables.push(KvTable { tid: tid, keys: codec::json::render_plan(def.cols) })
                 let k = self.kv_tables.len() - 1
                 self.by_kv.insert(table, k)
                 k

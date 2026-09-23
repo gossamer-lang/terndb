@@ -37,7 +37,7 @@ pub struct Prepared {
     identity: bool
     /// `,"<column>":` per projected column, built here so a render appends one
     /// piece per column rather than three.
-    json_keys: Vec<String>
+    json_plan: codec::json::RenderPlan
     order_idx: i64
     order_asc: bool
     limit: i64
@@ -91,7 +91,7 @@ pub fn prepare(eng: &mut engine::Engine, src: String) -> Result<Prepared, String
                 src: src, arity: arity, point_read: point_read, prefix: engine::row_prefix(q.table)
                 tid: tid, def: def, filter: filter
                 count_only: q.count_only, picks: picks, identity: identity
-                json_keys: codec::json::keys(out_cols), out_cols: out_cols
+                json_plan: codec::json::render_plan(out_cols), out_cols: out_cols
                 order_idx: order_idx, order_asc: q.order_asc
                 limit: q.limit, offset: q.offset
             })
@@ -136,17 +136,32 @@ impl Prepared {
     /// Renders row `id` as a JSON object in the statement's projection order, or
     /// the empty string when the row is not there.
     ///
+    /// A rendered row always begins with `{`, so an empty answer names the absent
+    /// row and nothing else. [`Self::read_json_into`] is the same read into a
+    /// buffer the caller keeps.
+    pub fn read_json(&mut self, eng: &mut engine::Engine, id: i64) -> Result<String, String> {
+        let mut out = String::with_capacity(16 + self.json_plan.keys.len() * 32)
+        let _ = self.read_json_into(eng, id, &mut out)?
+        Ok(out)
+    }
+
+    /// Appends row `id` as a JSON object in the statement's projection order to
+    /// `out`, answering whether the row is there; `out` is left as it was when it
+    /// is not.
+    ///
+    /// A caller answering many rows keeps one `out` and clears it between them, so
+    /// a read allocates nothing once the buffer has grown to a row's size.
+    ///
     /// A projection of the whole row in table order - which is what a keyed read
     /// usually is - is rendered straight from the bytes the read produced: no
     /// `Value` is built and no column is turned into a string of its own. A
     /// projection naming its columns in some other order reaches them through the
-    /// decoded row, and renders each the same way. A rendered row always begins
-    /// with `{`, so an empty answer names the absent row and nothing else.
-    pub fn read_json(&mut self, eng: &mut engine::Engine, id: i64) -> Result<String, String> {
+    /// decoded row, and renders each the same way.
+    pub fn read_json_into(&mut self, eng: &mut engine::Engine, id: i64, out: &mut String) -> Result<bool, String> {
         if !self.point_read {
             return Err("read_row_json takes a statement that names one row by its id: " + self.src)
         }
-        if id < 1 { return Ok("") }
+        if id < 1 { return Ok(false) }
         // A row in a generation the store holds is rendered where it lies: no
         // positional read, and no copy of the value out of the buffer first. The
         // buffer is handed to the renderer straight off the store, because binding
@@ -154,36 +169,32 @@ impl Prepared {
         if self.identity {
             let start, end = kv::rows::span(&mut eng.store, self.tid, id)
             if end > start {
-                let body = codec::json::render_window(
-                    eng.store.resident_bytes, start, end, self.json_keys, id)
-                if body.len() == 0 {
+                if !codec::json::render_window_into(out, eng.store.resident_bytes, start, end, self.json_plan, id) {
                     return Err("row " + id.to_string() + " of " + self.def.name + " is malformed")
                 }
-                return Ok(body)
+                return Ok(true)
             }
         }
         let bytes = match kv::rows::read(&mut eng.store, self.tid, id) {
             kv::Read::Value(b) => b
-            kv::Read::Absent => return Ok("")
+            kv::Read::Absent => return Ok(false)
             kv::Read::Fault(e) => return Err(e)
         }
         if self.identity {
-            let body = codec::json::render_window(bytes, 0, bytes.len(), self.json_keys, id)
-            if body.len() == 0 {
+            if !codec::json::render_window_into(out, bytes, 0, bytes.len(), self.json_plan, id) {
                 return Err("row " + id.to_string() + " of " + self.def.name + " is malformed")
             }
-            return Ok(body)
+            return Ok(true)
         }
         let vals = codec::decode_row(bytes, self.def.cols.len())?
-        let mut out = String::with_capacity(16 + self.picks.len() * 24)
         out.push_str("{\"id\":")
         out.push_str(id.to_string())
         for k in 0..self.picks.len() {
-            out.push_str(self.json_keys[k])
+            out.push_str(self.json_plan.keys[k])
             out.push_str(codec::json::value(vals[self.picks[k]]))
         }
         out.push_str("}")
-        Ok(out)
+        Ok(true)
     }
 
     /// The encoded bytes of row `id`, for a caller that renders them itself.
@@ -484,5 +495,22 @@ mod tests {
         assert_eq(picked.read_json(&mut eng, 2).unwrap_or("")
             "{\"id\":2,\"active\":false,\"name\":\"c\"}")
         assert_eq(whole.read_json(&mut eng, 99).unwrap_or("x"), "", "a row that is not there answers nothing")
+    }
+
+    #[test]
+    fn rows_render_into_a_buffer_the_caller_keeps() {
+        let mut eng = opened(fresh("row_json_into"))
+        assert_eq(run(&mut eng, "CREATE TABLE users (name TEXT, email TEXT, score FLOAT, active BOOL)"), 0)
+        assert_eq(run(&mut eng, "INSERT INTO users VALUES ('a', 'a@b', 1.5, true), ('c', 'c@d', 2.5, false)"), 2)
+        let mut whole = super::prepare(&mut eng, "SELECT name, email, score, active FROM users WHERE rowid = ?").unwrap_or_else(|e| panic(e))
+        let mut out = String::with_capacity(64)
+        assert(whole.read_json_into(&mut eng, 1, &mut out).unwrap_or(false))
+        assert_eq(out, "{\"id\":1,\"name\":\"a\",\"email\":\"a@b\",\"score\":1.5,\"active\":true}")
+        out.clear()
+        assert(whole.read_json_into(&mut eng, 2, &mut out).unwrap_or(false))
+        assert_eq(out, "{\"id\":2,\"name\":\"c\",\"email\":\"c@d\",\"score\":2.5,\"active\":false}")
+        // A miss answers false and leaves what the buffer held.
+        assert(!whole.read_json_into(&mut eng, 99, &mut out).unwrap_or(true))
+        assert_eq(out, "{\"id\":2,\"name\":\"c\",\"email\":\"c@d\",\"score\":2.5,\"active\":false}")
     }
 }

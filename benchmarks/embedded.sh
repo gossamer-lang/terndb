@@ -47,13 +47,17 @@ say "building"
 ( cd embedded/gos && gos build --release ) >> logs/embedded-build.log 2>&1 || { echo "embedded/gos build failed"; exit 1; }
 ( cd servers/rust-sqlite && cargo build --release --bin embedded ) >> logs/embedded-build.log 2>&1 || { echo "servers/rust-sqlite embedded build failed"; exit 1; }
 ( cd servers/rust-redb && cargo build --release --bins ) >> logs/embedded-build.log 2>&1 || { echo "servers/rust-redb embedded build failed"; exit 1; }
+( cd servers/cpp-rocksdb && cmake -S . -B target -DCMAKE_BUILD_TYPE=Release && cmake --build target -j "$(nproc)" ) >> logs/embedded-build.log 2>&1 || { echo "servers/cpp-rocksdb embedded build failed"; exit 1; }
+( cd servers/c-lmdb && cmake -S . -B target -DCMAKE_BUILD_TYPE=Release && cmake --build target -j "$(nproc)" ) >> logs/embedded-build.log 2>&1 || { echo "servers/c-lmdb embedded build failed"; exit 1; }
 ( cd servers/go-sqlite && go build -o "$BIN/go-embedded" ./cmd/embedded ) >> logs/embedded-build.log 2>&1 || { echo "servers/go-sqlite embedded build failed"; exit 1; }
+( cd servers/go-pogreb && go build -o "$BIN/go-pogreb-embedded" ./cmd/embedded ) >> logs/embedded-build.log 2>&1 || { echo "servers/go-pogreb embedded build failed"; exit 1; }
+( cd servers/go-bbolt && go build -o "$BIN/go-bbolt-embedded" ./cmd/embedded ) >> logs/embedded-build.log 2>&1 || { echo "servers/go-bbolt embedded build failed"; exit 1; }
 
 # ----------------------------------------------------------------- data ----
 # One benchmark seeds the stores and this one reads them, so there is a single
 # definition of what the dataset is: `run.sh` writes it, both measure it, and
 # neither can drift from the other's idea of the rows.
-for store in bench.sqlite bench.redb bench.terndb; do
+for store in bench.sqlite bench.redb bench.terndb bench.rocksdb bench.lmdb bench.pogreb bench.bbolt; do
   [ -e "$DATA/$store" ] && continue
   echo "$DATA/$store is missing - run ./run.sh first, which seeds the dataset both benchmarks read"
   exit 1
@@ -103,6 +107,14 @@ wanted rust-sqlite-embedded-sql && measure rust-sqlite-embedded-sql \
     servers/rust-sqlite/target/release/embedded "$DATA/bench.sqlite" "$ROWS" "$SECONDS_PER"
 wanted rust-redb-embedded-kv && measure rust-redb-embedded-kv \
     servers/rust-redb/target/release/embedded "$DATA/bench.redb" "$ROWS" "$SECONDS_PER"
+wanted cpp-rocksdb-embedded-kv && measure cpp-rocksdb-embedded-kv \
+    servers/cpp-rocksdb/target/embedded "$DATA/bench.rocksdb" "$ROWS" "$SECONDS_PER"
+wanted c-lmdb-embedded-kv && measure c-lmdb-embedded-kv \
+    servers/c-lmdb/target/embedded "$DATA/bench.lmdb" "$ROWS" "$SECONDS_PER"
+wanted go-pogreb-embedded-kv && measure go-pogreb-embedded-kv \
+    "$BIN/go-pogreb-embedded" "$DATA/bench.pogreb" "$ROWS" "$SECONDS_PER"
+wanted go-bbolt-embedded-kv && measure go-bbolt-embedded-kv \
+    "$BIN/go-bbolt-embedded" "$DATA/bench.bbolt" "$ROWS" "$SECONDS_PER"
 # Runs after the plain redb target because it seeds a second table into the same
 # file: the plain one is then measured against the store it was seeded with.
 wanted rust-redb-embedded-kv-typed && measure rust-redb-embedded-kv-typed \

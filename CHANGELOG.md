@@ -3,6 +3,8 @@
 ## 0.3.0
 
 - Requires Gossamer 0.63.1.
+- `plan.read_json_into(&mut db, id, &mut out)` renders a keyed row onto a `String` the caller keeps and answers whether the row is there, so a loop answering many rows reuses one buffer; `codec::json::render_window_into` is the same for a row the caller located itself.
+- `codec::json::render_plan(names)` replaces `codec::json::keys(names)` and is what the render functions take: it resolves a table's column keys once and writes a `true`, `false`, or `null` column together with its key in one piece.
 - A text column renders through `String::push_json_quoted`, so a row's JSON escapes text exactly as `std::encoding::json` does: `0x08` and `0x0c` are written `\b` and `\f` rather than `\u0008` and `\u000c`, and `<`, `>`, `&`, U+2028, and U+2029 are written as `\u` escapes.
 - A statement's records reach the log in one write at commit: a 2,000-row `INSERT` makes one write where it made 2,003.
 - `ORDER BY rowid` is accepted, `ASC` or `DESC`, and costs no sort.

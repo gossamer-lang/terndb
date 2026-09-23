@@ -61,6 +61,10 @@ say "building"
 ( cd servers/rust-sqlite && cargo build --release ) >> logs/build.log 2>&1 || { echo "servers/rust-sqlite build failed"; exit 1; }
 ( cd servers/rust-redb   && cargo build --release ) >> logs/build.log 2>&1 || { echo "servers/rust-redb build failed"; exit 1; }
 ( cd servers/go-sqlite   && go build -o "$BIN/go-sqlite" . ) >> logs/build.log 2>&1 || { echo "servers/go-sqlite build failed"; exit 1; }
+( cd servers/go-pogreb   && go build -o "$BIN/go-pogreb" . && go build -o "$BIN/go-pogreb-seed" ./cmd/seed ) >> logs/build.log 2>&1 || { echo "servers/go-pogreb build failed"; exit 1; }
+( cd servers/go-bbolt    && go build -o "$BIN/go-bbolt" . && go build -o "$BIN/go-bbolt-seed" ./cmd/seed ) >> logs/build.log 2>&1 || { echo "servers/go-bbolt build failed"; exit 1; }
+( cd servers/cpp-rocksdb && cmake -S . -B target -DCMAKE_BUILD_TYPE=Release && cmake --build target -j "$(nproc)" ) >> logs/build.log 2>&1 || { echo "servers/cpp-rocksdb build failed"; exit 1; }
+( cd servers/c-lmdb && cmake -S . -B target -DCMAKE_BUILD_TYPE=Release && cmake --build target -j "$(nproc)" ) >> logs/build.log 2>&1 || { echo "servers/c-lmdb build failed"; exit 1; }
 ( cd loadgen && go build -o "$BIN/loadgen" . ) >> logs/build.log 2>&1 || { echo "loadgen build failed"; exit 1; }
 
 # ----------------------------------------------------------------- seed ----
@@ -68,6 +72,10 @@ say "seeding $ROWS rows"
 uv run seed/seed_sqlite.py "$DATA/bench.sqlite" "$ROWS" || exit 1
 uv run seed/seed_terndb.py "$TERNDB" "$DATA/bench.terndb" "$ROWS" || exit 1
 servers/rust-redb/target/release/seed "$DATA/bench.redb" "$ROWS" || exit 1
+servers/cpp-rocksdb/target/seed "$DATA/bench.rocksdb" "$ROWS" || exit 1
+servers/c-lmdb/target/seed "$DATA/bench.lmdb" "$ROWS" || exit 1
+"$BIN/go-pogreb-seed" "$DATA/bench.pogreb" "$ROWS" || exit 1
+"$BIN/go-bbolt-seed" "$DATA/bench.bbolt" "$ROWS" || exit 1
 
 # ------------------------------------------------------------ harness ------
 PID=""
@@ -265,6 +273,26 @@ fi
 if wanted rust-redb-embedded-kv; then
   ( ADDR=127.0.0.1:8082 DB_PATH="$DATA/bench.redb" servers/rust-redb/target/release/rust-redb ) > logs/rust-redb-embedded-kv.log 2>&1 & PID=$!
   measure rust-redb-embedded-kv 8082
+fi
+
+if wanted c-lmdb-embedded-kv; then
+  ( ADDR=127.0.0.1:8091 DB_PATH="$DATA/bench.lmdb" servers/c-lmdb/target/server ) > logs/c-lmdb-embedded-kv.log 2>&1 & PID=$!
+  measure c-lmdb-embedded-kv 8091
+fi
+
+if wanted cpp-rocksdb-embedded-kv; then
+  ( ADDR=127.0.0.1:8090 DB_PATH="$DATA/bench.rocksdb" servers/cpp-rocksdb/target/server ) > logs/cpp-rocksdb-embedded-kv.log 2>&1 & PID=$!
+  measure cpp-rocksdb-embedded-kv 8090
+fi
+
+if wanted go-pogreb-embedded-kv; then
+  ( ADDR=127.0.0.1:8092 DB_PATH="$DATA/bench.pogreb" "$BIN/go-pogreb" ) > logs/go-pogreb-embedded-kv.log 2>&1 & PID=$!
+  measure go-pogreb-embedded-kv 8092
+fi
+
+if wanted go-bbolt-embedded-kv; then
+  ( ADDR=127.0.0.1:8093 DB_PATH="$DATA/bench.bbolt" "$BIN/go-bbolt" ) > logs/go-bbolt-embedded-kv.log 2>&1 & PID=$!
+  measure go-bbolt-embedded-kv 8093
 fi
 
 if wanted go-sqlite-embedded-sql; then

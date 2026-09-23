@@ -39,6 +39,10 @@ WEB_EMBEDDED_DB = [
     "gos-terndb-embedded-sql",
     "gos-terndb-embedded-kv",
     "rust-redb-embedded-kv",
+    "c-lmdb-embedded-kv",
+    "cpp-rocksdb-embedded-kv",
+    "go-pogreb-embedded-kv",
+    "go-bbolt-embedded-kv",
     "rust-sqlite-embedded-sql",
     "go-sqlite-embedded-sql",
     "python-sqlite-embedded-sql",
@@ -53,6 +57,10 @@ QUERY_ONLY = [
     "go-sqlite-embedded-sql",
     "rust-redb-embedded-kv",
     "rust-redb-embedded-kv-typed",
+    "go-pogreb-embedded-kv",
+    "go-bbolt-embedded-kv",
+    "cpp-rocksdb-embedded-kv",
+    "c-lmdb-embedded-kv",
 ]
 
 WEB_EMBEDDED_DB_TITLE = "Web server, embedded DB: the store in the web server's own process"
@@ -74,8 +82,8 @@ QUERY_ONLY_CHARTS = [
 ]
 
 # How each part of an id is spelled once it is read by a person.
-LANGUAGES = {"gos": "Gos", "rust": "Rust", "go": "Go", "python": "Python"}
-TOOLS = {"terndb": "terndb", "redb": "redb", "sqlite": "SQLite"}
+LANGUAGES = {"gos": "Gos", "rust": "Rust", "go": "Go", "python": "Python", "cpp": "C++", "c": "C"}
+TOOLS = {"terndb": "terndb", "redb": "redb", "sqlite": "SQLite", "rocksdb": "RocksDB", "lmdb": "LMDB", "pogreb": "pogreb", "bbolt": "bbolt"}
 DEPLOYMENTS = {"embedded": "Embedded"}
 QUERIES = {"kv": "KV", "sql": "SQL"}
 # A trailing part says a target is another target's read path under a different
@@ -132,10 +140,21 @@ PATH_COLOURS = {
     ("gos", "terndb", "kv"): "#eb6834",
     ("rust", "sqlite", "sql"): "#1baf7a",
     ("rust", "redb", "kv"): "#4a3aa7",
+    ("cpp", "rocksdb", "kv"): "#008300",
+    ("c", "lmdb", "kv"): "#e87ba4",
+    ("go", "pogreb", "kv"): "#e34948",
+    ("go", "bbolt", "kv"): "#e34948",
     ("go", "sqlite", "sql"): "#e34948",
     ("python", "sqlite", "sql"): "#eda100",
 }
 FALLBACK = "#999999"
+# The palette holds eight hues and there are more read paths than that. A path
+# past the eighth shares its language's hue under a texture of its own, set
+# apart from a variant's hatch, and every bar carries its own label.
+PATH_TEXTURES = {
+    ("go", "pogreb", "kv"): "..",
+    ("go", "bbolt", "kv"): "---",
+}
 
 
 def colour(target: str) -> str:
@@ -165,6 +184,9 @@ def bar_chart(runs, order, title, ylabel, key, fmt, path):
     for bar, r in zip(bars, picked):
         if hatched(r["target"]):
             bar.set_hatch("///")
+        p = parts(r["target"])
+        if p and (p[0], p[1], p[3]) in PATH_TEXTURES:
+            bar.set_hatch(PATH_TEXTURES[(p[0], p[1], p[3])])
     ax.set_title(title, fontsize=11, pad=12)
     ax.set_ylabel(ylabel, fontsize=9)
     ax.tick_params(axis="x", labelsize=8.5)

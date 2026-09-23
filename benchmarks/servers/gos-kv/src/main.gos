@@ -18,7 +18,7 @@ use std::http::router
 struct Users {
     store: kv::Store
     tid: i64
-    keys: Vec<String>
+    keys: codec::json::RenderPlan
 }
 
 fn main() {
@@ -40,7 +40,7 @@ fn serve_forever(addr: String, dir: String) -> Result<(), String> {
     let mut st = kv::open(dir, read_only: true)?
     let tid = kv::rows::open_table(&mut st, "users")
     let keys = st.len()
-    let mut users = Users { store: st, tid: tid, keys: codec::json::keys(#["name", "email", "score", "active"]) }
+    let mut users = Users { store: st, tid: tid, keys: codec::json::render_plan(#["name", "email", "score", "active"]) }
     println("bench-kv on {}, serving {} ({} keys)", addr, dir, keys)
     let routes = router::Router::new()
         .get("/health", |_req, _p| http::Response::text(200, "ok"))

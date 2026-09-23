@@ -16,11 +16,13 @@ Two benchmarks over one seeded dataset, so the numbers compare like with like.
   or `404` with `{"error":"not found"}`.
 - `GET /health` -> `200 ok`, used to wait for readiness.
 - The dataset is `N` rows with ids `1..N`, seeded identically everywhere. There
-  is one store per engine - `bench.sqlite`, `bench.terndb`, `bench.redb` - and the
+  is one store per engine - `bench.sqlite`, `bench.terndb`, `bench.redb`,
+  `bench.rocksdb`, `bench.lmdb`, `bench.pogreb`,
+  `bench.bbolt` - and the
   terndb servers all read the same `bench.terndb`, whether they reach a row through
   a `SELECT` or through a keyed get.
 - The lookup is by primary key in every stack: `rowid` for terndb, the
-  `INTEGER PRIMARY KEY` for SQLite, the key for redb. No server does a scan, so
+  `INTEGER PRIMARY KEY` for SQLite, the key for redb, RocksDB, LMDB, pogreb, and bbolt. No server does a scan, so
   the benchmark measures the read path rather than the absence of an index.
 
 ## How a target is named
@@ -36,8 +38,8 @@ rust-redb-embedded-kv-typed      Rust redb (typed) Embedded: KV
 gos-terndb-embedded-sql-gos-run  Gos terndb (gos run) Embedded: SQL
 ```
 
-- **language** - `gos`, `rust`, `go`, `python`.
-- **tool** - the store: `terndb`, `sqlite`, `redb`.
+- **language** - `gos`, `rust`, `go`, `python`, `cpp`, `c`.
+- **tool** - the store: `terndb`, `sqlite`, `redb`, `rocksdb`, `lmdb`, `pogreb`, `bbolt`.
 - **deployment** - `embedded`, the store in the caller's own process, which is
   the only one terndb has.
 - **query** - `kv`, a row reached by its identity, or `sql`, a row reached
@@ -55,7 +57,9 @@ one thing in a run and another on a chart.
 
 One deployment, and every stack that can serve it. The store runs in the web
 server's own process (`web-embedded-db-*`): `gos-terndb-embedded-sql`,
-`gos-terndb-embedded-kv`, `rust-redb-embedded-kv`, `rust-sqlite-embedded-sql`,
+`gos-terndb-embedded-kv`, `rust-redb-embedded-kv`, `c-lmdb-embedded-kv`,
+`cpp-rocksdb-embedded-kv`, `go-pogreb-embedded-kv`, `go-bbolt-embedded-kv`,
+`rust-sqlite-embedded-sql`,
 `go-sqlite-embedded-sql`, `python-sqlite-embedded-sql`, and the two terndb
 servers again under `gos run` (`gos-terndb-embedded-sql-gos-run`,
 `gos-terndb-embedded-kv-gos-run`).
@@ -66,10 +70,34 @@ and both decode and render it per request. What the `kv` target leaves off is
 the statement layer - no parse, no plan, no prepared-statement lookup - so the
 gap between the two is that layer and nothing else.
 
-redb is asked for the shape a key-value store is normally given: the row's
-finished JSON under its id, returned as it is. It therefore does no row decode,
-which is worth holding in mind next to `gos-terndb-embedded-kv` - the comparison
-is of two key-value read paths, not of two identical amounts of work.
+redb, RocksDB, LMDB, pogreb, and bbolt are asked for the shape a key-value
+store is normally given:
+the row's finished JSON under its id, returned as it is. They therefore do no
+row decode, which is worth holding in mind next to `gos-terndb-embedded-kv` - the
+comparison is of key-value read paths, not of identical amounts of work.
+
+RocksDB is the C++ LSM store, reached from C++ with its default options: the
+row's JSON under its id as an 8-byte big-endian key, one `Get` per request, the
+store opened read-only as the terndb servers open theirs. The HTTP server is
+cpp-httplib with one worker per hardware thread. Both are fetched at pinned tags
+and built by CMake with the rest of the target, so a run needs a C++20 compiler
+and CMake and nothing installed system-wide; the first build compiles RocksDB
+itself and takes several minutes.
+
+LMDB is the C memory-mapped B+tree store, reached from C: the row's JSON under
+the same 8-byte big-endian key, a read transaction per request as redb takes a
+snapshot per request, the environment opened read-only. The HTTP server is
+CivetWeb with one worker per hardware thread. LMDB and CivetWeb are fetched at
+pinned tags and compiled by CMake with the target.
+
+pogreb is a Go store with a hash index over an append-only log, reached from Go
+through `net/http`: the row's JSON under the same 8-byte big-endian key, one
+`Get` per request, which hands back a copy of the value.
+
+bbolt is etcd's B+tree store for Go, reached from Go through `net/http`: the
+row's JSON under the same key in a `users` bucket, a read transaction per request
+as redb takes a snapshot per request, the value copied out before the
+transaction ends, and the file opened read-only.
 
 ## What is compared with no HTTP (`query-only-*`)
 
@@ -80,7 +108,7 @@ than defining a second one that could drift from it. There is no socket, no
 web framework and no load generator in the loop, so the number is the read path
 and the JSON rendering and nothing else.
 
-Six targets, each rendering the same 90-byte row, and each reporting its
+Ten targets, each rendering the same 90-byte row, and each reporting its
 queries per second and its peak resident memory:
 
 - `gos-terndb-embedded-sql` - a prepared `SELECT ... WHERE rowid = ?`.
@@ -95,6 +123,14 @@ queries per second and its peak resident memory:
 - `rust-redb-embedded-kv-typed` - the same store asked the question the SQL
   stores are asked: four typed columns in a second table, decoded and rendered
   per query.
+- `cpp-rocksdb-embedded-kv` - one `Get` per query into an owned `std::string`,
+  which is what its HTTP server does per request.
+- `c-lmdb-embedded-kv` - a read transaction per query, with the row copied out
+  of the map into a buffer of its own, as the others hand back an owned string.
+- `go-pogreb-embedded-kv` - one `Get` per query, whose answer is a copy of the
+  stored value.
+- `go-bbolt-embedded-kv` - a read transaction per query, with the value copied
+  out of it into a slice of its own.
 
 The typed target seeds its table into the same file, and runs after
 `rust-redb-embedded-kv` so the plain target is measured against the store it was
@@ -164,7 +200,9 @@ measurement sits beneath them:
   store it is linked against.
 
 A chart keeps one colour per read path across every image, and a variant is that
-path's colour under a hatch.
+path's colour under a hatch. The palette holds eight hues, so the Go stores past
+the first share Go's hue under a texture of their own: dots for pogreb, lines for
+bbolt.
 
 ## Which number to read
 

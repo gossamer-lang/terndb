@@ -25,14 +25,18 @@ On 24 cores (Linux 7.0.0-31-generic).</p>
   <caption>Every HTTP target, sorted by response rate. The store runs in the
   web server's own process, so the memory is that one process.</caption>
   <tr><th>target</th><th>response rate, req/s</th><th>CPU, us/req</th><th>memory, peak MiB</th></tr>
-  <tr><td>Gos terndb Embedded: KV (gos-terndb-embedded-kv)</td><td>321,631</td><td>7.5</td><td>15.4</td></tr>
-<tr><td>Gos terndb Embedded: SQL (gos-terndb-embedded-sql)</td><td>313,118</td><td>7.7</td><td>14.5</td></tr>
-<tr><td>Rust redb Embedded: KV (rust-redb-embedded-kv)</td><td>286,376</td><td>7.4</td><td>17.9</td></tr>
-<tr><td>Rust SQLite Embedded: SQL (rust-sqlite-embedded-sql)</td><td>180,654</td><td>19.7</td><td>53.1</td></tr>
-<tr><td>Gos terndb (gos run) Embedded: KV (gos-terndb-embedded-kv-gos-run)</td><td>151,828</td><td>30.8</td><td>171.6</td></tr>
-<tr><td>Gos terndb (gos run) Embedded: SQL (gos-terndb-embedded-sql-gos-run)</td><td>144,970</td><td>32.9</td><td>172.9</td></tr>
-<tr><td>Go SQLite Embedded: SQL (go-sqlite-embedded-sql)</td><td>93,492</td><td>35.8</td><td>53.1</td></tr>
-<tr><td>Python SQLite Embedded: SQL (python-sqlite-embedded-sql)</td><td>12,699</td><td>102.8</td><td>164.4</td></tr>
+  <tr><td>C LMDB Embedded: KV (c-lmdb-embedded-kv)</td><td>504,673</td><td>6.7</td><td>8.4</td></tr>
+<tr><td>Gos terndb Embedded: KV (gos-terndb-embedded-kv)</td><td>498,626</td><td>7.1</td><td>15.3</td></tr>
+<tr><td>Gos terndb Embedded: SQL (gos-terndb-embedded-sql)</td><td>489,651</td><td>7.2</td><td>14.0</td></tr>
+<tr><td>C++ RocksDB Embedded: KV (cpp-rocksdb-embedded-kv)</td><td>426,081</td><td>8.6</td><td>18.5</td></tr>
+<tr><td>Rust redb Embedded: KV (rust-redb-embedded-kv)</td><td>414,695</td><td>6.4</td><td>17.7</td></tr>
+<tr><td>Rust SQLite Embedded: SQL (rust-sqlite-embedded-sql)</td><td>244,807</td><td>20.4</td><td>59.3</td></tr>
+<tr><td>Go pogreb Embedded: KV (go-pogreb-embedded-kv)</td><td>237,332</td><td>21.7</td><td>23.5</td></tr>
+<tr><td>Go bbolt Embedded: KV (go-bbolt-embedded-kv)</td><td>185,957</td><td>26.8</td><td>28.0</td></tr>
+<tr><td>Gos terndb (gos run) Embedded: KV (gos-terndb-embedded-kv-gos-run)</td><td>170,301</td><td>33.2</td><td>172.6</td></tr>
+<tr><td>Gos terndb (gos run) Embedded: SQL (gos-terndb-embedded-sql-gos-run)</td><td>163,063</td><td>34.3</td><td>174.6</td></tr>
+<tr><td>Go SQLite Embedded: SQL (go-sqlite-embedded-sql)</td><td>112,643</td><td>35.7</td><td>54.1</td></tr>
+<tr><td>Python SQLite Embedded: SQL (python-sqlite-embedded-sql)</td><td>10,461</td><td>130.4</td><td>163.9</td></tr>
 
 </table>
 <table>
@@ -42,11 +46,15 @@ On 24 cores (Linux 7.0.0-31-generic).</p>
   returns. The memory is the whole process, which is what the store costs to
   run.</caption>
   <tr><th>target</th><th>queries/s</th><th>memory, peak MiB</th></tr>
-  <tr><td>Gos terndb Embedded: KV (gos-terndb-embedded-kv)</td><td>9,567,232</td><td>14.1</td></tr>
-<tr><td>Gos terndb Embedded: SQL (gos-terndb-embedded-sql)</td><td>8,468,480</td><td>14.3</td></tr>
-<tr><td>Rust redb Embedded: KV (rust-redb-embedded-kv)</td><td>2,588,817</td><td>15.6</td></tr>
-<tr><td>Rust redb (typed) Embedded: KV (rust-redb-embedded-kv-typed)</td><td>1,947,658</td><td>11.9</td></tr>
-<tr><td>Rust SQLite Embedded: SQL (rust-sqlite-embedded-sql)</td><td>697,874</td><td>5.9</td></tr>
-<tr><td>Go SQLite Embedded: SQL (go-sqlite-embedded-sql)</td><td>103,935</td><td>18.0</td></tr>
+  <tr><td>Gos terndb Embedded: KV (gos-terndb-embedded-kv)</td><td>12,255,232</td><td>14.3</td></tr>
+<tr><td>Gos terndb Embedded: SQL (gos-terndb-embedded-sql)</td><td>12,037,530</td><td>14.3</td></tr>
+<tr><td>Go pogreb Embedded: KV (go-pogreb-embedded-kv)</td><td>8,650,432</td><td>20.3</td></tr>
+<tr><td>C LMDB Embedded: KV (c-lmdb-embedded-kv)</td><td>4,684,542</td><td>7.0</td></tr>
+<tr><td>Rust redb Embedded: KV (rust-redb-embedded-kv)</td><td>2,442,355</td><td>15.7</td></tr>
+<tr><td>Go bbolt Embedded: KV (go-bbolt-embedded-kv)</td><td>1,878,476</td><td>21.2</td></tr>
+<tr><td>Rust redb (typed) Embedded: KV (rust-redb-embedded-kv-typed)</td><td>1,858,325</td><td>11.3</td></tr>
+<tr><td>C++ RocksDB Embedded: KV (cpp-rocksdb-embedded-kv)</td><td>1,713,429</td><td>17.4</td></tr>
+<tr><td>Rust SQLite Embedded: SQL (rust-sqlite-embedded-sql)</td><td>661,307</td><td>5.8</td></tr>
+<tr><td>Go SQLite Embedded: SQL (go-sqlite-embedded-sql)</td><td>100,396</td><td>19.1</td></tr>
 
 </table>

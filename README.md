@@ -1,4 +1,4 @@
-# terndb 0.3.0
+# Tern DB
 
 [![CI](https://github.com/danpozmanter/terndb/actions/workflows/ci.yml/badge.svg)](https://github.com/danpozmanter/terndb/actions/workflows/ci.yml)
 
@@ -12,8 +12,6 @@ CREATE INDEX IF NOT EXISTS ON users (name)
 INSERT INTO users VALUES ('ada', 'ada@example.com', 1.5, true)
 SELECT name, score FROM users WHERE name = 'ada'
 ```
-
-Requires Gossamer 0.62.1 or later.
 
 ## Usage
 

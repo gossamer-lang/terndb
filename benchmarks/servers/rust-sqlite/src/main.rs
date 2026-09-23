@@ -61,8 +61,21 @@ async fn user(Path(id): Path<i64>) -> impl IntoResponse {
     }
 }
 
-#[tokio::main]
-async fn main() {
+fn main() {
+    // Each blocking thread opens a connection of its own, so the pool's size is
+    // the connection count: one per core, as go-sqlite sets it. Left at tokio's
+    // default the pool grows on demand to hundreds of threads, each with its
+    // own page cache.
+    let cores = std::thread::available_parallelism().map_or(8, std::num::NonZero::get);
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .max_blocking_threads(cores)
+        .enable_all()
+        .build()
+        .expect("runtime");
+    runtime.block_on(serve());
+}
+
+async fn serve() {
     let addr = std::env::var("ADDR").unwrap_or_else(|_| "127.0.0.1:8081".to_string());
     let app = Router::new()
         .route("/user/:id", get(user))

@@ -6,31 +6,45 @@ use crate::codec
 // the store handed back and writes each column into the answer as it goes,
 // which is the whole of what the key-value front end does above the store.
 
-/// The `,"<name>":` fragment each column is written under, built once so a
-/// render appends one piece per column rather than three.
+/// A row's JSON spelling resolved once from its column names.
+///
+/// `keys` holds the `,"<name>":` fragment each column is written under, and a
+/// column whose value is `true`, `false`, or `null` is written as one piece
+/// with its key, so a render appends one piece for it rather than two.
 ///
 /// A statement's columns are settled when it is planned, so this belongs
-/// wherever the plan does; [`render`] takes what it produces.
-pub fn keys(names: Vec<String>) -> Vec<String> {
-    let mut keys: Vec<String> = #[]
-    for name in names { keys.push(",\"" + name + "\":") }
-    keys
+/// wherever the plan does; [`render`] takes what [`render_plan`] produces.
+pub struct RenderPlan {
+    pub keys: Vec<String>
+    trues: Vec<String>
+    falses: Vec<String>
+    nulls: Vec<String>
+}
+
+/// The render plan for columns `names`, in the order a row encodes them.
+pub fn render_plan(names: Vec<String>) -> RenderPlan {
+    let mut plan = RenderPlan { keys: #[], trues: #[], falses: #[], nulls: #[] }
+    for name in names {
+        let key = ",\"" + name + "\":"
+        plan.trues.push(key + "true")
+        plan.falses.push(key + "false")
+        plan.nulls.push(key + "null")
+        plan.keys.push(key)
+    }
+    plan
 }
 
 /// Renders one row's encoded columns as `{"id":<id>,"<name>":<value>,...}`,
 /// or the empty string when the buffer does not hold them all.
 ///
-/// `keys` is what [`keys`] builds, one `,"<name>":` per column in the
-/// order the row encodes them.
+/// `plan` is what [`render_plan`] builds for the columns in the order the row
+/// encodes them.
 ///
 /// The row is read once, straight into the answer: no `codec::Value` is built and no
 /// column is turned into a string of its own on the way, which is the work a
-/// request answering a row as JSON does not otherwise need. The answer is built
-/// here and returned rather than appended to a caller's buffer, so the answer
-/// is one allocation sized for the row rather than a caller's buffer regrown
-/// per column.
-pub fn render(buf: Vec<u8>, keys: Vec<String>, id: i64) -> String {
-    render_window(buf, 0, buf.len(), keys, id)
+/// request answering a row as JSON does not otherwise need.
+pub fn render(buf: Vec<u8>, plan: RenderPlan, id: i64) -> String {
+    render_window(buf, 0, buf.len(), plan, id)
 }
 
 /// The same rendering over `buf[start..end]`, for a caller holding the row
@@ -39,9 +53,26 @@ pub fn render(buf: Vec<u8>, keys: Vec<String>, id: i64) -> String {
 /// A store that keeps a sealed file in memory reads a row by naming where it
 /// sits rather than by copying it out, so the render is the only pass over
 /// those bytes.
-pub fn render_window(buf: Vec<u8>, start: i64, end: i64, keys: Vec<String>, id: i64) -> String {
-    let cols = keys.len()
-    let mut out = String::with_capacity(16 + cols * 24 + (end - start))
+pub fn render_window(buf: Vec<u8>, start: i64, end: i64, plan: RenderPlan, id: i64) -> String {
+    let mut out = String::with_capacity(16 + plan.keys.len() * 24 + (end - start))
+    if render_window_into(&mut out, buf, start, end, plan, id) { out } else { "" }
+}
+
+/// Appends the rendering of `buf[start..end]` to `out`, answering whether the
+/// buffer held the whole row.
+///
+/// A caller answering many rows keeps one `out`, cleared between them, so a
+/// read allocates nothing once the buffer has grown to a row's size. A row
+/// the buffer does not hold leaves `out` as it was.
+pub fn render_window_into(out: &mut String, buf: Vec<u8>, start: i64, end: i64, plan: RenderPlan, id: i64) -> bool {
+    let mark = out.byte_len()
+    if render_columns(out, buf, start, end, plan, id) { return true }
+    out.truncate(mark)
+    false
+}
+
+fn render_columns(out: &mut String, buf: Vec<u8>, start: i64, end: i64, plan: RenderPlan, id: i64) -> bool {
+    let cols = plan.keys.len()
     out.push_str("{\"id\":")
     out.push_str(id.to_string())
     let n = end
@@ -50,70 +81,71 @@ pub fn render_window(buf: Vec<u8>, start: i64, end: i64, keys: Vec<String>, id: 
     // The row is read straight into the answer, one column at a time: no
     // `Value` is built, and the buffer is read where it lies.
     while c < cols {
-        if p >= n { return "" }
-        out.push_str(keys[c])
+        if p >= n { return false }
         let tag = buf[p]
         p += 1
+        // A column that renders as one of three words is written with its key
+        // in one piece; every other value follows its key.
+        if tag == codec::TAG_NIL {
+            out.push_str(plan.nulls[c])
+            c += 1
+            continue
+        }
+        if tag == codec::TAG_BOOL {
+            if p + 1 > n { return false }
+            if buf[p] != 0u8 { out.push_str(plan.trues[c]) } else { out.push_str(plan.falses[c]) }
+            p += 1
+            c += 1
+            continue
+        }
+        out.push_str(plan.keys[c])
         match tag {
-            codec::TAG_NIL => out.push_str("null")
-            codec::TAG_BOOL => {
-                if p + 1 > n { return "" }
-                out.push_str(if buf[p] != 0u8 { "true" } else { "false" })
-                p += 1
-            }
             codec::TAG_I8 => {
-                if p + 1 > n { return "" }
+                if p + 1 > n { return false }
                 out.push_str((buf[p] as i8 as i64).to_string())
                 p += 1
             }
             codec::TAG_I16 => {
-                if p + 2 > n { return "" }
+                if p + 2 > n { return false }
                 out.push_str(sign_extend((buf[p] as i64) | ((buf[p + 1] as i64) << 8), 2).to_string())
                 p += 2
             }
             codec::TAG_I32 => {
-                if p + 4 > n { return "" }
+                if p + 4 > n { return false }
                 out.push_str(sign_extend(u32_at(buf, p), 4).to_string())
                 p += 4
             }
             codec::TAG_I64 => {
-                if p + 8 > n { return "" }
+                if p + 8 > n { return false }
                 out.push_str(i64_at(buf, p).to_string())
                 p += 8
             }
             codec::TAG_DT => {
-                if p + 8 > n { return "" }
+                if p + 8 > n { return false }
                 out.push_str("\"")
                 out.push_str(datetime::render(i64_at(buf, p)))
                 out.push_str("\"")
                 p += 8
             }
             codec::TAG_F32 | codec::TAG_F64 => {
-                if p + 8 > n { return "" }
+                if p + 8 > n { return false }
                 out.push_str(f64::from_bits(i64_at(buf, p) as u64).to_string())
                 p += 8
             }
             codec::TAG_TEXT => {
-                if p + 4 > n { return "" }
+                if p + 4 > n { return false }
                 let body = p + 4
                 let stop = body + u32_at(buf, p)
-                if stop > n { return "" }
-                if !text_into(&mut out, buf, body, stop) { return "" }
+                if stop > n { return false }
+                if !out.push_json_quoted(buf, body, stop) { return false }
                 p = stop
             }
-            _ => return ""
+            _ => return false
         }
         c += 1
     }
     out.push_str("}")
-    out
-}
-
-// A text column's bytes as a JSON string, escaped as the language's own JSON
-// writer escapes one. False means the bytes are not the UTF-8 the column
-// claims.
-fn text_into(out: &mut String, buf: Vec<u8>, start: i64, end: i64) -> bool {
-    out.push_json_quoted(buf, start, end)
+    true
 }
 
 // A raw fixed-width field read as the signed integer it stands for.
@@ -202,9 +234,23 @@ mod tests {
         codec::encode_into(&mut buf, codec::Value::float(1.5))
         codec::encode_into(&mut buf, codec::Value::bool(true))
         codec::encode_into(&mut buf, codec::Value::nil())
-        assert_eq(super::render(buf, super::keys(#["name", "email", "score", "active", "note"]), 7)
+        assert_eq(super::render(buf, super::render_plan(#["name", "email", "score", "active", "note"]), 7)
             "{\"id\":7,\"name\":\"user-1\",\"email\":\"u\\\"q\\\\b\",\"score\":1.5,\"active\":true,\"note\":null}")
-        assert_eq(super::render(buf.slice(0, 5).unwrap_or(#[]), super::keys(#["name"]), 1), "", "a truncated row is refused")
+        assert_eq(super::render(buf.slice(0, 5).unwrap_or(#[]), super::render_plan(#["name"]), 1), "", "a truncated row is refused")
+    }
+
+    #[test]
+    fn a_row_renders_onto_what_the_buffer_already_holds() {
+        let mut buf: Vec<u8> = #[]
+        codec::encode_into(&mut buf, codec::Value::text("x"))
+        codec::encode_into(&mut buf, codec::Value::int(3))
+        let keys = super::render_plan(#["a", "b"])
+        let mut out = "["
+        assert(super::render_window_into(&mut out, buf, 0, buf.len(), keys, 1))
+        assert_eq(out, "[{\"id\":1,\"a\":\"x\",\"b\":3}")
+        // A row the window does not hold whole leaves the buffer as it was.
+        assert(!super::render_window_into(&mut out, buf, 0, buf.len() - 1, keys, 2))
+        assert_eq(out, "[{\"id\":1,\"a\":\"x\",\"b\":3}")
     }
 
     #[test]
@@ -215,19 +261,19 @@ mod tests {
         let raw = "é\"🌍\\x\u{1}y\tz"
         let mut buf: Vec<u8> = #[]
         codec::encode_into(&mut buf, codec::Value::text(raw))
-        assert_eq(super::render(buf, super::keys(#["t"]), 3)
+        assert_eq(super::render(buf, super::render_plan(#["t"]), 3)
             "{\"id\":3,\"t\":\"é\\\"🌍\\\\x\\u0001y\\tz\"}")
         // A text column with nothing to escape, and an empty one.
         let mut plain: Vec<u8> = #[]
         codec::encode_into(&mut plain, codec::Value::text("héllo 🌍"))
         codec::encode_into(&mut plain, codec::Value::text(""))
-        assert_eq(super::render(plain, super::keys(#["a", "b"]), 1)
+        assert_eq(super::render(plain, super::render_plan(#["a", "b"]), 1)
             "{\"id\":1,\"a\":\"héllo 🌍\",\"b\":\"\"}")
         // A row whose text length runs past the buffer is refused rather than
         // rendered short.
         let mut cut: Vec<u8> = #[]
         codec::encode_into(&mut cut, codec::Value::text("abcdefgh"))
-        assert_eq(super::render(cut.slice(0, 8).unwrap_or(#[]), super::keys(#["a"]), 1), "")
+        assert_eq(super::render(cut.slice(0, 8).unwrap_or(#[]), super::render_plan(#["a"]), 1), "")
     }
 
     #[test]
@@ -238,7 +284,7 @@ mod tests {
         for v in vals { codec::encode_into(&mut buf, v) }
         let mut names: Vec<String> = #[]
         for i in 0..vals.len() { names.push("c" + i.to_string()) }
-        let out = super::render(buf, super::keys(names), 1)
+        let out = super::render(buf, super::render_plan(names), 1)
         // Every column renders what Display renders, quoted where
         // JSON asks for a string.
         let mut want = "{\"id\":1"
@@ -259,7 +305,7 @@ mod tests {
         for v in vals {
             let mut buf: Vec<u8> = #[]
             codec::encode_into(&mut buf, v)
-            assert_eq(super::render(buf, super::keys(#["n"]), 1), "{\"id\":1,\"n\":" + super::value(v) + "}")
+            assert_eq(super::render(buf, super::render_plan(#["n"]), 1), "{\"id\":1,\"n\":" + super::value(v) + "}")
         }
     }
 }

@@ -51,10 +51,24 @@ if plan.read_row(&mut db, 1, &mut vals)? {
 }
 ```
 
+`read_json_into` renders onto a `String` the caller keeps and answers whether the
+row is there, so a loop answering many rows allocates nothing once the buffer has
+grown to a row's size:
+
+```gossamer
+let mut body = String::with_capacity(256)
+for id in 1..1000 {
+    body.clear()
+    if plan.read_json_into(&mut db, id, &mut body)? {
+        println("{}", body)
+    }
+}
+```
+
 `plan.read_bytes(&mut db, id)` answers the encoded record for a caller that
-renders it itself, as a `kv::Read`. All three take a statement a single read can
-answer, and nothing else: `read_row` and `read_json` reject one that would need a
-walk rather than quietly turning into a scan.
+renders it itself, as a `kv::Read`. All of these take a statement a single read
+can answer, and nothing else: `read_row`, `read_json`, and `read_json_into` reject
+one that would need a walk rather than quietly turning into a scan.
 
 ### Straight at the store
 
