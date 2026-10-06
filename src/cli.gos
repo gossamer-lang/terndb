@@ -151,7 +151,7 @@ fn fail(err: Fn(String), msg: String) -> i64 {
 }
 
 fn usage(out: Fn(String)) -> i64 {
-    out("terndb 0.3.0 - a small structured key-value store with a light SQL front")
+    out("terndb 0.3.1 - a small structured key-value store with a light SQL front")
     out("")
     out("  terndb exec <dir> <sql>...   run statements and print the rows")
     out("                               CREATE TABLE / CREATE INDEX / DROP TABLE /")
@@ -212,7 +212,7 @@ mod tests {
             let what = "terndb " + args.join(" ")
             assert_eq(code, cli::EXIT_USAGE, what)
             assert_eq(err.len(), 0, what)
-            assert(out.len() > 0 && out[0].starts_with("terndb 0.3.0"), what)
+            assert(out.len() > 0 && out[0].starts_with("terndb 0.3.1"), what)
             for cmd in #["exec", "shell", "bench"] {
                 assert(out.join("\n").contains("terndb " + cmd), what + ": names " + cmd)
             }

@@ -29,8 +29,6 @@ const VLEN_BITS: i64 = 21
 
 const VLEN_MASK: i64 = 2_097_151
 
-const CRC_MASK: i64 = 4_294_967_295
-
 /// Path of a generation's data file.
 pub fn data_path(dir: String, gen: i64) -> String { dir + "/" + gen.to_string() + ".data" }
 
@@ -110,7 +108,7 @@ pub (package) fn key_from(bytes: Vec<u8>) -> Option<String> {
 
 pub (package) fn pack_loc(offset: i64, vlen: i64) -> i64 { (offset << VLEN_BITS) | vlen }
 
-pub (package) fn pack_gc(gen: i64, crc: i64) -> i64 { (gen << 32) | crc }
+pub (package) fn pack_gc(gen: i64, crc: u32) -> i64 { (gen << 32) | crc as i64 }
 
 pub (package) fn loc_offset(w: i64) -> i64 { w >> VLEN_BITS }
 
@@ -118,7 +116,7 @@ pub (package) fn loc_vlen(w: i64) -> i64 { w & VLEN_MASK }
 
 pub (package) fn gc_gen(w: i64) -> i64 { w >> 32 }
 
-pub (package) fn gc_crc(w: i64) -> i64 { w & CRC_MASK }
+pub (package) fn gc_crc(w: i64) -> u32 { w as u32 }
 
 // Decimal digits a positive rowid is written with, which is what its key costs
 // on top of the table's prefix.
@@ -136,11 +134,11 @@ pub (package) fn record_len(key: String, vlen: i64) -> i64 { HEADER_LEN + key.by
 
 // The checksum spans the key and then the value, accumulated across the two
 // rather than over a joined copy of them.
-pub (package) fn record_crc(key: String, val: Vec<u8>) -> i64 {
+pub (package) fn record_crc(key: String, val: Vec<u8>) -> u32 {
     crc32::update(crc32::checksum(key.as_bytes()), val)
 }
 
-pub (package) fn record(key: String, kind: u8, val: Vec<u8>, crc: i64) -> Vec<u8> {
+pub (package) fn record(key: String, kind: u8, val: Vec<u8>, crc: u32) -> Vec<u8> {
     let mut out: Vec<u8> = #[]
     record_into(&mut out, key, kind, val, crc)
     out
@@ -148,8 +146,8 @@ pub (package) fn record(key: String, kind: u8, val: Vec<u8>, crc: i64) -> Vec<u8
 
 // Appends one framed record to `buf`, the header written field by field in
 // place rather than assembled from pieces of its own.
-pub (package) fn record_into(buf: &mut Vec<u8>, key: String, kind: u8, val: Vec<u8>, crc: i64) {
-    push_le(buf, crc, 4)
+pub (package) fn record_into(buf: &mut Vec<u8>, key: String, kind: u8, val: Vec<u8>, crc: u32) {
+    push_le(buf, crc as i64, 4)
     buf.push(kind)
     push_le(buf, key.byte_len(), 2)
     push_le(buf, val.len(), 4)

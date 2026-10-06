@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.3.1
+
+- Requires Gossamer 0.67.0, whose `std::hash::crc32` answers a `u32`.
+- `kv::Entry::crc` is a `u32`, the width of the CRC-32 it carries.
+
 ## 0.3.0
 
 - Requires Gossamer 0.63.1.

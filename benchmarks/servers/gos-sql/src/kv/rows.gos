@@ -217,7 +217,7 @@ pub (package) fn remember(st: &mut kv::Store, key: String, e: kv::Entry) {
 
 /// Places row `rid` of table `tid`, whose key checksums to `kcrc`, without
 /// spelling or parsing its key: the caller already knows which row it is.
-pub (package) fn remember_row(st: &mut kv::Store, tid: i64, rid: i64, kcrc: i64, e: kv::Entry) {
+pub (package) fn remember_row(st: &mut kv::Store, tid: i64, rid: i64, kcrc: u32, e: kv::Entry) {
     if rid >= 1 && rid <= st.tables[tid].top + ROWID_SLACK {
         remember_dense(st, tid, rid, kcrc, e)
         return
@@ -226,7 +226,7 @@ pub (package) fn remember_row(st: &mut kv::Store, tid: i64, rid: i64, kcrc: i64,
 }
 
 // Holds row `rid` of `tid` in its dense slot.
-fn remember_dense(st: &mut kv::Store, tid: i64, rid: i64, kcrc: i64, e: kv::Entry) {
+fn remember_dense(st: &mut kv::Store, tid: i64, rid: i64, kcrc: u32, e: kv::Entry) {
     // A key the hash index answered before a dense slot could hold it moves
     // rather than being held in both. Only a store that ever hashed a row key
     // can hold one there, so the others skip the probe.
@@ -248,7 +248,7 @@ fn remember_dense(st: &mut kv::Store, tid: i64, rid: i64, kcrc: i64, e: kv::Entr
     }
     st.tables[tid].slots[s] = log::pack_loc(e.offset, e.vlen)
     st.tables[tid].slots[s + 1] = log::pack_gc(e.file, e.crc)
-    st.tables[tid].slots[s + 2] = kcrc
+    st.tables[tid].slots[s + 2] = kcrc as i64
     if rid > st.tables[tid].top { st.tables[tid].top = rid }
     st.live_bytes += e.vlen
 }
@@ -315,7 +315,7 @@ pub fn read(st: &mut kv::Store, tid: i64, rid: i64) -> kv::Read {
     let vlen = log::loc_vlen(loc)
     let prefix = st.tables[tid].prefix
     let at = log::loc_offset(loc) + log::HEADER_LEN + prefix.byte_len() + log::digits_len(rid)
-    let kcrc = st.tables[tid].slots[s + 2]
+    let kcrc = st.tables[tid].slots[s + 2] as u32
     let gen = log::gc_gen(gc)
     if gen == st.gen {
         if let Some(f) = st.data { return read_row_value(f, at, vlen, kcrc, log::gc_crc(gc), prefix, rid) }
@@ -333,7 +333,7 @@ pub fn read(st: &mut kv::Store, tid: i64, rid: i64) -> kv::Read {
 //
 // The row's name is carried in rather than built, so it costs a message only
 // where there is a fault to report.
-fn read_row_value(f: fs::File, at: i64, vlen: i64, kcrc: i64, crc: i64, prefix: String, rid: i64) -> kv::Read {
+fn read_row_value(f: fs::File, at: i64, vlen: i64, kcrc: u32, crc: u32, prefix: String, rid: i64) -> kv::Read {
     let value = match f.read_at(vlen, at) {
         Ok(v) => v
         Err(e) => return kv::Read::Fault(row_name(prefix, rid) + ": " + e.message())
@@ -442,7 +442,7 @@ pub fn locate(st: &mut kv::Store, cur: &mut Cursor, rid: i64) -> Place {
     cur.last_start[w] = rec
     cur.last_end[w] = at + vlen
     let a = at - cur.offs[w]
-    if crc32::update_window(st.tables[tid].slots[s + 2], cur.blocks[w], a, a + vlen) != log::gc_crc(gc) {
+    if crc32::update_window(st.tables[tid].slots[s + 2] as u32, cur.blocks[w], a, a + vlen) != log::gc_crc(gc) {
         return Place::Fault(row_name(st.tables[tid].prefix, rid) + ": checksum mismatch")
     }
     Place::Block(w, a, a + vlen)
@@ -515,7 +515,7 @@ pub fn span(st: &mut kv::Store, tid: i64, rid: i64) -> (i64, i64) {
     let vlen = log::loc_vlen(loc)
     let at = base + log::loc_offset(loc) + log::HEADER_LEN + st.tables[tid].prefix.byte_len() + log::digits_len(rid)
     if at < 0 || vlen <= 0 || at + vlen > st.resident_bytes.len() { return (0, 0) }
-    if crc32::update_window(st.tables[tid].slots[s + 2], st.resident_bytes, at, at + vlen)
+    if crc32::update_window(st.tables[tid].slots[s + 2] as u32, st.resident_bytes, at, at + vlen)
     != log::gc_crc(gc)
     {
         return (0, 0)

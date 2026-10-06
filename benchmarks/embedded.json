@@ -2,15 +2,15 @@
   "config": {"rows": 50000, "seconds": 5, "threads": 1},
   "host": {"cores": 24, "kernel": "Linux 7.0.0-31-generic"},
   "runs": [
-{"target":"gos-terndb-embedded-sql","queries":60187648,"seconds":5.000,"qps":12037529.6,"ns_per_query":83.1,"bytes":5436969280,"rss_peak_mb":14.3},
-{"target":"gos-terndb-embedded-kv","queries":61276160,"seconds":5.000,"qps":12255232.0,"ns_per_query":81.6,"bytes":5535298562,"rss_peak_mb":14.3},
-{"target":"rust-sqlite-embedded-sql","queries":3307520,"seconds":5.001,"qps":661307.4,"ns_per_query":1512.2,"bytes":298780271,"rss_peak_mb":5.8},
-{"target":"rust-redb-embedded-kv","queries":12212224,"seconds":5.000,"qps":2442355.0,"ns_per_query":409.4,"bytes":1103174611,"rss_peak_mb":15.7},
-{"target":"cpp-rocksdb-embedded-kv","queries":8567808,"seconds":5.000,"qps":1713428.7,"ns_per_query":583.6,"bytes":773961246,"rss_peak_mb":17.4},
-{"target":"c-lmdb-embedded-kv","queries":23422976,"seconds":5.000,"qps":4684542.4,"ns_per_query":213.5,"bytes":2115882656,"rss_peak_mb":7.0},
-{"target":"go-pogreb-embedded-kv","queries":43252736,"seconds":5.000,"qps":8650431.5,"ns_per_query":115.6,"bytes":3907177067,"rss_peak_mb":20.3},
-{"target":"go-bbolt-embedded-kv","queries":9393152,"seconds":5.000,"qps":1878475.8,"ns_per_query":532.3,"bytes":848517578,"rss_peak_mb":21.2},
-{"target":"rust-redb-embedded-kv-typed","queries":9291776,"seconds":5.000,"qps":1858324.8,"ns_per_query":538.1,"bytes":839359913,"rss_peak_mb":11.3},
-{"target":"go-sqlite-embedded-sql","queries":502784,"seconds":5.008,"qps":100395.8,"ns_per_query":9960.6,"bytes":45418280,"rss_peak_mb":19.1}
+{"target":"gos-terndb-embedded-sql","queries":60620800,"seconds":5.000,"qps":12124160.0,"ns_per_query":82.5,"bytes":5476097509,"rss_peak_mb":13.9},
+{"target":"gos-terndb-embedded-kv","queries":60780544,"seconds":5.000,"qps":12156108.8,"ns_per_query":82.3,"bytes":5490527752,"rss_peak_mb":14.0},
+{"target":"rust-sqlite-embedded-sql","queries":3372032,"seconds":5.000,"qps":674355.8,"ns_per_query":1482.9,"bytes":304607906,"rss_peak_mb":5.6},
+{"target":"rust-redb-embedded-kv","queries":12490752,"seconds":5.000,"qps":2497990.8,"ns_per_query":400.3,"bytes":1128335055,"rss_peak_mb":15.6},
+{"target":"cpp-rocksdb-embedded-kv","queries":8610816,"seconds":5.000,"qps":1722125.7,"ns_per_query":580.7,"bytes":777846306,"rss_peak_mb":16.9},
+{"target":"c-lmdb-embedded-kv","queries":23501824,"seconds":5.000,"qps":4700284.9,"ns_per_query":212.8,"bytes":2123005288,"rss_peak_mb":6.8},
+{"target":"go-pogreb-embedded-kv","queries":44744704,"seconds":5.000,"qps":8948882.2,"ns_per_query":111.7,"bytes":4041951952,"rss_peak_mb":19.2},
+{"target":"go-bbolt-embedded-kv","queries":9700352,"seconds":5.000,"qps":1939960.7,"ns_per_query":515.5,"bytes":876268079,"rss_peak_mb":20.6},
+{"target":"rust-redb-embedded-kv-typed","queries":9521152,"seconds":5.000,"qps":1904132.3,"ns_per_query":525.2,"bytes":860080288,"rss_peak_mb":11.7},
+{"target":"go-sqlite-embedded-sql","queries":502784,"seconds":5.002,"qps":100516.3,"ns_per_query":9948.6,"bytes":45418280,"rss_peak_mb":18.1}
   ]
 }

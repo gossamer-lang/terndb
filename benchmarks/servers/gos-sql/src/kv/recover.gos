@@ -53,7 +53,7 @@ fn is_sectioned(buf: Vec<u8>) -> bool {
 fn sections(st: &mut kv::Store, gen: i64, buf: Vec<u8>, apply: bool) -> bool {
     let n = buf.len()
     if n < HINT_MAGIC.byte_len() + 13 { return false }
-    let sum = binary::get_u32_le_at(buf, n - 4).unwrap_or(0u32) as i64
+    let sum = binary::get_u32_le_at(buf, n - 4).unwrap_or(0u32)
     if !apply && crc32::update_window(0, buf, 0, n - 4) != sum { return false }
     let mut p = HINT_MAGIC.byte_len()
     let mut seen: i64 = 0
@@ -97,11 +97,11 @@ fn sections(st: &mut kv::Store, gen: i64, buf: Vec<u8>, apply: bool) -> bool {
                 for i in 0..count {
                     let r = p + i * HINT_ROW_LEN
                     let rid = binary::get_u64_le_at(buf, r).unwrap_or(0u64) as i64
-                    rows::remember_row(st, tid, rid, binary::get_u32_le_at(buf, r + 24).unwrap_or(0u32) as i64, kv::Entry {
+                    rows::remember_row(st, tid, rid, binary::get_u32_le_at(buf, r + 24).unwrap_or(0u32), kv::Entry {
                         file: gen
                         offset: binary::get_u64_le_at(buf, r + 8).unwrap_or(0u64) as i64
                         vlen: binary::get_u32_le_at(buf, r + 16).unwrap_or(0u32) as i64
-                        crc: binary::get_u32_le_at(buf, r + 20).unwrap_or(0u32) as i64
+                        crc: binary::get_u32_le_at(buf, r + 20).unwrap_or(0u32)
                     })
                 }
             } else {
@@ -143,7 +143,7 @@ fn flat_record(st: &mut kv::Store, gen: i64, buf: Vec<u8>, p: i64, end: i64, app
             file: gen
             offset: binary::get_u64_le_at(buf, p + 10).unwrap_or(0u64) as i64
             vlen: binary::get_u32_le_at(buf, p + 2).unwrap_or(0u32) as i64
-            crc: binary::get_u32_le_at(buf, p + 6).unwrap_or(0u32) as i64
+            crc: binary::get_u32_le_at(buf, p + 6).unwrap_or(0u32)
         })
     }
     kstart + klen
@@ -191,7 +191,7 @@ fn ensure(f: fs::File, blk: &mut Block, at: i64, len: i64) -> Result<bool, Strin
 // A record's header as the scan reads it: what it claims to hold, and the
 // checksum it was written with.
 struct Header {
-    crc: i64
+    crc: u32
     kind: u8
     klen: i64
     vlen: i64
@@ -279,7 +279,7 @@ fn header_at(blk: Block, at: i64) -> Header {
     let klen = binary::get_u16_le_at(blk.bytes, h + 5).unwrap_or(0u16) as i64
     let vlen = binary::get_u32_le_at(blk.bytes, h + 7).unwrap_or(0u32) as i64
     Header {
-        crc: binary::get_u32_le_at(blk.bytes, h).unwrap_or(0u32) as i64
+        crc: binary::get_u32_le_at(blk.bytes, h).unwrap_or(0u32)
         kind: blk.bytes[h + 4]
         klen: klen
         vlen: vlen

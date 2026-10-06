@@ -18,7 +18,7 @@ pub (package) struct Staged {
     pub (package) tid: i64
     pub (package) rid: i64
     /// The key's checksum, carried so placing the row recomputes nothing.
-    pub (package) kcrc: i64
+    pub (package) kcrc: u32
 }
 
 /// Opens a batch: nothing written inside it is visible until it commits.
