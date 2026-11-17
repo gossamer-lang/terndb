@@ -19,7 +19,7 @@ const HINT_FLUSH: i64 = 65_536
 // point where a merge rewrites less than it reclaims, and because a merge
 // leaves nothing dead behind it the log has to roughly double before the next
 // one, so merges space themselves out however hard the store is written.
-pub (package) const AUTO_COMPACT_RATIO: f64 = 0.5
+pub(package) const AUTO_COMPACT_RATIO: f64 = 0.5
 
 const AUTO_COMPACT_MIN_BYTES: i64 = 1_048_576
 
@@ -61,7 +61,7 @@ fn flush_hints(f: fs::File, buf: Vec<u8>, off: i64) -> Result<i64, String> {
 // What each generation's live records occupy, keyed by generation. The index is
 // the only thing that knows which records are still live, so this is where a
 // generation's waste is worked out from.
-pub (package) fn live_by_gen(st: &mut kv::Store) -> Map<i64, i64> {
+pub(package) fn live_by_gen(st: &mut kv::Store) -> Map<i64, i64> {
     let mut live_in: Map<i64, i64> = Map::new()
     for k in st.index.keys() {
         if let Some(e) = st.index.get(k) {
@@ -156,7 +156,7 @@ pub fn run(st: &mut kv::Store) -> Result<(), String> {
 // Merges only the generations that are mostly dead, which is what a store
 // merging itself does: a record that is not wasting space is left where it is
 // rather than rewritten for the sake of records that are.
-pub (package) fn compact_dirty(st: &mut kv::Store) -> Result<(), String> {
+pub(package) fn compact_dirty(st: &mut kv::Store) -> Result<(), String> {
     let dirty = dirty_generations(st)?
     compact_into(st, dirty)
 }

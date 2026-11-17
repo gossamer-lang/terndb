@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.3.2
+
+- Requires Gossamer 0.81.1.
+
 ## 0.3.1
 
 - Requires Gossamer 0.67.0, whose `std::hash::crc32` answers a `u32`.

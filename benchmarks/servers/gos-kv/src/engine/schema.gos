@@ -8,7 +8,7 @@ use crate::codec
 //
 //   schema record: [namelen u16][name][ncols u16][per column: namelen u16][name][tag u8]
 
-pub (package) fn encode(def: engine::TableDef) -> Vec<u8> {
+pub(package) fn encode(def: engine::TableDef) -> Vec<u8> {
     let mut out = put_name(#[], def.name)
     out.extend(binary::put_u16_le(#[], def.cols.len()))
     for i in 0..def.cols.len() {
@@ -41,7 +41,7 @@ fn take_name(buf: Vec<u8>, p: i64) -> Result<(String, i64), String> {
     }
 }
 
-pub (package) fn decode(buf: Vec<u8>) -> Result<engine::TableDef, String> {
+pub(package) fn decode(buf: Vec<u8>) -> Result<engine::TableDef, String> {
     let name, mut p = take_name(buf, 0)?
     let ncols = match binary::get_u16_le_at(buf, p) {
         Ok(x) => x as i64
@@ -69,7 +69,7 @@ pub (package) fn decode(buf: Vec<u8>) -> Result<engine::TableDef, String> {
 // f64, text, bool or nil; a bound value may be any width the caller built, so
 // a whole number is range-checked whatever width it arrived at, and a float
 // of either width is taken by either float column.
-pub (package) fn coerce(val: codec::Value, tag: u8, col: String) -> Result<codec::Value, String> {
+pub(package) fn coerce(val: codec::Value, tag: u8, col: String) -> Result<codec::Value, String> {
     if val.tag == codec::TAG_NIL { return Ok(codec::Value::nil()) }
     if tag == codec::TAG_TEXT && val.tag == codec::TAG_TEXT { return Ok(val) }
     if tag == codec::TAG_BOOL && val.tag == codec::TAG_BOOL { return Ok(val) }
@@ -101,13 +101,13 @@ pub (package) fn coerce(val: codec::Value, tag: u8, col: String) -> Result<codec
         "; a " + codec::type_name_for_tag(val.tag) + " value does not fit it")
 }
 
-pub (package) fn encode_row(vals: Vec<codec::Value>) -> Vec<u8> {
+pub(package) fn encode_row(vals: Vec<codec::Value>) -> Vec<u8> {
     let mut out: Vec<u8> = #[]
     for v in vals { codec::encode_into(&mut out, v) }
     out
 }
 
-pub (package) fn col_index(def: &mut engine::TableDef, col: String) -> Result<i64, String> {
+pub(package) fn col_index(def: &mut engine::TableDef, col: String) -> Result<i64, String> {
     let want = col.to_lowercase()
     for i in 0..def.cols.len() {
         if def.cols[i].to_lowercase() == want { return Ok(i) }

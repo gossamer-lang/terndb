@@ -39,7 +39,7 @@ use std::hash::crc32
 
 const MAX_KEY_LEN: i64 = 65_535
 
-pub (package) const MAX_VALUE_LEN: i64 = 1_048_576
+pub(package) const MAX_VALUE_LEN: i64 = 1_048_576
 
 /// What a read answers: the value, the absence of one, or why neither.
 ///
@@ -271,10 +271,10 @@ fn newest_or(gens: Vec<i64>, fallback: i64) -> i64 {
 // A batch holds this many bytes before it writes what it has so far, which is
 // where one write's fixed cost has stopped mattering against the bytes it
 // carries. What it writes early is still invisible until the commit lands.
-pub (package) const PENDING_FLUSH: i64 = 1_048_576
+pub(package) const PENDING_FLUSH: i64 = 1_048_576
 
 // Frames a record into the open batch and answers the offset it will occupy.
-pub (package) fn stage(st: &mut Store, key: String, kind: u8, val: Vec<u8>, crc: u32) -> Result<i64, String> {
+pub(package) fn stage(st: &mut Store, key: String, kind: u8, val: Vec<u8>, crc: u32) -> Result<i64, String> {
     if st.read_only { return Err("store is read-only") }
     if st.data.is_none() { return Err("store not open for writing") }
     let off = st.pending_at + st.pending.len()
@@ -285,7 +285,7 @@ pub (package) fn stage(st: &mut Store, key: String, kind: u8, val: Vec<u8>, crc:
 }
 
 // Writes the batch's staged bytes where they belong in the active file.
-pub (package) fn flush_pending(st: &mut Store) -> Result<(), String> {
+pub(package) fn flush_pending(st: &mut Store) -> Result<(), String> {
     if st.pending.len() == 0 { return Ok(()) }
     st.touched = true
     match st.data {
@@ -309,7 +309,7 @@ pub (package) fn flush_pending(st: &mut Store) -> Result<(), String> {
 // Stages `val` under `key`, as a batch of one when no batch is open. `tid` and
 // `rid` name the row the key addresses, or are -1 for a key the caller has not
 // placed; `kcrc` is the key's checksum, which the record's continues from.
-pub (package) fn stage_put(st: &mut Store, key: String, val: Vec<u8>, kcrc: u32, tid: i64, rid: i64) -> Result<(), String> {
+pub(package) fn stage_put(st: &mut Store, key: String, val: Vec<u8>, kcrc: u32, tid: i64, rid: i64) -> Result<(), String> {
     if key == "" { return Err("put: key must not be empty") }
     if key.byte_len() > MAX_KEY_LEN { return Err("put: key exceeds " + MAX_KEY_LEN.to_string() + " bytes") }
     if val.len() > MAX_VALUE_LEN { return Err("put: value exceeds " + MAX_VALUE_LEN.to_string() + " bytes") }
@@ -418,7 +418,7 @@ impl Store {
 
 // Sealed generations are immutable, so one handle per generation serves every
 // read of it and a get costs no open.
-pub (package) fn reader_for(st: &mut Store, gen: i64) -> Option<fs::File> {
+pub(package) fn reader_for(st: &mut Store, gen: i64) -> Option<fs::File> {
     if let Some(f) = st.readers.get(gen) { return Some(f) }
     match log::open_read(log::data_path(st.dir, gen)) {
         Some(f) => {

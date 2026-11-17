@@ -12,23 +12,23 @@ use crate::sql
 // and the literal already narrowed to that column's type. Resolving a column
 // name means lowercasing every candidate, so it is done once per statement
 // rather than once per row.
-pub (package) struct Filter {
-    pub (package) cols: Vec<i64>
+pub(package) struct Filter {
+    pub(package) cols: Vec<i64>
     /// The column each comparison names, kept so a value that cannot be
     /// narrowed to it is reported against the column that refused it.
-    pub (package) names: Vec<String>
-    pub (package) ops: Vec<u8>
-    pub (package) vals: Vec<codec::Value>
+    pub(package) names: Vec<String>
+    pub(package) ops: Vec<u8>
+    pub(package) vals: Vec<codec::Value>
     /// The column tag each comparison narrows its value to, kept so a bound
     /// parameter can be narrowed the same way a literal was.
-    pub (package) tags: Vec<u8>
-    pub (package) id_ops: Vec<u8>
-    pub (package) id_vals: Vec<i64>
+    pub(package) tags: Vec<u8>
+    pub(package) id_ops: Vec<u8>
+    pub(package) id_vals: Vec<i64>
     /// For each row-id comparison, the argument that fills it, or -1 when the
     /// statement wrote a literal.
-    pub (package) id_args: Vec<i64>
-    pub (package) id_eq: i64
-    pub (package) id_eq_arg: i64
+    pub(package) id_args: Vec<i64>
+    pub(package) id_eq: i64
+    pub(package) id_eq_arg: i64
 }
 
 fn empty() -> Filter {
@@ -38,7 +38,7 @@ fn empty() -> Filter {
     }
 }
 
-pub (package) fn compile(def: &mut engine::TableDef, conds: Vec<sql::Cond>) -> Result<Filter, String> {
+pub(package) fn compile(def: &mut engine::TableDef, conds: Vec<sql::Cond>) -> Result<Filter, String> {
     let mut f = empty()
     for cond in conds {
         if cond.col.to_lowercase() == schema::ROWID {
@@ -72,7 +72,7 @@ pub (package) fn compile(def: &mut engine::TableDef, conds: Vec<sql::Cond>) -> R
 
 // Fills a compiled filter's placeholders from the bound arguments, leaving the
 // prepared statement's own filter untouched so it can be run again.
-pub (package) fn bind(template: Filter, args: Vec<codec::Value>) -> Result<Filter, String> {
+pub(package) fn bind(template: Filter, args: Vec<codec::Value>) -> Result<Filter, String> {
     let mut f = template
     for i in 0..f.vals.len() {
         if f.vals[i].tag != codec::TAG_PARAM { continue }
@@ -103,7 +103,7 @@ fn missing_arg(n: i64, given: i64) -> String {
         ", but " + given.to_string() + " were bound"
 }
 
-pub (package) fn id_holds(filter: &mut Filter, rid: i64) -> bool {
+pub(package) fn id_holds(filter: &mut Filter, rid: i64) -> bool {
     let mut i: i64 = 0
     while i < filter.id_ops.len() {
         if !op_holds(filter.id_ops[i], rid - filter.id_vals[i]) { return false }
@@ -112,7 +112,7 @@ pub (package) fn id_holds(filter: &mut Filter, rid: i64) -> bool {
     true
 }
 
-pub (package) fn op_holds(op: u8, c: i64) -> bool {
+pub(package) fn op_holds(op: u8, c: i64) -> bool {
     match op {
         sql::OP_EQ => c == 0
         sql::OP_NE => c != 0

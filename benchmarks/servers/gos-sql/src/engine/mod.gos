@@ -58,9 +58,9 @@ pub struct Engine {
     pub indexes: Vec<index::ColIndex>
 }
 
-pub (package) fn row_prefix(table: String) -> String { table + "/r/" }
+pub(package) fn row_prefix(table: String) -> String { table + "/r/" }
 
-pub (package) fn schema_key(table: String) -> String { "schema/" + table }
+pub(package) fn schema_key(table: String) -> String { "schema/" + table }
 
 /// Opens the database in `dir` and loads its table catalogue.
 pub fn open(dir: String, read_only: bool = false) -> Result<Engine, String> {
@@ -161,21 +161,21 @@ impl Engine {
     }
 }
 
-pub (package) fn empty_result() -> QueryResult { QueryResult { cols: #[], rows: #[], count: 0 } }
+pub(package) fn empty_result() -> QueryResult { QueryResult { cols: #[], rows: #[], count: 0 } }
 
 // A result carrying nothing but the number of rows a write touched.
-pub (package) fn affected(n: i64) -> Result<QueryResult, String> {
+pub(package) fn affected(n: i64) -> Result<QueryResult, String> {
     Ok(QueryResult { cols: #[], rows: #[], count: n })
 }
 
 // A result carrying one count, which is what COUNT(*) answers with.
-pub (package) fn counted(n: i64) -> Result<QueryResult, String> {
+pub(package) fn counted(n: i64) -> Result<QueryResult, String> {
     Ok(QueryResult { cols: #["count"], rows: #[Row { rowid: 0, vals: #[codec::Value::int(n)] }], count: n })
 }
 
 // The rows a LIMIT and an OFFSET leave, given the matches in the order they
 // were produced.
-pub (package) fn window(rows: Vec<Row>, offset: i64, limit: i64) -> Vec<Row> {
+pub(package) fn window(rows: Vec<Row>, offset: i64, limit: i64) -> Vec<Row> {
     if offset == 0 && limit < 0 { return rows }
     if offset >= rows.len() { return #[] }
     let mut end = rows.len()
@@ -191,7 +191,7 @@ pub (package) fn window(rows: Vec<Row>, offset: i64, limit: i64) -> Vec<Row> {
 
 // How many of `matched` rows a LIMIT and an OFFSET leave, which is what a
 // COUNT(*) carrying either answers.
-pub (package) fn window_count(matched: i64, offset: i64, limit: i64) -> i64 {
+pub(package) fn window_count(matched: i64, offset: i64, limit: i64) -> i64 {
     let rest = if matched > offset { matched - offset } else { 0 }
     if limit >= 0 && rest > limit { limit } else { rest }
 }
@@ -199,7 +199,7 @@ pub (package) fn window_count(matched: i64, offset: i64, limit: i64) -> i64 {
 // The catalogue is reached through the engine rather than a copy of it: an
 // engine holds the store's whole index, so a by-value read would copy every
 // key on the way to one table definition.
-pub (package) fn get_def(eng: &mut Engine, table: String) -> Result<TableDef, String> {
+pub(package) fn get_def(eng: &mut Engine, table: String) -> Result<TableDef, String> {
     match eng.tables.get(table) {
         Some(d) => Ok(d)
         None => Err("no such table: " + table)
@@ -209,7 +209,7 @@ pub (package) fn get_def(eng: &mut Engine, table: String) -> Result<TableDef, St
 // A statement that would write is refused before it reaches anything mutable.
 // A read-only engine is what several readers share, so a write that got as far
 // as the catalogue would be one reader writing to another's store.
-pub (package) fn read_only_refuses(eng: &mut Engine) -> Result<(), String> {
+pub(package) fn read_only_refuses(eng: &mut Engine) -> Result<(), String> {
     if eng.store.read_only { return Err("store is read-only") }
     Ok(())
 }

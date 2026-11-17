@@ -75,8 +75,8 @@ pub fn claim(dir: String) -> Result<(), String> {
                 if entry.name == OWNED { return Ok(()) }
             }
             if entries.is_empty() { return Ok(()) }
-            Err("bench: " + dir + " holds data the benchmark did not write; "
-                + "pass an empty or new directory")
+            Err("bench: " + dir + " holds data the benchmark did not write; " +
+                "pass an empty or new directory")
         }
     }
 }

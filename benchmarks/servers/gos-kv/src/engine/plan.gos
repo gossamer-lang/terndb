@@ -84,8 +84,8 @@ pub fn prepare(eng: &mut engine::Engine, src: String) -> Result<Prepared, String
             let order_idx = if q.has_order { order::resolve(&mut def, q.order_col)? } else { order::NONE }
             // One row id and nothing else to test is a single read: no walk, no
             // ordering to settle, and no limit that could cut it short.
-            let point_read = filter.id_ops.len() == 1 && filter.id_ops[0] == sql::OP_EQ
-            && filter.cols.len() == 0 && !q.has_order && q.limit != 0 && q.offset == 0
+            let point_read = filter.id_ops.len() == 1 && filter.id_ops[0] == sql::OP_EQ &&
+                filter.cols.len() == 0 && !q.has_order && q.limit != 0 && q.offset == 0
             let tid = kv::rows::table_id(&mut eng.store, q.table)
             Ok(Prepared {
                 src: src, arity: arity, point_read: point_read, prefix: engine::row_prefix(q.table)

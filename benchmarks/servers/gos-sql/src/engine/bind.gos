@@ -11,7 +11,7 @@ use crate::sql
 ///
 /// A statement carrying no placeholder is answered as it stands, and one whose
 /// placeholder count differs from `args` is refused before it reads or writes.
-pub (package) fn stmt(s: sql::Stmt, args: Vec<codec::Value>) -> Result<sql::Stmt, String> {
+pub(package) fn stmt(s: sql::Stmt, args: Vec<codec::Value>) -> Result<sql::Stmt, String> {
     let n = arity(s)
     if n != args.len() {
         return Err("statement takes " + n.to_string() + " argument(s), got " +

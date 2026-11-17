@@ -8,7 +8,7 @@ use super::order
 // One statement carried out against the store, from the `Stmt` the parser
 // produced.
 
-pub (package) fn create(eng: &mut engine::Engine, name: String, cols: Vec<(String, u8)>, if_not_exists: bool) -> Result<engine::QueryResult, String> {
+pub(package) fn create(eng: &mut engine::Engine, name: String, cols: Vec<(String, u8)>, if_not_exists: bool) -> Result<engine::QueryResult, String> {
     engine::read_only_refuses(eng)?
     if eng.tables.contains(name) {
         if if_not_exists { return Ok(engine::empty_result()) }
@@ -29,7 +29,7 @@ pub (package) fn create(eng: &mut engine::Engine, name: String, cols: Vec<(Strin
     Ok(engine::empty_result())
 }
 
-pub (package) fn create_index(eng: &mut engine::Engine, table: String, col: String, if_not_exists: bool) -> Result<engine::QueryResult, String> {
+pub(package) fn create_index(eng: &mut engine::Engine, table: String, col: String, if_not_exists: bool) -> Result<engine::QueryResult, String> {
     engine::read_only_refuses(eng)?
     let mut def = engine::get_def(eng, table)?
     let ci = schema::col_index(&mut def, col)?
@@ -50,7 +50,7 @@ pub (package) fn create_index(eng: &mut engine::Engine, table: String, col: Stri
 /// The rows and the declarations go in one batch with the schema key, so a
 /// table is either whole or gone; nothing on disk names a table the catalogue
 /// does not hold.
-pub (package) fn drop_table(eng: &mut engine::Engine, table: String, if_exists: bool) -> Result<engine::QueryResult, String> {
+pub(package) fn drop_table(eng: &mut engine::Engine, table: String, if_exists: bool) -> Result<engine::QueryResult, String> {
     engine::read_only_refuses(eng)?
     if !eng.tables.contains(table) {
         if if_exists { return Ok(engine::empty_result()) }
@@ -94,7 +94,7 @@ pub (package) fn drop_table(eng: &mut engine::Engine, table: String, if_exists: 
 }
 
 /// Removes an index declaration, leaving the rows it filed as they are.
-pub (package) fn drop_index(eng: &mut engine::Engine, table: String, col: String, if_exists: bool) -> Result<engine::QueryResult, String> {
+pub(package) fn drop_index(eng: &mut engine::Engine, table: String, col: String, if_exists: bool) -> Result<engine::QueryResult, String> {
     engine::read_only_refuses(eng)?
     let mut def = engine::get_def(eng, table)?
     let ci = schema::col_index(&mut def, col)?
@@ -108,7 +108,7 @@ pub (package) fn drop_index(eng: &mut engine::Engine, table: String, col: String
     Ok(engine::empty_result())
 }
 
-pub (package) fn insert(eng: &mut engine::Engine, table: String, cols: Vec<String>, rows: Vec<Vec<codec::Value>>) -> Result<engine::QueryResult, String> {
+pub(package) fn insert(eng: &mut engine::Engine, table: String, cols: Vec<String>, rows: Vec<Vec<codec::Value>>) -> Result<engine::QueryResult, String> {
     engine::read_only_refuses(eng)?
     let mut def = engine::get_def(eng, table)?
     // A statement naming its columns supplies those and leaves the rest NULL;
@@ -163,7 +163,7 @@ pub (package) fn insert(eng: &mut engine::Engine, table: String, cols: Vec<Strin
     engine::affected(encoded.len())
 }
 
-pub (package) fn select(eng: &mut engine::Engine, q: sql::Query) -> Result<engine::QueryResult, String> {
+pub(package) fn select(eng: &mut engine::Engine, q: sql::Query) -> Result<engine::QueryResult, String> {
     let mut def = engine::get_def(eng, q.table)?
     let filter = filter::compile(&mut def, q.conds)?
     // The order is resolved before any row is read, so a statement naming a
@@ -188,8 +188,8 @@ pub (package) fn select(eng: &mut engine::Engine, q: sql::Query) -> Result<engin
 // Whether the statement names one row by its id and nothing else, which one
 // read answers: the walk exists to find rows the key does not already name.
 fn names_one_row(filter: filter::Filter, has_order: bool, limit: i64) -> bool {
-    filter.cols.len() == 0 && filter.id_ops.len() == 1 && filter.id_ops[0] == sql::OP_EQ
-    && filter.id_args[0] < 0 && !has_order && limit != 0
+    filter.cols.len() == 0 && filter.id_ops.len() == 1 && filter.id_ops[0] == sql::OP_EQ &&
+        filter.id_args[0] < 0 && !has_order && limit != 0
 }
 
 // The one row `rid` names, projected the way the statement asked for it.
@@ -245,7 +245,7 @@ fn project(def: &mut engine::TableDef, cols: Vec<String>, kept: Vec<engine::Row>
     Ok(engine::QueryResult { cols: out_cols, rows: projected, count: projected.len() })
 }
 
-pub (package) fn update(eng: &mut engine::Engine, table: String, sets: Vec<(String, codec::Value)>, conds: Vec<sql::Cond>) -> Result<engine::QueryResult, String> {
+pub(package) fn update(eng: &mut engine::Engine, table: String, sets: Vec<(String, codec::Value)>, conds: Vec<sql::Cond>) -> Result<engine::QueryResult, String> {
     engine::read_only_refuses(eng)?
     let mut def = engine::get_def(eng, table)?
     let filter = filter::compile(&mut def, conds)?
@@ -285,7 +285,7 @@ pub (package) fn update(eng: &mut engine::Engine, table: String, sets: Vec<(Stri
     engine::affected(writes.len())
 }
 
-pub (package) fn delete(eng: &mut engine::Engine, table: String, conds: Vec<sql::Cond>) -> Result<engine::QueryResult, String> {
+pub(package) fn delete(eng: &mut engine::Engine, table: String, conds: Vec<sql::Cond>) -> Result<engine::QueryResult, String> {
     engine::read_only_refuses(eng)?
     let mut def = engine::get_def(eng, table)?
     let filter = filter::compile(&mut def, conds)?

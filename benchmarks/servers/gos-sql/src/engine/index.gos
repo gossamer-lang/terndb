@@ -28,11 +28,11 @@ pub struct ColIndex {
     pub prev: Vec<i64>
 }
 
-pub (package) fn declaration_key(table: String, col: String) -> String { "index/" + table + "/" + col }
+pub(package) fn declaration_key(table: String, col: String) -> String { "index/" + table + "/" + col }
 
 // The table and column an `index/<table>/<col>` key names, or empty names when
 // the key is not one.
-pub (package) fn split_key(key: String) -> (String, String) {
+pub(package) fn split_key(key: String) -> (String, String) {
     let n = key.byte_len()
     let start: i64 = 6
     if n <= start { return ("", "") }
@@ -59,7 +59,7 @@ pub fn of(eng: &mut engine::Engine, table: String, col: String) -> i64 {
 
 // Whether any column of `table` is indexed, which is what decides whether a
 // write has to keep one up to date.
-pub (package) fn covers(eng: &mut engine::Engine, table: String) -> bool {
+pub(package) fn covers(eng: &mut engine::Engine, table: String) -> bool {
     let mut i: i64 = 0
     while i < eng.indexes.len() {
         if eng.indexes[i].table == table { return true }
@@ -69,21 +69,21 @@ pub (package) fn covers(eng: &mut engine::Engine, table: String) -> bool {
 }
 
 // Adds the index to the engine and fills it from the rows already there.
-pub (package) fn attach(eng: &mut engine::Engine, table: String, col: String, ci: i64) -> Result<(), String> {
+pub(package) fn attach(eng: &mut engine::Engine, table: String, col: String, ci: i64) -> Result<(), String> {
     eng.indexes.push(ColIndex { table: table, col: col, ci: ci, head: Map::new(), next: #[], prev: #[] })
     build(eng, eng.indexes.len() - 1)
 }
 
 // Drops the index on one column, closing the gap the removal leaves so every
 // later index keeps a place in the vector.
-pub (package) fn detach(eng: &mut engine::Engine, table: String, col: String) {
+pub(package) fn detach(eng: &mut engine::Engine, table: String, col: String) {
     let ix = of(eng, table, col)
     if ix >= 0 { let _ = eng.indexes.remove(ix) }
 }
 
 // Drops every index a table declared, which is what a dropped table leaves
 // behind in the engine.
-pub (package) fn detach_table(eng: &mut engine::Engine, table: String) {
+pub(package) fn detach_table(eng: &mut engine::Engine, table: String) {
     let mut kept: Vec<ColIndex> = #[]
     for ci in eng.indexes {
         if ci.table != table { kept.push(ci) }
@@ -124,7 +124,7 @@ fn build(eng: &mut engine::Engine, ix: i64) -> Result<(), String> {
 // answer a question differently from the walk it replaces. A float's negative
 // zero compares equal to its positive one and encodes differently, so it is
 // filed as positive; every other pair that compares equal is identical.
-pub (package) fn key_of(v: codec::Value) -> codec::Value {
+pub(package) fn key_of(v: codec::Value) -> codec::Value {
     // Adding zero turns a negative zero into a positive one and leaves every
     // other value exactly as it was, which is what makes the two share a key.
     if v.tag == codec::TAG_F64 { return codec::Value::float(v.f + 0.0) }
@@ -176,7 +176,7 @@ fn take_out(eng: &mut engine::Engine, ix: i64, rid: i64, raw: codec::Value) {
 }
 
 // Files a row that has just been written under every indexed column it has.
-pub (package) fn row_added(eng: &mut engine::Engine, table: String, rid: i64, vals: Vec<codec::Value>) {
+pub(package) fn row_added(eng: &mut engine::Engine, table: String, rid: i64, vals: Vec<codec::Value>) {
     let mut ix: i64 = 0
     while ix < eng.indexes.len() {
         if eng.indexes[ix].table == table {
@@ -188,7 +188,7 @@ pub (package) fn row_added(eng: &mut engine::Engine, table: String, rid: i64, va
 }
 
 // Takes a row that is about to be replaced or removed out of every index.
-pub (package) fn row_removed(eng: &mut engine::Engine, table: String, rid: i64, vals: Vec<codec::Value>) {
+pub(package) fn row_removed(eng: &mut engine::Engine, table: String, rid: i64, vals: Vec<codec::Value>) {
     let mut ix: i64 = 0
     while ix < eng.indexes.len() {
         if eng.indexes[ix].table == table {

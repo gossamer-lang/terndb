@@ -10,15 +10,15 @@ use super::rows
 // transaction.
 
 // One staged change, held until its batch commits.
-pub (package) struct Staged {
-    pub (package) key: String
-    pub (package) entry: kv::Entry
-    pub (package) remove: bool
+pub(package) struct Staged {
+    pub(package) key: String
+    pub(package) entry: kv::Entry
+    pub(package) remove: bool
     /// The table and row the key addresses, or -1 for a key nobody placed.
-    pub (package) tid: i64
-    pub (package) rid: i64
+    pub(package) tid: i64
+    pub(package) rid: i64
     /// The key's checksum, carried so placing the row recomputes nothing.
-    pub (package) kcrc: u32
+    pub(package) kcrc: u32
 }
 
 /// Opens a batch: nothing written inside it is visible until it commits.
@@ -113,11 +113,11 @@ pub fn undo(st: &mut kv::Store, e: String) -> String {
 
 // A write outside an explicit batch is a batch of one, so every write is
 // atomic and durable whether or not the caller asked for a transaction.
-pub (package) fn solo(st: &mut kv::Store) -> bool { !st.in_batch }
+pub(package) fn solo(st: &mut kv::Store) -> bool { !st.in_batch }
 
 // A key written earlier in this batch is present for the batch's own purposes,
 // even though the index will not show it until the batch commits.
-pub (package) fn staged_holds(st: &mut kv::Store, key: String) -> bool {
+pub(package) fn staged_holds(st: &mut kv::Store, key: String) -> bool {
     for change in st.staged {
         if change.key == key { return !change.remove }
     }

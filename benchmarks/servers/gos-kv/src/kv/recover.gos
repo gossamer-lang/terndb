@@ -12,12 +12,12 @@ use super::rows
 /// The first bytes of a hint written in sections: a table's rows by row id,
 /// then the keys the hash index holds. A hint without them is the older form,
 /// one record per key.
-pub (package) const HINT_MAGIC: String = "TNH2"
+pub(package) const HINT_MAGIC: String = "TNH2"
 
 /// Section tags of a sectioned hint.
-pub (package) const HINT_END: u8 = 0
-pub (package) const HINT_TABLE: u8 = 1
-pub (package) const HINT_KEYS: u8 = 2
+pub(package) const HINT_END: u8 = 0
+pub(package) const HINT_TABLE: u8 = 1
+pub(package) const HINT_KEYS: u8 = 2
 
 // One row of a table section: row id, offset, value length, record checksum and
 // key checksum.
@@ -27,7 +27,7 @@ const HINT_ROW_LEN: i64 = 28
 // file described every record it holds: a hint that runs out part-way through,
 // or fails its own checksum, describes the generation no better than not at
 // all, and the caller reads the data file instead.
-pub (package) fn rebuild_from_hints(st: &mut kv::Store, gen: i64, buf: Vec<u8>) -> bool {
+pub(package) fn rebuild_from_hints(st: &mut kv::Store, gen: i64, buf: Vec<u8>) -> bool {
     if is_sectioned(buf) {
         // The whole hint is checked before any of it is applied, so a hint the
         // data file has to stand in for leaves nothing half-placed behind it.
@@ -208,7 +208,7 @@ struct Header {
 // scan stops there either way - it cannot tell what follows a record it cannot
 // read - and records the fault on the store, so a caller can say what happened
 // rather than serving a log that quietly ends early.
-pub (package) fn rebuild_from_data(st: &mut kv::Store, gen: i64, path: String) -> i64 {
+pub(package) fn rebuild_from_data(st: &mut kv::Store, gen: i64, path: String) -> i64 {
     let f = match log::open_read(path) {
         Some(h) => h
         // The generation is one the directory listed, so a file that will not

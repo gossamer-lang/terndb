@@ -27,7 +27,7 @@ const MAX_ROWID: i64 = 1_000_000_000_000_000
 // generation into a look at a buffer rather than a positional read and a copy
 // of the value out of it. The budget is what keeps a large log from being held
 // whole; zero holds none.
-pub (package) const RESIDENT_BUDGET: i64 = 67_108_864
+pub(package) const RESIDENT_BUDGET: i64 = 67_108_864
 
 /// One table's rows, addressed by rowid rather than by key.
 ///
@@ -109,7 +109,7 @@ fn row_prefix_end(key: String) -> i64 {
 // The table and rowid a key names among the tables already opened. A row the
 // dense index declined still answers here, because the caller falls through to
 // the hash index when the slot turns out to be empty.
-pub (package) fn locate_row(st: &mut kv::Store, key: String) -> (i64, i64) {
+pub(package) fn locate_row(st: &mut kv::Store, key: String) -> (i64, i64) {
     let mut t: i64 = 0
     while t < st.tables.len() {
         if key.starts_with(st.tables[t].prefix) {
@@ -127,7 +127,7 @@ pub (package) fn locate_row(st: &mut kv::Store, key: String) -> (i64, i64) {
 ///
 /// A row id is written without a leading zero, so one row is never reachable
 /// under two spellings of its key.
-pub (package) fn locate_row_bytes(st: &mut kv::Store, buf: Vec<u8>, start: i64, len: i64) -> (i64, i64) {
+pub(package) fn locate_row_bytes(st: &mut kv::Store, buf: Vec<u8>, start: i64, len: i64) -> (i64, i64) {
     for t in 0..st.tables.len() {
         let prefix = st.tables[t].prefix.as_bytes()
         let n = prefix.len()
@@ -178,7 +178,7 @@ fn locate_or_open_row(st: &mut kv::Store, key: String) -> (i64, i64) {
 
 // Sizes `tid`'s slots for row ids up to `top` in one step, for a caller that
 // knows the highest row it is about to place.
-pub (package) fn reserve(st: &mut kv::Store, tid: i64, top: i64) {
+pub(package) fn reserve(st: &mut kv::Store, tid: i64, top: i64) {
     let want = 3 * top + 3
     if st.tables[tid].slots.len() < want { st.tables[tid].slots.resize(want, 0) }
 }
@@ -192,13 +192,13 @@ fn slot_for(st: &mut kv::Store, tid: i64, rid: i64) -> i64 {
 
 // What a row's record occupies, key included, from the parts the dense index
 // keeps instead of the key.
-pub (package) fn row_record_len(st: &mut kv::Store, tid: i64, rid: i64, vlen: i64) -> i64 {
+pub(package) fn row_record_len(st: &mut kv::Store, tid: i64, rid: i64, vlen: i64) -> i64 {
     log::HEADER_LEN + st.tables[tid].prefix.byte_len() + log::digits_len(rid) + vlen
 }
 
 // Replacing a key retires whatever the index held for it; the retired bytes
 // are what compaction reclaims.
-pub (package) fn remember(st: &mut kv::Store, key: String, e: kv::Entry) {
+pub(package) fn remember(st: &mut kv::Store, key: String, e: kv::Entry) {
     let tid, rid = locate_or_open_row(st, key)
     if tid >= 0 {
         // The key's own checksum is taken once, here, so a read never rebuilds
@@ -217,7 +217,7 @@ pub (package) fn remember(st: &mut kv::Store, key: String, e: kv::Entry) {
 
 /// Places row `rid` of table `tid`, whose key checksums to `kcrc`, without
 /// spelling or parsing its key: the caller already knows which row it is.
-pub (package) fn remember_row(st: &mut kv::Store, tid: i64, rid: i64, kcrc: u32, e: kv::Entry) {
+pub(package) fn remember_row(st: &mut kv::Store, tid: i64, rid: i64, kcrc: u32, e: kv::Entry) {
     if rid >= 1 && rid <= st.tables[tid].top + ROWID_SLACK {
         remember_dense(st, tid, rid, kcrc, e)
         return
@@ -253,14 +253,14 @@ fn remember_dense(st: &mut kv::Store, tid: i64, rid: i64, kcrc: u32, e: kv::Entr
     st.live_bytes += e.vlen
 }
 
-pub (package) fn forget(st: &mut kv::Store, key: String) {
+pub(package) fn forget(st: &mut kv::Store, key: String) {
     let tid, rid = locate_row(st, key)
     if tid >= 0 && forget_dense(st, tid, rid) { return }
     forget_hashed(st, key)
 }
 
 /// Removes row `rid` of table `tid`, wherever the index holds it.
-pub (package) fn forget_row(st: &mut kv::Store, tid: i64, rid: i64) {
+pub(package) fn forget_row(st: &mut kv::Store, tid: i64, rid: i64) {
     if forget_dense(st, tid, rid) { return }
     if st.hashed_rows > 0 { forget_hashed(st, st.tables[tid].prefix + rid.to_string()) }
 }
@@ -515,8 +515,8 @@ pub fn span(st: &mut kv::Store, tid: i64, rid: i64) -> (i64, i64) {
     let vlen = log::loc_vlen(loc)
     let at = base + log::loc_offset(loc) + log::HEADER_LEN + st.tables[tid].prefix.byte_len() + log::digits_len(rid)
     if at < 0 || vlen <= 0 || at + vlen > st.resident_bytes.len() { return (0, 0) }
-    if crc32::update_window(st.tables[tid].slots[s + 2] as u32, st.resident_bytes, at, at + vlen)
-    != log::gc_crc(gc)
+    if crc32::update_window(st.tables[tid].slots[s + 2] as u32, st.resident_bytes, at, at + vlen) !=
+        log::gc_crc(gc)
     {
         return (0, 0)
     }
@@ -547,7 +547,7 @@ fn resident_base(st: &mut kv::Store, gen: i64) -> i64 {
 // ones the most rows are read from, for as long as the budget has room. A
 // generation still being appended to is never admitted, since its bytes are
 // not final.
-pub (package) fn admit_resident(st: &mut kv::Store) {
+pub(package) fn admit_resident(st: &mut kv::Store) {
     st.resident_bytes = #[]
     st.resident_gens = #[]
     st.resident_base = #[]

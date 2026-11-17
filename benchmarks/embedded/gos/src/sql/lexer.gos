@@ -143,7 +143,7 @@ fn is_space(c: char) -> bool { c == ' ' || c == '\t' || c == '\n' || c == '\r' }
 
 // The character a backslash escape stands for; an unknown escape is the
 // character itself, which is what a quoted literal's scan also reads it as.
-pub (package) fn unescape(c: char) -> char {
+pub(package) fn unescape(c: char) -> char {
     if c == 'n' { return '\n' }
     if c == 't' { return '\t' }
     if c == 'r' { return '\r' }

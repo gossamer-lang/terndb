@@ -13,14 +13,14 @@ use super::scan
 // returned rather than the rows matched.
 
 /// The statement names no order.
-pub (package) const NONE: i64 = -1
+pub(package) const NONE: i64 = -1
 
 /// The statement orders by the row id.
-pub (package) const ROWID: i64 = -2
+pub(package) const ROWID: i64 = -2
 
 /// What an `ORDER BY` names in `def`: a column index, [`ROWID`], or an error
 /// naming the column the table does not have.
-pub (package) fn resolve(def: &mut engine::TableDef, name: String) -> Result<i64, String> {
+pub(package) fn resolve(def: &mut engine::TableDef, name: String) -> Result<i64, String> {
     if name.to_lowercase() == schema::ROWID { return Ok(ROWID) }
     schema::col_index(def, name)
 }
@@ -28,7 +28,7 @@ pub (package) fn resolve(def: &mut engine::TableDef, name: String) -> Result<i64
 /// The matching rows, whole, ordered by `by` ([`NONE`], [`ROWID`] or a column
 /// index) and cut to the window `offset` / `limit`, where a negative `limit`
 /// takes every row.
-pub (package) fn rows(eng: &mut engine::Engine, def: &mut engine::TableDef, filter: filter::Filter, by: i64, asc: bool, limit: i64, offset: i64) -> Result<Vec<engine::Row>, String> {
+pub(package) fn rows(eng: &mut engine::Engine, def: &mut engine::TableDef, filter: filter::Filter, by: i64, asc: bool, limit: i64, offset: i64) -> Result<Vec<engine::Row>, String> {
     if by == NONE || by == ROWID {
         let cap = if limit < 0 { -1 } else { limit + offset }
         let walk = scan::table(eng, def, filter, scan::Want::Values, cap, by == ROWID && !asc, scan::no_top())?

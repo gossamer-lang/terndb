@@ -5,20 +5,20 @@ use std::hash::crc32
 // live, and how a record's place is packed into the two words the row index
 // keeps.
 
-pub (package) const HEADER_LEN: i64 = 11
+pub(package) const HEADER_LEN: i64 = 11
 
-pub (package) const HINT_LEN: i64 = 18
+pub(package) const HINT_LEN: i64 = 18
 
 // The most a sequential read takes from the log at once: enough that a walk
 // over many small records costs a read per block rather than per record, and
 // little enough to hold one per generation being read.
-pub (package) const SCAN_BLOCK: i64 = 262_144
+pub(package) const SCAN_BLOCK: i64 = 262_144
 
-pub (package) const KIND_PUT: u8 = 0
+pub(package) const KIND_PUT: u8 = 0
 
-pub (package) const KIND_DELETE: u8 = 1
+pub(package) const KIND_DELETE: u8 = 1
 
-pub (package) const KIND_COMMIT: u8 = 2
+pub(package) const KIND_COMMIT: u8 = 2
 
 // A row's place in the log is two packed words: `offset << VLEN_BITS | vlen`
 // and `gen << 32 | crc`. Generations start at 1, so the second word is zero
@@ -35,7 +35,7 @@ pub fn data_path(dir: String, gen: i64) -> String { dir + "/" + gen.to_string() 
 /// Path of a generation's hint file.
 pub fn hint_path(dir: String, gen: i64) -> String { dir + "/" + gen.to_string() + ".hint" }
 
-pub (package) fn dir_entries(dir: String) -> Result<Vec<fs::DirInfo>, String> {
+pub(package) fn dir_entries(dir: String) -> Result<Vec<fs::DirInfo>, String> {
     match fs::read_dir(dir) {
         Ok(entries) => Ok(entries)
         Err(e) => Err("read " + dir + ": " + e.message())
@@ -46,7 +46,7 @@ pub (package) fn dir_entries(dir: String) -> Result<Vec<fs::DirInfo>, String> {
 // created, a hint that was renamed into place and a merged generation that was
 // removed are each only as durable as the entry naming them, which is a
 // separate flush from the file's own.
-pub (package) fn sync_dir(dir: String) -> Result<(), String> {
+pub(package) fn sync_dir(dir: String) -> Result<(), String> {
     match fs::sync_dir(dir) {
         Ok(()) => Ok(())
         Err(e) => Err("sync " + dir + ": " + e.message())
@@ -55,7 +55,7 @@ pub (package) fn sync_dir(dir: String) -> Result<(), String> {
 
 // Generation numbers are the file stem, so a name that is not all digits is
 // not one of ours and is left alone.
-pub (package) fn parse_gen(name: String, suffix: String) -> Option<i64> {
+pub(package) fn parse_gen(name: String, suffix: String) -> Option<i64> {
     let stem = name.strip_suffix(suffix)?
     if stem == "" { return None }
     for c in stem {
@@ -64,7 +64,7 @@ pub (package) fn parse_gen(name: String, suffix: String) -> Option<i64> {
     stem.to_i64()
 }
 
-pub (package) fn data_generations(dir: String) -> Result<Vec<i64>, String> {
+pub(package) fn data_generations(dir: String) -> Result<Vec<i64>, String> {
     let mut gens: Vec<i64> = #[]
     // A directory that cannot be listed is not an empty store: answering one
     // would start a fresh generation over the records already there.
@@ -75,24 +75,24 @@ pub (package) fn data_generations(dir: String) -> Result<Vec<i64>, String> {
     Ok(gens)
 }
 
-pub (package) fn open_read(path: String) -> Option<fs::File> {
+pub(package) fn open_read(path: String) -> Option<fs::File> {
     fs::open(path).ok()
 }
 
 // The active file is read and written at explicit offsets, so it needs both
 // modes on one handle and must never truncate an existing generation.
-pub (package) fn open_append(path: String) -> Result<fs::File, String> {
+pub(package) fn open_append(path: String) -> Result<fs::File, String> {
     fs::OpenOptions::new().read(true).write(true).create(true).open(path).map_err(|e| "open: " + e.message())
 }
 
 // The staging file a merge writes its hint into. It starts empty whatever was
 // left at that path, so a hint renamed into place describes the generation it
 // was written for and nothing else.
-pub (package) fn open_fresh(path: String) -> Result<fs::File, String> {
+pub(package) fn open_fresh(path: String) -> Result<fs::File, String> {
     fs::OpenOptions::new().read(true).write(true).create(true).truncate(true).open(path).map_err(|e| "open: " + e.message())
 }
 
-pub (package) fn read_whole(path: String) -> Result<Vec<u8>, String> {
+pub(package) fn read_whole(path: String) -> Result<Vec<u8>, String> {
     match fs::read(path) {
         Ok(b) => Ok(b)
         Err(e) => Err("read " + path + ": " + e.message())
@@ -102,25 +102,25 @@ pub (package) fn read_whole(path: String) -> Result<Vec<u8>, String> {
 /// Path of the file a writer holds the store's exclusive lock on.
 pub fn lock_path(dir: String) -> String { dir + "/LOCK" }
 
-pub (package) fn key_from(bytes: Vec<u8>) -> Option<String> {
+pub(package) fn key_from(bytes: Vec<u8>) -> Option<String> {
     String::from_utf8(bytes).ok()
 }
 
-pub (package) fn pack_loc(offset: i64, vlen: i64) -> i64 { (offset << VLEN_BITS) | vlen }
+pub(package) fn pack_loc(offset: i64, vlen: i64) -> i64 { (offset << VLEN_BITS) | vlen }
 
-pub (package) fn pack_gc(gen: i64, crc: u32) -> i64 { (gen << 32) | crc as i64 }
+pub(package) fn pack_gc(gen: i64, crc: u32) -> i64 { (gen << 32) | crc as i64 }
 
-pub (package) fn loc_offset(w: i64) -> i64 { w >> VLEN_BITS }
+pub(package) fn loc_offset(w: i64) -> i64 { w >> VLEN_BITS }
 
-pub (package) fn loc_vlen(w: i64) -> i64 { w & VLEN_MASK }
+pub(package) fn loc_vlen(w: i64) -> i64 { w & VLEN_MASK }
 
-pub (package) fn gc_gen(w: i64) -> i64 { w >> 32 }
+pub(package) fn gc_gen(w: i64) -> i64 { w >> 32 }
 
-pub (package) fn gc_crc(w: i64) -> u32 { w as u32 }
+pub(package) fn gc_crc(w: i64) -> u32 { w as u32 }
 
 // Decimal digits a positive rowid is written with, which is what its key costs
 // on top of the table's prefix.
-pub (package) fn digits_len(n: i64) -> i64 {
+pub(package) fn digits_len(n: i64) -> i64 {
     let mut d: i64 = 1
     let mut v = n
     while v >= 10 {
@@ -130,15 +130,15 @@ pub (package) fn digits_len(n: i64) -> i64 {
     d
 }
 
-pub (package) fn record_len(key: String, vlen: i64) -> i64 { HEADER_LEN + key.byte_len() + vlen }
+pub(package) fn record_len(key: String, vlen: i64) -> i64 { HEADER_LEN + key.byte_len() + vlen }
 
 // The checksum spans the key and then the value, accumulated across the two
 // rather than over a joined copy of them.
-pub (package) fn record_crc(key: String, val: Vec<u8>) -> u32 {
+pub(package) fn record_crc(key: String, val: Vec<u8>) -> u32 {
     crc32::update(crc32::checksum(key.as_bytes()), val)
 }
 
-pub (package) fn record(key: String, kind: u8, val: Vec<u8>, crc: u32) -> Vec<u8> {
+pub(package) fn record(key: String, kind: u8, val: Vec<u8>, crc: u32) -> Vec<u8> {
     let mut out: Vec<u8> = #[]
     record_into(&mut out, key, kind, val, crc)
     out
@@ -146,7 +146,7 @@ pub (package) fn record(key: String, kind: u8, val: Vec<u8>, crc: u32) -> Vec<u8
 
 // Appends one framed record to `buf`, the header written field by field in
 // place rather than assembled from pieces of its own.
-pub (package) fn record_into(buf: &mut Vec<u8>, key: String, kind: u8, val: Vec<u8>, crc: u32) {
+pub(package) fn record_into(buf: &mut Vec<u8>, key: String, kind: u8, val: Vec<u8>, crc: u32) {
     push_le(buf, crc as i64, 4)
     buf.push(kind)
     push_le(buf, key.byte_len(), 2)
@@ -156,6 +156,6 @@ pub (package) fn record_into(buf: &mut Vec<u8>, key: String, kind: u8, val: Vec<
 }
 
 // Appends the low `width` bytes of `v`, least significant first.
-pub (package) fn push_le(buf: &mut Vec<u8>, v: i64, width: i64) {
+pub(package) fn push_le(buf: &mut Vec<u8>, v: i64, width: i64) {
     for i in 0..width { buf.push(((v >> (8 * i)) & 255) as u8) }
 }

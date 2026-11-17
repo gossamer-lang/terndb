@@ -18,10 +18,10 @@ pub enum Want {
 }
 
 /// What a walk found: how many rows matched, and what it kept of them.
-pub (package) struct Walk {
-    pub (package) matched: i64
-    pub (package) rows: Vec<engine::Row>
-    pub (package) top: Top
+pub(package) struct Walk {
+    pub(package) matched: i64
+    pub(package) rows: Vec<engine::Row>
+    pub(package) top: Top
 }
 
 /// The `k` leading rows by one column, as a heap whose root is the one that
@@ -29,7 +29,7 @@ pub (package) struct Walk {
 ///
 /// Only the ordering value and the row id are held: the rows answered are read
 /// whole once the walk has settled which they are.
-pub (package) struct Top {
+pub(package) struct Top {
     col: i64
     asc: bool
     k: i64
@@ -38,10 +38,10 @@ pub (package) struct Top {
 }
 
 /// A [`Top`] that holds nothing, for a walk that keeps rows another way.
-pub (package) fn no_top() -> Top { Top { col: -1, asc: true, k: 0, keys: #[], rids: #[] } }
+pub(package) fn no_top() -> Top { Top { col: -1, asc: true, k: 0, keys: #[], rids: #[] } }
 
 /// A [`Top`] keeping the `k` leading rows ordered by column `col`.
-pub (package) fn top_of(col: i64, asc: bool, k: i64) -> Top {
+pub(package) fn top_of(col: i64, asc: bool, k: i64) -> Top {
     Top { col: col, asc: asc, k: k, keys: #[], rids: #[] }
 }
 
@@ -61,7 +61,7 @@ struct Take {
 //
 // The walk visits rowids rather than index keys: it costs one map lookup per
 // id, against iterating and sorting every key in the store for each statement.
-pub (package) fn table(eng: &mut engine::Engine, def: &mut engine::TableDef, filter: filter::Filter, want: Want, cap: i64, reverse: bool, top: Top) -> Result<Walk, String> {
+pub(package) fn table(eng: &mut engine::Engine, def: &mut engine::TableDef, filter: filter::Filter, want: Want, cap: i64, reverse: bool, top: Top) -> Result<Walk, String> {
     let table = def.name
     // Every row of the table is reached by its id, so the walk builds no key.
     let tid = kv::rows::table_id(&mut eng.store, table)
@@ -279,7 +279,7 @@ fn sift_down(top: &mut Top, at: i64) {
 }
 
 /// The row ids `top` kept, in the order they are answered.
-pub (package) fn ranked(top: &mut Top) -> Vec<i64> {
+pub(package) fn ranked(top: &mut Top) -> Vec<i64> {
     let n = top.rids.len()
     let mut out: Vec<i64> = #[0; n]
     // The root is always the row answered last of those still held, so taking
